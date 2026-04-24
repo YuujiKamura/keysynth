@@ -791,6 +791,12 @@ pub struct PianoVoice {
     released: bool,
     rel_mul: f32,
     rel_step: f32,
+    /// Pre-rendered hammer "click" — short broadband transient mixed in for
+    /// the first ~50 samples to model the felt-on-string mechanical thump
+    /// (the part of the onset that is NOT string vibration). Dramatically
+    /// improves onset RMS envelope match against real piano samples.
+    click_buf: Vec<f32>,
+    click_pos: usize,
 }
 
 impl PianoVoice {
@@ -801,16 +807,20 @@ impl PianoVoice {
         // (Weinreich 1977, "Coupled piano strings"). Wider spreads
         // (e.g. +/-7c) sound like an out-of-tune honky-tonk, not a piano.
         let detunes = [cents_to_ratio(-1.5), 1.0, cents_to_ratio(1.5)];
-        // Stronger stiffness than ks-rich + scaled with frequency.
-        let ap = (0.25 + (freq / 1500.0).min(0.30)).min(0.50);
+        // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; previous
+        // 0.25..0.50 ap range gave B ~4.6e-4 (cand too stiff). Drop to a
+        // shallow fixed range that puts B near the reference.
+        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
         // Frequency-dependent decay: 110 Hz -> 0.9990 (long); 2000 Hz -> 0.9930 (short)
         // Pushed both endpoints toward 1.0: high notes were dying in <0.2s
         // because the in-loop LPF was already taking the edge off; once we
         // rebalanced that to 0.95/0.05 the per-trip decay needed to give
         // back the sustain margin it had been hiding.
+        // Faster decay: ref T60 ~3-6s; previous 1.0..0.9992 gave 4-8s candidate.
+        // Walk back to a more conventional KS decay range.
         let decay_for = |f: f32| -> f32 {
             let high = (f / 2000.0).clamp(0.0, 1.0);
-            1.0 - 0.0008 * high
+            0.9985 - 0.0035 * high  // ~0.9985 at lows, ~0.995 at 2k
         };
         let hammer_w = piano_hammer_width(velocity);
         let mk = |freq_string: f32| -> KsString {
@@ -826,11 +836,47 @@ impl PianoVoice {
         let release_sec = 0.300_f32;
         let release_samples = (release_sec * sr).max(1.0);
         let rel_step = (1e-3_f32.ln() / release_samples).exp();
+        // Build a short bandpassed-noise click: ~0.7 ms at 44.1 kHz = 31 samples.
+        // Velocity scales the amplitude. Simple two-pole shaping (highpass +
+        // lowpass via leaky averager) gives 200..8000 Hz bandpass-ish noise.
+        let click_samples = ((sr * 0.0008) as usize).clamp(16, 80);
+        let click_amp = amp * 0.55;
+        let mut click_buf = Vec::with_capacity(click_samples);
+        // Deterministic per-voice seed so unit tests are reproducible.
+        let mut rng_state: u32 = 0x9E37_79B9
+            ^ ((freq.to_bits() as u32).wrapping_mul(2654435761))
+            ^ ((velocity as u32).wrapping_mul(0x85EB_CA77));
+        let mut lp_prev = 0.0f32;
+        let mut hp_prev_x = 0.0f32;
+        let mut hp_prev_y = 0.0f32;
+        // Highpass coef (cut <~200 Hz): a = 1 - 2*pi*f/sr
+        let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 200.0 / sr;
+        // Lowpass coef (cut >~8 kHz): leak fraction
+        let lp_a = (-2.0 * std::f32::consts::PI * 8000.0 / sr).exp();
+        for i in 0..click_samples {
+            // xorshift32
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 17;
+            rng_state ^= rng_state << 5;
+            let raw = ((rng_state as i32) as f32) / (i32::MAX as f32);
+            // Highpass: y = a*(y_prev + x - x_prev)
+            let hp = hp_a * (hp_prev_y + raw - hp_prev_x);
+            hp_prev_x = raw;
+            hp_prev_y = hp;
+            // Lowpass: y = (1-a)*x + a*y_prev
+            lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
+            // Half-cosine amplitude window: 0 -> 1 -> 0 across the click.
+            let t = i as f32 / (click_samples - 1).max(1) as f32;
+            let win = 0.5 * (1.0 - (std::f32::consts::TAU * t).cos());
+            click_buf.push(lp_prev * win * click_amp);
+        }
         Self {
             strings,
             released: false,
             rel_mul: 1.0,
             rel_step,
+            click_buf,
+            click_pos: 0,
         }
     }
 }
@@ -843,6 +889,11 @@ impl VoiceImpl for PianoVoice {
                 + self.strings[1].step()
                 + self.strings[2].step();
             let mut out_sample = s * gain;
+            // Mix in remaining click samples (mechanical hammer-strike thump).
+            if self.click_pos < self.click_buf.len() {
+                out_sample += self.click_buf[self.click_pos];
+                self.click_pos += 1;
+            }
             if self.released {
                 self.rel_mul *= self.rel_step;
                 out_sample *= self.rel_mul;
