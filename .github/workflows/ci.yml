@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    name: fmt + clippy + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # cpal on Linux requires ALSA development headers.
+      - name: Install ALSA dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
+      - name: cargo fmt --check
+        run: cargo fmt -- --check
+
+      - name: cargo clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test (release, lib)
+        run: cargo test --release --lib
+
+      - name: cargo build (release bins)
+        run: cargo build --release --bin bench --bin analyse
+
+      # TODO(#2): regression gate.
+      # Future step: run the `bench` binary to render bench-out/REF/square_c4_4s.wav,
+      # then invoke `analyse` to compute T60 / B / MR-STFT and diff against a stored
+      # baseline JSON. Fail the job on regression beyond tolerance. Tracking: issue #2.

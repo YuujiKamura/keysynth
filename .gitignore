@@ -24,12 +24,19 @@ Thumbs.db
 # in a derived repo. Even CC0 packs add MB-GB of binary noise to git history.
 # This includes reference/*.wav (Iowa MIS, MAPS, etc.) -- documented in
 # reference/README.md but never redistributed in this repo.
-bench-out/
+bench-out/*
+!bench-out/REF/
+!bench-out/REF/**
 recordings/
 samples/
 ir/
 reference/*.wav
 **/*.wav
+# Whitelist the locked-in deterministic reference WAV (square C4) and its
+# README, even though the global **/*.wav rule above would otherwise hide
+# them. This is the only audio file we redistribute in the repo.
+!bench-out/REF/square_c4_4s.wav
+!bench-out/REF/README.md
 **/*.flac
 **/*.aif
 **/*.aiff
