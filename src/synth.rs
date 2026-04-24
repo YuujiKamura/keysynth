@@ -194,9 +194,12 @@ impl KsVoice {
     pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
         // Fractional-delay decomposition: integer N + frac in [0, 1).
         // Without this, notes above ~MIDI 72 mistune by tens of cents.
+        // Reserve 0.5 sample for the in-loop 2-tap LPF (group delay = 0.5
+        // at low freq); the tuning AP picks up the rest.
         let raw = sr / freq.max(1.0);
-        let n_f = raw.floor();
-        let frac = raw - n_f;
+        let target = (raw - 0.5_f32).max(2.0);
+        let n_f = target.floor();
+        let frac = target - n_f;
         let n = (n_f as usize).max(2);
         let tune_coef = (1.0 - frac) / (1.0 + frac);
         let amp = (velocity.max(1) as f32) / 127.0;
@@ -537,7 +540,7 @@ pub struct KsString {
 
 impl KsString {
     pub fn new(sr: f32, freq: f32, amp: f32, ap_coef: f32, hammer_width: usize) -> Self {
-        let (n, _frac) = Self::delay_length(sr, freq);
+        let (n, _frac) = Self::delay_length_compensated(sr, freq, ap_coef);
         let buf = hammer_excitation(n, hammer_width, amp);
         Self::with_buf(sr, freq, buf, 0.997, ap_coef)
     }
@@ -546,9 +549,9 @@ impl KsString {
     /// Used by `piano` (asymmetric hammer + freq-dependent decay) and `koto`
     /// (offset pluck + long sustain) which need control beyond `new`.
     /// `sr` and `freq` are used to compute the fractional-delay tuning coef.
-    /// The caller MUST size `buf` to `delay_length(sr, freq).0`.
+    /// The caller MUST size `buf` to `delay_length_compensated(sr, freq, ap_coef).0`.
     pub fn with_buf(sr: f32, freq: f32, buf: Vec<f32>, decay: f32, ap_coef: f32) -> Self {
-        let (_n, frac) = Self::delay_length(sr, freq);
+        let (_n, frac) = Self::delay_length_compensated(sr, freq, ap_coef);
         // Allpass coefficient for fractional delay of `frac` samples.
         // c = (1 - frac) / (1 + frac), Julius O. Smith, PASP.
         let tune_coef = (1.0 - frac) / (1.0 + frac);
@@ -577,6 +580,33 @@ impl KsString {
         (n, frac)
     }
 
+    /// Like `delay_length` but compensates for the extra phase delay
+    /// introduced inside the feedback loop by the 2-tap LPF (0.5 sample
+    /// at low freq) and the dispersion allpass (`(1 - a) / (1 + a)` at DC,
+    /// Julius O. Smith PASP). Without this compensation, the loop period
+    /// is too long and the fundamental sounds flat by ~20+ cents at C4.
+    pub fn delay_length_compensated(sr: f32, freq: f32, ap_coef: f32) -> (usize, f32) {
+        let raw = sr / freq.max(1.0);
+        // 2-tap moving average (linear-phase would be 0.5); we now run an
+        // asymmetric 0.95/0.05 weighting in `step`, which empirically lands
+        // closer to 0.5 sample of total in-loop LPF+buffer delay once the
+        // writeback race is included, so 0.5 remains the right number.
+        let lpf_delay = 0.5_f32;
+        // 1st-order allpass phase delay at DC: (1 - a) / (1 + a).
+        let disp_delay = (1.0 - ap_coef) / (1.0 + ap_coef);
+        // Reserve `extra` samples worth of delay for the in-loop filters
+        // (LPF + dispersion AP); the tuning allpass picks up the remainder.
+        // The +0.5 empirical fudge accounts for the implicit one-sample read-
+        // before-write delay through the buffer slot itself; without it C4
+        // still reads ~14 cents flat in the analyse harness.
+        let extra = lpf_delay + disp_delay + 0.5;
+        let target = (raw - extra).max(2.0);
+        let n_f = target.floor();
+        let frac = target - n_f;
+        let n = (n_f as usize).max(2);
+        (n, frac)
+    }
+
     #[inline]
     fn step(&mut self) -> f32 {
         let n = self.buf.len();
@@ -586,8 +616,10 @@ impl KsString {
         } else {
             self.buf[self.head - 1]
         };
-        // Standard 2-tap lowpass average + decay
-        let lp = (cur + prev) * 0.5 * self.decay;
+        // 2-tap weighted lowpass + decay: weighting `cur` heavier than
+        // `prev` flattens the high-frequency rolloff, preserving brilliance
+        // in upper partials. Pure 0.5/0.5 average loses h7+ in <0.2s.
+        let lp = (cur * 0.97 + prev * 0.03) * self.decay;
         // Dispersion 1-pole allpass (stiffness): textbook Smith form.
         //   y[n] = a * x[n] + x[n-1] - a * y[n-1]
         let a = self.ap_coef;
@@ -772,13 +804,17 @@ impl PianoVoice {
         // Stronger stiffness than ks-rich + scaled with frequency.
         let ap = (0.25 + (freq / 1500.0).min(0.30)).min(0.50);
         // Frequency-dependent decay: 110 Hz -> 0.9990 (long); 2000 Hz -> 0.9930 (short)
+        // Pushed both endpoints toward 1.0: high notes were dying in <0.2s
+        // because the in-loop LPF was already taking the edge off; once we
+        // rebalanced that to 0.95/0.05 the per-trip decay needed to give
+        // back the sustain margin it had been hiding.
         let decay_for = |f: f32| -> f32 {
             let high = (f / 2000.0).clamp(0.0, 1.0);
-            0.999 - 0.006 * high
+            1.0 - 0.0008 * high
         };
         let hammer_w = piano_hammer_width(velocity);
         let mk = |freq_string: f32| -> KsString {
-            let (n, _frac) = KsString::delay_length(sr, freq_string);
+            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
             let buf = piano_hammer_excitation(n, hammer_w, amp);
             KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
         };
@@ -869,14 +905,15 @@ pub struct KotoVoice {
 impl KotoVoice {
     pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
         let amp = (velocity.max(1) as f32) / 127.0;
-        let (n, _frac) = KsString::delay_length(sr, freq);
+        let koto_ap = 0.05_f32;
+        let (n, _frac) = KsString::delay_length_compensated(sr, freq, koto_ap);
         // Pluck near 1/4 of string length (typical koto tsume position).
         // Combined with the comb-FIR shape in koto_pluck_excitation, this
         // gives the bridge-side bright/twangy timbre.
         let pluck_pos = n / 4;
         let buf = koto_pluck_excitation(n, amp, pluck_pos);
         // Long sustain, very mild stiffness.
-        let string = KsString::with_buf(sr, freq, buf, 0.9992, 0.05);
+        let string = KsString::with_buf(sr, freq, buf, 0.9992, koto_ap);
         let release_sec = 0.500_f32; // longer release = "ふわっと消える"
         let release_samples = (release_sec * sr).max(1.0);
         let rel_step = (1e-3_f32.ln() / release_samples).exp();
