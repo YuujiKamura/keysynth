@@ -18,7 +18,7 @@ use cpal::Stream;
 use eframe::egui;
 use midir::MidiInputConnection;
 
-use crate::{DashState, Engine, LiveParams};
+use crate::synth::{DashState, Engine, LiveParams};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
 /// MIDI handles so they aren't dropped while the GUI is open.
