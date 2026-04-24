@@ -1008,144 +1008,205 @@ pub fn piano_hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
     buf
 }
 
+// ---------------------------------------------------------------------------
+// Piano preset container (issue #2 transition: unify Piano/PianoThick/PianoLite
+// into one parameterised voice). Adding a new preset = one const-struct entry.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SoundboardKind {
+    /// Full 16-mode bank used by the original `Piano` preset.
+    ConcertGrand,
+    /// 12-mode lite bank — drops the high-Q upper-band modes that were
+    /// ringing through the bridge feedback loop in the full preset.
+    Lite,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PianoPreset {
+    /// Number of detuned KS strings ganged in unison.
+    pub string_count: usize,
+    /// Half-spread of the detune in cents. Strings are placed symmetrically
+    /// around 1.0 (centre). For odd counts the centre string is at 0 cents.
+    pub detune_cents_half_spread: f32,
+    /// Which soundboard mode bank to use.
+    pub soundboard: SoundboardKind,
+    /// Per-string KS in-loop decay at low freq (~110 Hz).
+    pub decay_base: f32,
+    /// Decay slope at 2 kHz. The per-string decay multiplier is
+    /// `decay_base - decay_slope * (freq/2000).clamp(0,1)`.
+    pub decay_slope: f32,
+    /// Bridge feedback coefficient injected into each string per sample.
+    /// Already pre-divided by string_count for presets where total bridge
+    /// energy is normalised; raw (un-divided) for presets that explicitly
+    /// want stronger per-string coupling.
+    pub coupling_per_string: f32,
+    /// Dry string-sum gain in the final mix.
+    pub dry_gain: f32,
+    /// Wet soundboard-output gain in the final mix.
+    pub wet_gain: f32,
+    /// Voice release time (seconds) handed to the shared ReleaseEnvelope.
+    pub release_sec: f32,
+}
+
+impl PianoPreset {
+    /// Original `Piano` engine: 7 strings, full ConcertGrand 16-mode body,
+    /// dry/wet 0.5/0.35. Bridge feedback normalised across the 7 strings.
+    pub const PIANO: Self = Self {
+        string_count: 7,
+        detune_cents_half_spread: 3.0,
+        soundboard: SoundboardKind::ConcertGrand,
+        decay_base: 0.9985,
+        decay_slope: 0.0035,
+        coupling_per_string: 0.012 / 7.0,
+        dry_gain: 0.5,
+        wet_gain: 0.35,
+        release_sec: 0.300,
+    };
+    /// `PianoThick`: 7 strings + 12-mode lite body so the high-Q upper-band
+    /// modes don't ring through the bridge loop. Decay base lifted to keep
+    /// the fundamental sustaining (closer to the SFZ Salamander C4 ref) and
+    /// dry-dominant 0.7/0.20 mix to suppress the metallic body sustain.
+    pub const PIANO_THICK: Self = Self {
+        string_count: 7,
+        detune_cents_half_spread: 3.0,
+        soundboard: SoundboardKind::Lite,
+        decay_base: 0.9990,
+        decay_slope: 0.0050,
+        coupling_per_string: 0.015 / 7.0,
+        dry_gain: 0.7,
+        wet_gain: 0.20,
+        release_sec: 0.300,
+    };
+    /// `PianoLite`: 3 strings + 12-mode lite body. v4 tuning lands h1 T60
+    /// within 8% of the SFZ Salamander C4 reference. Coupling is NOT
+    /// pre-divided here — the original PianoLite ran 0.015/string × 3
+    /// strings = 0.045 total bridge energy by design.
+    pub const PIANO_LITE: Self = Self {
+        string_count: 3,
+        detune_cents_half_spread: 1.5,
+        soundboard: SoundboardKind::Lite,
+        decay_base: 0.9980,
+        decay_slope: 0.0025,
+        coupling_per_string: 0.015,
+        dry_gain: 0.5,
+        wet_gain: 0.35,
+        release_sec: 0.300,
+    };
+}
+
+/// Build the symmetric per-string detune ratios for a preset's string count
+/// and half-spread. Reproduces the explicit arrays the pre-unification
+/// `PianoVoice` / `PianoVoiceThick` (7-string, ±3 c) and `PianoVoiceLite`
+/// (3-string, ±1.5 c) used.
+fn piano_detunes(count: usize, half_cents: f32) -> Vec<f32> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if count == 1 {
+        return vec![1.0];
+    }
+    let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
+    let mut v = Vec::with_capacity(count);
+    if count % 2 == 1 {
+        let half = (count - 1) / 2;
+        let step = half_cents / (half as f32);
+        for i in 0..count {
+            let offset_cents = (i as f32 - half as f32) * step;
+            v.push(if offset_cents == 0.0 {
+                1.0
+            } else {
+                cents_to_ratio(offset_cents)
+            });
+        }
+    } else {
+        let step = (2.0 * half_cents) / ((count - 1) as f32);
+        for i in 0..count {
+            let offset_cents = -half_cents + (i as f32) * step;
+            v.push(cents_to_ratio(offset_cents));
+        }
+    }
+    v
+}
+
 pub struct PianoVoice {
-    /// 7 strings (was 3). User intuition 2026-04-25: "弦7個くらいいるんでは"
-    /// — non-physical (real piano: 1-3 strings/note) but the extra detuned
-    /// copies thicken the source spectrum, giving the soundboard more raw
-    /// material to colour and reducing the perceived "曇り". Each string is
-    /// a small fraction in the mix (1/7 vs old 1/3).
-    strings: [KsString; 7],
+    /// Detuned KS strings (count comes from `PianoPreset::string_count`).
+    /// `Vec` rather than a fixed array so a single struct serves all
+    /// presets — this is the issue #2 transition fix.
+    strings: Vec<KsString>,
     release: ReleaseEnvelope,
     /// Modal soundboard resonator bank. Receives the summed string output
-    /// every sample and feeds back into the strings via `coupling` for
-    /// physical bridge coupling (Bank/Lehtonen DWS). Replaces the older
-    /// pre-rendered click/Thump/Bright additive transient — the soundboard
-    /// gives that "body / halo" character organically and bidirectionally.
+    /// every sample and feeds back into the strings via `coupling_per_string`
+    /// for physical bridge coupling (Bank/Lehtonen DWS).
     soundboard: crate::soundboard::Soundboard,
-    /// Bridge coupling coefficient. Controls how much of the soundboard
-    /// output gets injected back into each string per sample. Must be
-    /// kept small enough that `coupling * resonator_peak_gain < 1` for
-    /// every mode or the loop runs away. 0.025 = ~5% energy returned
-    /// across the bank, well inside the stable region.
-    coupling: f32,
+    coupling_per_string: f32,
+    dry_gain: f32,
+    wet_gain: f32,
+    /// 1.0 / string_count — applied to the string sum so the in-phase
+    /// attack peak stays bounded regardless of preset.
+    string_norm: f32,
 }
 
 impl PianoVoice {
+    /// Construct a piano voice using `PianoPreset::PIANO` (the original
+    /// 7-string ConcertGrand defaults). Kept as `new` for backward
+    /// compatibility with existing tests.
     pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
+        Self::with_preset(PianoPreset::PIANO, sr, freq, velocity)
+    }
+
+    /// Construct a piano voice using an arbitrary preset. This is the
+    /// canonical entry point — `Engine::Piano`/`PianoThick`/`PianoLite`
+    /// all dispatch here with different presets.
+    pub fn with_preset(preset: PianoPreset, sr: f32, freq: f32, velocity: u8) -> Self {
         let amp = (velocity.max(1) as f32) / 127.0;
-        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        // Real piano triple-string unison detune: ~0.5-2 cents
-        // (Weinreich 1977, "Coupled piano strings"). Wider spreads
-        // (e.g. +/-7c) sound like an out-of-tune honky-tonk, not a piano.
-        // 7 detunes spread ±3 cents. Symmetric around the centre, slightly
-        // wider than the 3-string ±1.5 c so 7 in unison still beats audibly.
-        let detunes = [
-            cents_to_ratio(-3.0),
-            cents_to_ratio(-2.0),
-            cents_to_ratio(-1.0),
-            1.0,
-            cents_to_ratio(1.0),
-            cents_to_ratio(2.0),
-            cents_to_ratio(3.0),
-        ];
-        // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; previous
-        // 0.25..0.50 ap range gave B ~4.6e-4 (cand too stiff). Drop to a
-        // shallow fixed range that puts B near the reference.
+        let detunes = piano_detunes(preset.string_count, preset.detune_cents_half_spread);
+        // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; the
+        // shallow fixed range puts B near the reference.
         let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
-        // Frequency-dependent decay: 110 Hz -> 0.9990 (long); 2000 Hz -> 0.9930 (short)
-        // Pushed both endpoints toward 1.0: high notes were dying in <0.2s
-        // because the in-loop LPF was already taking the edge off; once we
-        // rebalanced that to 0.95/0.05 the per-trip decay needed to give
-        // back the sustain margin it had been hiding.
-        // Faster decay: ref T60 ~3-6s; previous 1.0..0.9992 gave 4-8s candidate.
-        // Walk back to a more conventional KS decay range.
         let decay_for = |f: f32| -> f32 {
             let high = (f / 2000.0).clamp(0.0, 1.0);
-            0.9985 - 0.0035 * high  // ~0.9985 at lows, ~0.995 at 2k
+            preset.decay_base - preset.decay_slope * high
         };
         let hammer_w = piano_hammer_width(velocity);
-        // Fix B: time-varying LPF strength. Attack: w0=0.99 (minimal in-loop
-        // LPF, preserves attack brilliance). Steady: keep current 0.97.
-        // 80 ms ramp matches the perceptual attack window.
-        // Fix B disabled: any attack-window LPF brilliance leaks into the
-        // KS feedback loop and persists, which raises the inharmonicity B
-        // estimate by ~30% (composite penalty +0.24). Infrastructure kept
-        // for future tuning if a co-compensating change is found.
-        let attack_ms = 0.0_f32;
-        let w0_attack = 0.97_f32;
-        let w0_steady = 0.97_f32;
         let mk = |freq_string: f32| -> KsString {
             let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
             let buf = piano_hammer_excitation(n, hammer_w, amp);
             KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
-                .with_attack_lpf(sr, attack_ms, w0_attack, w0_steady)
+                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
         };
-        let strings = [
-            mk(freq * detunes[0]),
-            mk(freq * detunes[1]),
-            mk(freq * detunes[2]),
-            mk(freq * detunes[3]),
-            mk(freq * detunes[4]),
-            mk(freq * detunes[5]),
-            mk(freq * detunes[6]),
-        ];
-        // ---------------------------------------------------------------
-        // Modal soundboard with bridge coupling (Bank/Lehtonen DWS).
-        //
-        // Replaces the previous pre-rendered click_buf (Thump + Bright
-        // noise/sine bursts mixed at the output). The additive approach
-        // was whack-a-mole: every HF noise component the ear could pick
-        // up read as breath/click/cloth. Real piano body radiation is
-        // bidirectional — string drives the soundboard, the soundboard's
-        // resonant modes pump back into the string through the bridge,
-        // and the body's modal radiation IS the perceived sound.
-        //
-        // Coupling 0.025 = ~5% energy returned per sample. With
-        // soundboard peak response ~1, this stays well below the
-        // unity-gain instability threshold across all modes.
-        let _ = velocity; // velocity already mixed into amp above
-        let soundboard = crate::soundboard::Soundboard::new_concert_grand(sr);
-        // 2026-04-25 piano-tuning pass against SFZ Salamander C4 reference.
-        // Bench analysis showed the candidate centroid drifting +495 Hz at
-        // the tail (high-Q soundboard modes ringing past string death,
-        // perceived as harpsichord-like sustained metallic ring) and mid-
-        // band partials n=2..4 running 1-2 s longer than the SFZ ref.
-        //
-        // Coupling cut from 0.025 → 0.012 / 7. Dividing by string count
-        // keeps total bridge feedback constant regardless of N (was
-        // 0.025 × 7 = 0.175 effective when summed across 7 strings,
-        // pushing the loop into "ビョーオン" sustained ringing). Halving
-        // again to 0.012/7 cuts the bridge-loop sustain contribution
-        // without killing the body resonance entirely.
-        let coupling = 0.012_f32 / 7.0;
+        let strings: Vec<KsString> = detunes.iter().map(|d| mk(freq * *d)).collect();
+        let soundboard = match preset.soundboard {
+            SoundboardKind::ConcertGrand => crate::soundboard::Soundboard::new_concert_grand(sr),
+            SoundboardKind::Lite => crate::soundboard::Soundboard::new_concert_grand_lite(sr),
+        };
+        let string_norm = if preset.string_count == 0 {
+            1.0
+        } else {
+            1.0 / (preset.string_count as f32)
+        };
         Self {
             strings,
-            release: ReleaseEnvelope::new(0.300, sr),
+            release: ReleaseEnvelope::new(preset.release_sec, sr),
             soundboard,
-            coupling,
+            coupling_per_string: preset.coupling_per_string,
+            dry_gain: preset.dry_gain,
+            wet_gain: preset.wet_gain,
+            string_norm,
         }
     }
 }
 
 impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        // 7-string sum normalised by 1/7 keeps the in-phase attack peak
-        // bounded (7 strings hammer in phase, decorrelate over ~sqrt(7)
-        // after detune drift).
-        // Dry/wet rebalanced 0.2/0.7 → 0.5/0.35 (2026-04-25). At the
-        // previous wet dominance the high-Q soundboard modes ringing
-        // through the bridge loop were audible as "波がもどってくる"
-        // sustained resonance / harpsichord-like ring. Pushing dry up
-        // makes the immediate string sound primary; the soundboard
-        // sits behind as colour, not as the body of the note.
-        let dry_gain = 0.5_f32;
-        let wet_gain = 0.35_f32;
-        let string_norm = 1.0_f32 / 7.0;
+        let dry_gain = self.dry_gain;
+        let wet_gain = self.wet_gain;
+        let string_norm = self.string_norm;
         for sample in buf.iter_mut() {
             // 1. Inject the previous-sample soundboard output back into
             //    every string via the bridge. One-sample delay keeps the
             //    feedback loop strictly causal (no algebraic loop).
-            let fb = self.soundboard.last_output() * self.coupling;
+            let fb = self.soundboard.last_output() * self.coupling_per_string;
             if fb != 0.0 {
                 for s in &mut self.strings {
                     s.inject_feedback(fb);
@@ -1281,239 +1342,30 @@ pub fn make_voice(
         Engine::KsRich => Box::new(KsRichVoice::new(sr, freq, velocity)),
         Engine::Sub => Box::new(SubVoice::new(sr, freq, velocity)),
         Engine::Fm => Box::new(FmVoice::new(sr, freq, velocity)),
-        Engine::Piano => Box::new(PianoVoice::new(sr, freq, velocity)),
+        Engine::Piano => Box::new(PianoVoice::with_preset(
+            PianoPreset::PIANO,
+            sr,
+            freq,
+            velocity,
+        )),
         Engine::Koto => Box::new(KotoVoice::new(sr, freq, velocity)),
         Engine::SfPiano => Box::new(SfPianoPlaceholder::new(sr)),
         // SfzPiano shares the placeholder voice strategy with SfPiano: the
         // pool entry only tracks (channel, note) for eviction; audio comes
         // from the shared SfzPlayer rendered in the audio callback.
         Engine::SfzPiano => Box::new(SfPianoPlaceholder::new(sr)),
-        // PianoThick: 7 strings + 12-mode lite soundboard (no high-freq
-        // additions). The full Piano variant's high-Q 16-mode set with
-        // 7-string coupling produced an abnormal "ドーンミャアああーーオーン"
-        // decay character — high-Q modes at 3000-7500 Hz ringing through
-        // the bridge feedback loop. PianoVoiceThick keeps the thicker
-        // 7-string fundamental but uses the cleaner 12-mode body.
-        Engine::PianoThick => Box::new(PianoVoiceThick::new(sr, freq, velocity)),
-        Engine::PianoLite => Box::new(PianoVoiceLite::new(sr, freq, velocity)),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PianoVoiceLite: 3 strings + 12-mode lite soundboard, no sym bank.
-//
-// v4 tuning (2026-04-25): decay 0.9980 - 0.0025*high, coupling 0.015 — proven
-// against SFZ Salamander C4 reference to give h1 T60 ratio 0.92x ref (vs 4.4x
-// at baseline). Best per-partial T60 match across all variants.
-// ---------------------------------------------------------------------------
-
-pub struct PianoVoiceLite {
-    strings: [KsString; 3],
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
-    soundboard: crate::soundboard::Soundboard,
-    coupling: f32,
-}
-
-impl PianoVoiceLite {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let detunes = [cents_to_ratio(-1.5), 1.0, cents_to_ratio(1.5)];
-        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
-        // v4 tuning: faster decay than the original (0.9985 - 0.0035*high) so
-        // h1 T60 lands within 8% of SFZ ref instead of 4.4x over.
-        let decay_for = |f: f32| -> f32 {
-            let high = (f / 2000.0).clamp(0.0, 1.0);
-            0.9980 - 0.0025 * high
-        };
-        let hammer_w = piano_hammer_width(velocity);
-        let mk = |freq_string: f32| -> KsString {
-            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
-            let buf = piano_hammer_excitation(n, hammer_w, amp);
-            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
-                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
-        };
-        let strings = [
-            mk(freq * detunes[0]),
-            mk(freq * detunes[1]),
-            mk(freq * detunes[2]),
-        ];
-        let release_sec = 0.300_f32;
-        let release_samples = (release_sec * sr).max(1.0);
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
-        let soundboard = crate::soundboard::Soundboard::new_concert_grand_lite(sr);
-        // v4: 0.025 -> 0.015. Less feedback retention = cleaner decay.
-        let coupling = 0.015_f32;
-        Self {
-            strings,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
-            soundboard,
-            coupling,
-        }
-    }
-}
-
-impl VoiceImpl for PianoVoiceLite {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        let dry_gain = 0.5_f32;
-        let wet_gain = 0.35_f32;
-        let string_norm = 1.0_f32 / 3.0;
-        for sample in buf.iter_mut() {
-            let fb = self.soundboard.last_output() * self.coupling;
-            if fb != 0.0 {
-                for s in &mut self.strings {
-                    s.inject_feedback(fb);
-                }
-            }
-            let mut s_sum = 0.0_f32;
-            for s in &mut self.strings {
-                s_sum += s.step();
-            }
-            let s_avg = s_sum * string_norm;
-            let board_out = self.soundboard.process(s_avg);
-            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
-        }
-    }
-    fn trigger_release(&mut self) {
-        self.released = true;
-    }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
-    }
-    fn is_releasing(&self) -> bool {
-        self.released
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PianoVoiceThick: 7 strings + 12-mode lite soundboard, no sym bank.
-//
-// Mid-tier between the planned 3-string PianoVoiceLite and the full
-// `PianoVoice` (7 strings + 16-mode soundboard + cross-string
-// sympathetic bank). Combines the thicker 7-string fundamental with a
-// cleaner 12-mode soundboard so the high-Q resonances of the extended
-// set don't bleed sustained ring into the decay tail.
-//
-// Decay/coupling/dry-wet tuned 2026-04-25 against the SFZ Salamander C4
-// reference. Reference T60 vector at C4 is roughly
-//     n=1: 18.1s, n=2: 11.2s, n=3: 9.6s, n=4: 7.4s, n=5..8: 5.5..9.0s
-// (fundamental decays slowest, mid/high partials decay faster). The
-// previous parameter set (decay 0.9985 - 0.0035*high, coupling 0.025/7,
-// dry 0.5 / wet 0.35) gave a fundamental T60 of only 9.2s (-8.9s vs ref)
-// while h6-h8 came in 3-4s short — the wrong overall shape. The new
-// curve lifts the low-end base (0.9990) and steepens the high slope
-// (-0.0050 at 2 kHz) so n=1 sustains longer while n=6..8 decay closer
-// to ref. Coupling is halved (0.015/7) and the dry/wet rebalanced to
-// 0.7/0.20 to keep the soundboard from contributing the sustained
-// metallic ring the user described as "ドーンミャアああーーオーン".
-// ---------------------------------------------------------------------------
-
-pub struct PianoVoiceThick {
-    strings: [KsString; 7],
-    release: ReleaseEnvelope,
-    soundboard: crate::soundboard::Soundboard,
-    coupling: f32,
-}
-
-impl PianoVoiceThick {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let detunes = [
-            cents_to_ratio(-3.0),
-            cents_to_ratio(-2.0),
-            cents_to_ratio(-1.0),
-            1.0,
-            cents_to_ratio(1.0),
-            cents_to_ratio(2.0),
-            cents_to_ratio(3.0),
-        ];
-        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
-        // Frequency-dependent decay tuned against SFZ Salamander C4:
-        //   base  0.9990  → long fundamental (n=1 ~ 10s after coupling)
-        //   slope 0.0050  → steeper high-end falloff so h6-h8 don't ring
-        //                   past their reference T60.
-        let decay_for = |f: f32| -> f32 {
-            let high = (f / 2000.0).clamp(0.0, 1.0);
-            0.9990 - 0.0050 * high
-        };
-        let hammer_w = piano_hammer_width(velocity);
-        let mk = |freq_string: f32| -> KsString {
-            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
-            let buf = piano_hammer_excitation(n, hammer_w, amp);
-            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
-                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
-        };
-        let strings = [
-            mk(freq * detunes[0]),
-            mk(freq * detunes[1]),
-            mk(freq * detunes[2]),
-            mk(freq * detunes[3]),
-            mk(freq * detunes[4]),
-            mk(freq * detunes[5]),
-            mk(freq * detunes[6]),
-        ];
-        // 12-mode "lite" soundboard (no high-freq additions) so the
-        // upper-band high-Q resonances don't ring through the bridge
-        // feedback loop and colour the tail.
-        let soundboard = crate::soundboard::Soundboard::new_concert_grand_lite(sr);
-        // Coupling halved from 0.025/7 → 0.015/7. The previous value
-        // re-injected enough mid-band soundboard energy to extend
-        // partials 2-4 by 1-2 s vs the SFZ reference; halving keeps the
-        // body resonance audible without the sustained mid-band ring.
-        let coupling = 0.015_f32 / 7.0;
-        Self {
-            strings,
-            release: ReleaseEnvelope::new(0.300, sr),
-            soundboard,
-            coupling,
-        }
-    }
-}
-
-impl VoiceImpl for PianoVoiceThick {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        // dry/wet pushed from the original 0.5/0.35 balance toward dry
-        // dominance (0.7/0.20). With the lite soundboard the wet
-        // contribution was still bright enough to lift the late-decay
-        // spectral centroid well above the SFZ reference, perceived as
-        // the tail "オーン" sustained body resonance. Bringing the
-        // direct string sound forward keeps the immediate hammer attack
-        // primary; the soundboard sits behind as colour.
-        let dry_gain = 0.7_f32;
-        let wet_gain = 0.20_f32;
-        let string_norm = 1.0_f32 / 7.0;
-        for sample in buf.iter_mut() {
-            let fb = self.soundboard.last_output() * self.coupling;
-            if fb != 0.0 {
-                for s in &mut self.strings {
-                    s.inject_feedback(fb);
-                }
-            }
-            let mut s_sum = 0.0_f32;
-            for s in &mut self.strings {
-                s_sum += s.step();
-            }
-            let s_avg = s_sum * string_norm;
-            let board_out = self.soundboard.process(s_avg);
-            let env = self.release.step();
-            *sample += (s_avg * dry_gain + board_out * wet_gain) * env;
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
+        Engine::PianoThick => Box::new(PianoVoice::with_preset(
+            PianoPreset::PIANO_THICK,
+            sr,
+            freq,
+            velocity,
+        )),
+        Engine::PianoLite => Box::new(PianoVoice::with_preset(
+            PianoPreset::PIANO_LITE,
+            sr,
+            freq,
+            velocity,
+        )),
     }
 }
 
@@ -2074,22 +1926,57 @@ mod tests {
         assert!(v.is_done());
     }
 
-    // --- PianoVoiceThick -------------------------------------------------
+    // --- PianoVoice (PIANO_THICK preset) ---------------------------------
 
     #[test]
-    fn piano_thick_voice_renders_audio() {
-        let mut v = PianoVoiceThick::new(SR, 261.63, 100);
+    fn piano_thick_preset_renders_audio() {
+        let mut v = PianoVoice::with_preset(PianoPreset::PIANO_THICK, SR, 261.63, 100);
         let buf = render_n(&mut v, 4096);
         assert!(nonzero_peak(&buf) > 0.0);
     }
 
     #[test]
-    fn piano_thick_voice_release_lifecycle() {
-        let mut v = PianoVoiceThick::new(SR, 261.63, 100);
+    fn piano_thick_preset_release_lifecycle() {
+        let mut v = PianoVoice::with_preset(PianoPreset::PIANO_THICK, SR, 261.63, 100);
         v.trigger_release();
         assert!(v.is_releasing());
         let _ = render_n(&mut v, (SR * 0.7) as usize);
         assert!(v.is_done());
+    }
+
+    #[test]
+    fn piano_lite_preset_renders_audio() {
+        let mut v = PianoVoice::with_preset(PianoPreset::PIANO_LITE, SR, 261.63, 100);
+        let buf = render_n(&mut v, 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn piano_lite_preset_release_lifecycle() {
+        let mut v = PianoVoice::with_preset(PianoPreset::PIANO_LITE, SR, 261.63, 100);
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 0.7) as usize);
+        assert!(v.is_done());
+    }
+
+    #[test]
+    fn piano_detunes_symmetric_odd_count() {
+        let d = piano_detunes(7, 3.0);
+        assert_eq!(d.len(), 7);
+        // Centre is exactly 1.0
+        assert!((d[3] - 1.0).abs() < 1e-9);
+        // Symmetric: outermost ratio = 1 / opposite ratio (within FP).
+        assert!((d[0] * d[6] - 1.0).abs() < 1e-6);
+        assert!((d[1] * d[5] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn piano_detunes_three_string_lite() {
+        let d = piano_detunes(3, 1.5);
+        assert_eq!(d.len(), 3);
+        assert!((d[1] - 1.0).abs() < 1e-9);
+        assert!((d[0] * d[2] - 1.0).abs() < 1e-6);
     }
 
     // --- SfPianoPlaceholder ---------------------------------------------
