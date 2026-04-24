@@ -107,6 +107,38 @@ Free, redistributable piano-flavoured SoundFonts:
 Drop a `.sf2` anywhere on disk and pass the path via `--sf2`. Files are
 gitignored.
 
+## analyse: quantitative WAV comparison
+
+Ear-based "does this sound like piano?" is unfalsifiable — you can't tell
+whether a parameter tweak helped or hurt. The `analyse` binary turns each
+A/B into a single number (log-spectral distance in dB) plus per-harmonic
+decay tables, spectrogram PNGs, and a centroid CSV.
+
+```bash
+# 1. Render a reference + a candidate.
+cargo run --release --bin bench -- --sf2 GeneralUser-GS.sf2 \
+    --engine piano --reverb 0.6 --note 60 --duration 3
+# -> bench-out/4_soundfont_reference.wav, bench-out/2_piano_body_ir.wav, ...
+
+# 2. Compare them.
+cargo run --release --bin analyse -- \
+    --reference bench-out/4_soundfont_reference.wav \
+    --candidate bench-out/2_piano_body_ir.wav \
+    --note 60 --out bench-out/report/
+
+# 3. Read summary.txt, eyeball the spectrograms, check harmonics.json.
+cat bench-out/report/summary.txt
+
+# 4. Tweak engine params, re-bench, re-analyse, see if the LSD dropped.
+```
+
+Output dir contains:
+
+- `summary.txt`     human-readable single page (LSD, top-8 harmonics, centroid)
+- `spectrogram_reference.png` / `spectrogram_candidate.png`  (viridis dB scale)
+- `harmonics.json`  per-harmonic freq, T60, initial dB, fit R^2; plus deltas
+- `centroid.csv`    spectral centroid Hz per frame, both files
+
 ## License
 
 MIT (or whatever the user prefers later).

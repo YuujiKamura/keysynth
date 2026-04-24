@@ -5,6 +5,7 @@
 //! MIDI math. `ui` is the egui dashboard, kept here so both bins (or
 //! future tools) can re-skin or embed it.
 
+pub mod analysis;
 pub mod reverb;
 pub mod synth;
 pub mod ui;
