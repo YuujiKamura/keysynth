@@ -254,6 +254,11 @@ struct KsVoice {
     buf: Vec<f32>,
     head: usize,
     decay: f32,
+    // Fractional-delay tuning allpass: y[n] = c*x[n] + x[n-1] - c*y[n-1]
+    // where c = (1 - frac) / (1 + frac). Total delay = buf.len() + frac.
+    tune_coef: f32,
+    tune_xprev: f32,
+    tune_yprev: f32,
     released: bool,
     rel_mul: f32,
     rel_step: f32,
@@ -261,7 +266,13 @@ struct KsVoice {
 
 impl KsVoice {
     fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let n = ((sr / freq.max(1.0)).round() as usize).max(2);
+        // Fractional-delay decomposition: integer N + frac in [0, 1).
+        // Without this, notes above ~MIDI 72 mistune by tens of cents.
+        let raw = sr / freq.max(1.0);
+        let n_f = raw.floor();
+        let frac = raw - n_f;
+        let n = (n_f as usize).max(2);
+        let tune_coef = (1.0 - frac) / (1.0 + frac);
         let amp = (velocity.max(1) as f32) / 127.0;
         // Hammer excitation: velocity sets contact width -> spectral brightness.
         let width = hammer_width_for_velocity(velocity);
@@ -274,6 +285,9 @@ impl KsVoice {
             buf,
             head: 0,
             decay: 0.996,
+            tune_coef,
+            tune_xprev: 0.0,
+            tune_yprev: 0.0,
             released: false,
             rel_mul: 1.0,
             rel_step,
@@ -284,6 +298,7 @@ impl KsVoice {
 impl VoiceImpl for KsVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         let n = self.buf.len();
+        let c = self.tune_coef;
         for sample in buf.iter_mut() {
             let cur = self.buf[self.head];
             let prev = if self.head == 0 {
@@ -297,7 +312,13 @@ impl VoiceImpl for KsVoice {
                 out_sample *= self.rel_mul;
             }
             *sample += out_sample;
-            self.buf[self.head] = (cur + prev) * 0.5 * self.decay;
+            // Lowpass + decay, then 1st-order allpass tuning filter for the
+            // fractional-delay component.
+            let lp = (cur + prev) * 0.5 * self.decay;
+            let y = c * lp + self.tune_xprev - c * self.tune_yprev;
+            self.tune_xprev = lp;
+            self.tune_yprev = y;
+            self.buf[self.head] = y;
             self.head += 1;
             if self.head >= n {
                 self.head = 0;
@@ -574,23 +595,37 @@ struct KsString {
     buf: Vec<f32>,
     head: usize,
     decay: f32,
-    // 1-pole allpass state: y[n] = -a*x[n] + x[n-1] + a*y[n-1]
+    // Dispersion (stiffness) 1-pole allpass: textbook Smith form
+    //   H(z) = (a + z^-1) / (1 + a * z^-1)
+    //   y[n] = a * x[n] + x[n-1] - a * y[n-1]
     ap_coef: f32,
     ap_xprev: f32,
     ap_yprev: f32,
+    // Tuning 1-pole allpass for the fractional-delay component, same form.
+    // c = (1 - frac) / (1 + frac), giving group delay ~= frac at low freq.
+    // Total effective delay is buf.len() + frac.
+    tune_coef: f32,
+    tune_xprev: f32,
+    tune_yprev: f32,
 }
 
 impl KsString {
     fn new(sr: f32, freq: f32, amp: f32, ap_coef: f32, hammer_width: usize) -> Self {
-        let n = ((sr / freq.max(1.0)).round() as usize).max(2);
+        let (n, _frac) = Self::delay_length(sr, freq);
         let buf = hammer_excitation(n, hammer_width, amp);
-        Self::with_buf(buf, 0.997, ap_coef)
+        Self::with_buf(sr, freq, buf, 0.997, ap_coef)
     }
 
     /// Construct with a fully-prepared excitation buffer and explicit decay.
     /// Used by `piano` (asymmetric hammer + freq-dependent decay) and `koto`
     /// (offset pluck + long sustain) which need control beyond `new`.
-    fn with_buf(buf: Vec<f32>, decay: f32, ap_coef: f32) -> Self {
+    /// `sr` and `freq` are used to compute the fractional-delay tuning coef.
+    /// The caller MUST size `buf` to `delay_length(sr, freq).0`.
+    fn with_buf(sr: f32, freq: f32, buf: Vec<f32>, decay: f32, ap_coef: f32) -> Self {
+        let (_n, frac) = Self::delay_length(sr, freq);
+        // Allpass coefficient for fractional delay of `frac` samples.
+        // c = (1 - frac) / (1 + frac), Julius O. Smith, PASP.
+        let tune_coef = (1.0 - frac) / (1.0 + frac);
         Self {
             buf,
             head: 0,
@@ -598,11 +633,22 @@ impl KsString {
             ap_coef,
             ap_xprev: 0.0,
             ap_yprev: 0.0,
+            tune_coef,
+            tune_xprev: 0.0,
+            tune_yprev: 0.0,
         }
     }
 
-    fn delay_length(sr: f32, freq: f32) -> usize {
-        ((sr / freq.max(1.0)).round() as usize).max(2)
+    /// Returns (integer delay length N, fractional component in [0, 1)).
+    /// Total target period = N + frac samples.
+    fn delay_length(sr: f32, freq: f32) -> (usize, f32) {
+        let raw = sr / freq.max(1.0);
+        // Reserve ~1 sample for the tuning allpass; ensure N >= 2.
+        // Use floor so frac in [0, 1).
+        let n_f = raw.floor();
+        let frac = raw - n_f;
+        let n = (n_f as usize).max(2);
+        (n, frac)
     }
 
     #[inline]
@@ -616,11 +662,18 @@ impl KsString {
         };
         // Standard 2-tap lowpass average + decay
         let lp = (cur + prev) * 0.5 * self.decay;
-        // 1-pole allpass for dispersion (stiffness)
+        // Dispersion 1-pole allpass (stiffness): textbook Smith form.
+        //   y[n] = a * x[n] + x[n-1] - a * y[n-1]
         let a = self.ap_coef;
-        let y = -a * lp + self.ap_xprev + a * self.ap_yprev;
+        let disp = a * lp + self.ap_xprev - a * self.ap_yprev;
         self.ap_xprev = lp;
-        self.ap_yprev = y;
+        self.ap_yprev = disp;
+        // Tuning allpass: same form, separate state. Placed AFTER dispersion
+        // so the fractional delay sees the full feedback chain.
+        let c = self.tune_coef;
+        let y = c * disp + self.tune_xprev - c * self.tune_yprev;
+        self.tune_xprev = disp;
+        self.tune_yprev = y;
         self.buf[self.head] = y;
         self.head += 1;
         if self.head >= n {
@@ -786,7 +839,10 @@ impl PianoVoice {
     fn new(sr: f32, freq: f32, velocity: u8) -> Self {
         let amp = (velocity.max(1) as f32) / 127.0;
         let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let detunes = [cents_to_ratio(-7.0), 1.0, cents_to_ratio(7.0)];
+        // Real piano triple-string unison detune: ~0.5-2 cents
+        // (Weinreich 1977, "Coupled piano strings"). Wider spreads
+        // (e.g. +/-7c) sound like an out-of-tune honky-tonk, not a piano.
+        let detunes = [cents_to_ratio(-1.5), 1.0, cents_to_ratio(1.5)];
         // Stronger stiffness than ks-rich + scaled with frequency.
         let ap = (0.25 + (freq / 1500.0).min(0.30)).min(0.50);
         // Frequency-dependent decay: 110 Hz -> 0.9990 (long); 2000 Hz -> 0.9930 (short)
@@ -796,9 +852,9 @@ impl PianoVoice {
         };
         let hammer_w = piano_hammer_width(velocity);
         let mk = |freq_string: f32| -> KsString {
-            let n = KsString::delay_length(sr, freq_string);
+            let (n, _frac) = KsString::delay_length(sr, freq_string);
             let buf = piano_hammer_excitation(n, hammer_w, amp);
-            KsString::with_buf(buf, decay_for(freq_string), ap)
+            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
         };
         let strings = [
             mk(freq * detunes[0]),
@@ -855,16 +911,25 @@ impl VoiceImpl for PianoVoice {
 //   - LONG sustain (decay closer to 1.0) - acoustic koto strings ring 5-15s
 //   - MINIMAL allpass dispersion - low stiffness, harmonic spectrum
 
-fn koto_pluck_excitation(n: usize, amp: f32, offset: usize) -> Vec<f32> {
+fn koto_pluck_excitation(n: usize, amp: f32, pluck_pos: usize) -> Vec<f32> {
     let mut buf = vec![0.0_f32; n];
     if n == 0 {
         return buf;
     }
-    // Two-sample plectrum: a sharp positive spike followed by a smaller
-    // negative tail (string snaps back). This gives the characteristic
-    // "click" of fingernail/tsume contact.
-    buf[offset % n] = amp;
-    buf[(offset + 1) % n] = -amp * 0.3;
+    // Pluck-position FIR comb (1 - z^-p): inject the plectrum at offset 0
+    // AND a sign-reversed copy at offset `pluck_pos`. This is the standard
+    // pluck-position model in Karplus-Strong (the original a-spike-at-offset
+    // form was just a time shift, not a comb, so it produced no notches).
+    // Result: spectrum has nulls at every (sr / pluck_pos) Hz, giving the
+    // classic bridge-vs-middle pluck timbre.
+    //
+    // Two-sample plectrum shape kept (sharp + small negative snap-back),
+    // so each "tap" of the comb is a (+amp, -0.3*amp) pair.
+    buf[0] = amp;
+    buf[1 % n] += -amp * 0.3;
+    let p = pluck_pos % n;
+    buf[p] += -amp;
+    buf[(p + 1) % n] += amp * 0.3;
     buf
 }
 
@@ -878,12 +943,14 @@ struct KotoVoice {
 impl KotoVoice {
     fn new(sr: f32, freq: f32, velocity: u8) -> Self {
         let amp = (velocity.max(1) as f32) / 127.0;
-        let n = KsString::delay_length(sr, freq);
-        // Pluck near 1/4 of string length (typical koto tsume position)
-        let pluck_offset = n / 4;
-        let buf = koto_pluck_excitation(n, amp, pluck_offset);
+        let (n, _frac) = KsString::delay_length(sr, freq);
+        // Pluck near 1/4 of string length (typical koto tsume position).
+        // Combined with the comb-FIR shape in koto_pluck_excitation, this
+        // gives the bridge-side bright/twangy timbre.
+        let pluck_pos = n / 4;
+        let buf = koto_pluck_excitation(n, amp, pluck_pos);
         // Long sustain, very mild stiffness.
-        let string = KsString::with_buf(buf, 0.9992, 0.05);
+        let string = KsString::with_buf(sr, freq, buf, 0.9992, 0.05);
         let release_sec = 0.500_f32; // longer release = "ふわっと消える"
         let release_samples = (release_sec * sr).max(1.0);
         let rel_step = (1e-3_f32.ln() / release_samples).exp();
