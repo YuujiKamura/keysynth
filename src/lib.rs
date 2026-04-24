@@ -6,6 +6,7 @@
 //! future tools) can re-skin or embed it.
 
 pub mod analysis;
+pub mod extract;
 pub mod gm;
 pub mod reverb;
 pub mod sfz;
