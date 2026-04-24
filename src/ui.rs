@@ -76,7 +76,8 @@ impl eframe::App for KeysynthApp {
                 cc_raw: d.cc_raw.clone(),
                 cc_count: d.cc_count.clone(),
                 active_notes: d.active_notes.clone(),
-                recent: d.recent.iter().cloned().collect(),
+                // Only clone the tail we actually display (newest 60, pre-reversed).
+                recent: d.recent.iter().rev().take(60).cloned().collect(),
             };
             (m, e, snap)
         };
@@ -119,7 +120,8 @@ impl eframe::App for KeysynthApp {
             egui::ScrollArea::vertical()
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    for line in dash_snapshot.recent.iter().rev().take(60) {
+                    // Snapshot is already newest-first and capped at 60.
+                    for line in dash_snapshot.recent.iter() {
                         ui.monospace(line);
                     }
                 });
@@ -235,10 +237,26 @@ impl eframe::App for KeysynthApp {
 
         // Write back any GUI-driven changes. Skip the lock entirely if
         // nothing changed so we don't fight the MIDI thread for it.
-        if (master - master_before).abs() > 1e-6 || engine != engine_before {
+        //
+        // For `master` we apply the GUI movement as a DELTA on the current
+        // value rather than a blind absolute write. The MIDI callback may
+        // have nudged `master` (CC70 encoder) between our snapshot at frame
+        // start and this write-back; an absolute set would silently discard
+        // that concurrent change. Delta-apply preserves both edits.
+        //
+        // For `engine` last-writer-wins is fine: it's a discrete choice, not
+        // an accumulator, so racing two writers just picks one.
+        let gui_master_delta = master - master_before;
+        let master_changed = gui_master_delta.abs() > 1e-6;
+        let engine_changed = engine != engine_before;
+        if master_changed || engine_changed {
             let mut lp = self.ctx.live.lock().unwrap();
-            lp.master = master;
-            lp.engine = engine;
+            if master_changed {
+                lp.master = (lp.master + gui_master_delta).clamp(0.0, 3.0);
+            }
+            if engine_changed {
+                lp.engine = engine;
+            }
         }
     }
 }

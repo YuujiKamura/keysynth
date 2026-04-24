@@ -108,7 +108,7 @@ fn print_help() {
     println!(
         "keysynth - real-time MIDI keyboard -> speaker synth\n\n\
          USAGE:\n  \
-            keysynth [--engine square|ks] [--port NAME] [--master FLOAT]\n  \
+            keysynth [--engine square|ks|ks-rich|sub|fm|piano|koto] [--port NAME] [--master FLOAT]\n  \
             keysynth --list\n\n\
          OPTIONS:\n  \
             --engine ENGINE   square|ks|ks-rich|sub|fm|piano|koto\n  \
@@ -765,7 +765,7 @@ impl VoiceImpl for KsRichVoice {
 fn hammer_width_for_velocity(vel: u8) -> usize {
     // vel=127 -> 3 samples (sharp click, very bright)
     // vel=20  -> ~19 samples (soft, mellow)
-    let v = vel.max(1).min(127) as f32;
+    let v = vel.clamp(1, 127) as f32;
     (3.0 + (127.0 - v) * 0.13) as usize
 }
 
@@ -802,7 +802,7 @@ fn hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
 fn piano_hammer_width(vel: u8) -> usize {
     // vel=127 -> 20 samples (~0.45 ms): firm but felt
     // vel=20  -> 200 samples (~4.5 ms): very soft
-    let v = vel.max(1).min(127) as f32;
+    let v = vel.clamp(1, 127) as f32;
     (20.0 + (127.0 - v) * 1.7) as usize
 }
 
@@ -982,27 +982,6 @@ impl VoiceImpl for KotoVoice {
     }
 }
 
-// xorshift32, thread-local. No extra crate.
-// Kept available for future engines (noise oscillator, sample-and-hold, etc.)
-#[allow(dead_code)]
-fn fastrand_f32() -> f32 {
-    use std::cell::Cell;
-    thread_local! {
-        static STATE: Cell<u32> = Cell::new(0x9E37_79B9);
-    }
-    STATE.with(|s| {
-        let mut x = s.get();
-        if x == 0 {
-            x = 0x1234_5678;
-        }
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        s.set(x);
-        (x as f32) / (u32::MAX as f32)
-    })
-}
-
 // ---------------------------------------------------------------------------
 
 fn midi_to_freq(note: u8) -> f32 {
@@ -1165,7 +1144,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *d.cc_count.entry(cc_num).or_insert(0) += 1;
                         d.push_event(format!("CC{cc_num}={cc_val} ch{channel}"));
                     }
-                    eprintln!("midi: CC{cc_num}={cc_val} (ch={channel})");
 
                     // MPK mini 3 K1-K8 are ROTARY ENCODERS in relative mode:
                     //   1..63   = +N step(s) clockwise
@@ -1180,17 +1158,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match cc_num {
                         // CC 7 = absolute MIDI Volume (rare on MPK).
+                        // Top out at 3.0 to match the GUI slider + CC70 range.
                         7 => {
-                            let new_master = (cc_val as f32 / 127.0) * 2.0;
+                            let new_master = (cc_val as f32 / 127.0) * 3.0;
                             live_for_midi.lock().unwrap().master = new_master;
-                            eprintln!("    -> master = {new_master:.3} (absolute)");
                         }
                         // CC 70 = MPK K1 (relative encoder by default).
                         // 1 tick = +/- 0.05 master gain, clamped 0..3.0.
                         70 => {
                             let mut p = live_for_midi.lock().unwrap();
                             p.master = (p.master + delta_ticks as f32 * 0.05).clamp(0.0, 3.0);
-                            eprintln!("    -> master = {:.3} (delta={delta_ticks:+})", p.master);
                         }
                         _ => {}
                     }
@@ -1247,7 +1224,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut mono_scratch,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
-                        let clamped = src.max(-1.0).min(1.0);
+                        let clamped = src.clamp(-1.0, 1.0);
                         *dst = (clamped * i16::MAX as f32) as i16;
                     }
                 },
@@ -1275,7 +1252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut mono_scratch,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
-                        let clamped = src.max(-1.0).min(1.0);
+                        let clamped = src.clamp(-1.0, 1.0);
                         let unsigned = ((clamped + 1.0) * 0.5 * u16::MAX as f32) as u16;
                         *dst = unsigned;
                     }
