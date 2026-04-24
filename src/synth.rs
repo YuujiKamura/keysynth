@@ -8,8 +8,31 @@
 //!   - square : NES-style pulse wave with linear AR envelope
 //!   - ks     : Karplus-Strong plucked string (single delay line + 2-tap
 //!              lowpass), Phase 1 physical model
+//!
+//! Per-engine voice impls live under `crate::voices::*` (issue #2 split).
+//! This module keeps the shared primitives (`ReleaseEnvelope`, `Adsr`,
+//! `KsString`, hammer/pluck excitations) plus the `Engine` enum, the
+//! `VoiceImpl` trait, and the `make_voice` factory; voice types are
+//! re-exported below so external callers (`main.rs`, `bench`) can keep
+//! importing them via `keysynth::synth::*`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+
+pub mod voices {
+    //! Re-exported for callers that prefer `keysynth::synth::voices::...`.
+    pub use crate::voices::*;
+}
+
+// Public re-exports of the voice impls so `keysynth::synth::SquareVoice`
+// etc. keep resolving for `main.rs` / `bench` / external tests.
+pub use crate::voices::fm::FmVoice;
+pub use crate::voices::koto::{koto_pluck_excitation, KotoVoice};
+pub use crate::voices::ks::KsVoice;
+pub use crate::voices::ks_rich::KsRichVoice;
+pub use crate::voices::piano::{PianoPreset, PianoVoice, SoundboardKind};
+pub use crate::voices::placeholder::SfPianoPlaceholder;
+pub use crate::voices::square::SquareVoice;
+pub use crate::voices::sub::SubVoice;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
@@ -162,7 +185,7 @@ impl ReleaseEnvelope {
 }
 
 // ---------------------------------------------------------------------------
-// Voice trait + implementations
+// Voice trait
 // ---------------------------------------------------------------------------
 
 pub trait VoiceImpl: Send {
@@ -271,148 +294,12 @@ impl DashState {
     }
 }
 
-// --- Square voice ----------------------------------------------------------
-
-pub struct SquareVoice {
-    sr: f32,
-    freq: f32,
-    amp: f32,
-    phase: f32,
-    env: f32,
-    released: bool,
-    attack_per_sample: f32,
-    release_per_sample: f32,
-}
-
-impl SquareVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let attack_sec = 0.005_f32;
-        let release_sec = 0.080_f32;
-        Self {
-            sr,
-            freq,
-            amp: (velocity.max(1) as f32) / 127.0,
-            phase: 0.0,
-            env: 0.0,
-            released: false,
-            attack_per_sample: 1.0 / (attack_sec * sr),
-            release_per_sample: 1.0 / (release_sec * sr),
-        }
-    }
-}
-
-impl VoiceImpl for SquareVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        let inc = self.freq / self.sr;
-        for sample in buf.iter_mut() {
-            if self.released {
-                self.env = (self.env - self.release_per_sample).max(0.0);
-            } else if self.env < 1.0 {
-                self.env = (self.env + self.attack_per_sample).min(1.0);
-            }
-            let s = if self.phase < 0.5 { 1.0 } else { -1.0 };
-            *sample += s * self.env * self.amp;
-            self.phase += inc;
-            if self.phase >= 1.0 {
-                self.phase -= 1.0;
-            }
-        }
-    }
-    // SquareVoice uses a linear AR envelope rather than the shared
-    // multiplicative ReleaseEnvelope, so it overrides the trait methods.
-    fn trigger_release(&mut self) {
-        self.released = true;
-    }
-    fn is_done(&self) -> bool {
-        self.released && self.env <= 1e-5
-    }
-    fn is_releasing(&self) -> bool {
-        self.released
-    }
-}
-
-// --- Karplus-Strong voice --------------------------------------------------
-
-pub struct KsVoice {
-    buf: Vec<f32>,
-    head: usize,
-    decay: f32,
-    // Fractional-delay tuning allpass: y[n] = c*x[n] + x[n-1] - c*y[n-1]
-    // where c = (1 - frac) / (1 + frac). Total delay = buf.len() + frac.
-    tune_coef: f32,
-    tune_xprev: f32,
-    tune_yprev: f32,
-    release: ReleaseEnvelope,
-}
-
-impl KsVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        // Fractional-delay decomposition: integer N + frac in [0, 1).
-        // Without this, notes above ~MIDI 72 mistune by tens of cents.
-        // Reserve 0.5 sample for the in-loop 2-tap LPF (group delay = 0.5
-        // at low freq); the tuning AP picks up the rest.
-        let raw = sr / freq.max(1.0);
-        let target = (raw - 0.5_f32).max(2.0);
-        let n_f = target.floor();
-        let frac = target - n_f;
-        let n = (n_f as usize).max(2);
-        let tune_coef = (1.0 - frac) / (1.0 + frac);
-        let amp = (velocity.max(1) as f32) / 127.0;
-        // Hammer excitation: velocity sets contact width -> spectral brightness.
-        let width = hammer_width_for_velocity(velocity);
-        let buf = hammer_excitation(n, width, amp);
-        Self {
-            buf,
-            head: 0,
-            decay: 0.996,
-            tune_coef,
-            tune_xprev: 0.0,
-            tune_yprev: 0.0,
-            release: ReleaseEnvelope::new(0.150, sr),
-        }
-    }
-}
-
-impl VoiceImpl for KsVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        let n = self.buf.len();
-        let c = self.tune_coef;
-        for sample in buf.iter_mut() {
-            let cur = self.buf[self.head];
-            let prev = if self.head == 0 {
-                self.buf[n - 1]
-            } else {
-                self.buf[self.head - 1]
-            };
-            let env = self.release.step();
-            *sample += cur * env;
-            // Lowpass + decay, then 1st-order allpass tuning filter for the
-            // fractional-delay component.
-            let lp = (cur + prev) * 0.5 * self.decay;
-            let y = c * lp + self.tune_xprev - c * self.tune_yprev;
-            self.tune_xprev = lp;
-            self.tune_yprev = y;
-            self.buf[self.head] = y;
-            self.head += 1;
-            if self.head >= n {
-                self.head = 0;
-            }
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Shared: 4-stage ADSR envelope
+// Shared: 4-stage ADSR envelope (used by SubVoice + FmVoice).
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdsrStage {
+pub(crate) enum AdsrStage {
     Attack,
     Decay,
     Sustain,
@@ -420,7 +307,7 @@ enum AdsrStage {
     Done,
 }
 
-struct Adsr {
+pub(crate) struct Adsr {
     sr: f32,
     attack_s: f32,
     decay_s: f32,
@@ -436,7 +323,7 @@ struct Adsr {
 }
 
 impl Adsr {
-    fn new(sr: f32, attack_s: f32, decay_s: f32, sustain: f32, release_s: f32) -> Self {
+    pub(crate) fn new(sr: f32, attack_s: f32, decay_s: f32, sustain: f32, release_s: f32) -> Self {
         Self {
             sr,
             attack_s: attack_s.max(1e-4),
@@ -449,7 +336,7 @@ impl Adsr {
         }
     }
 
-    fn release(&mut self) {
+    pub(crate) fn release(&mut self) {
         if self.value <= 1e-6 {
             // Nothing to fade; mark done so the voice gets cleaned up.
             self.stage = AdsrStage::Done;
@@ -459,7 +346,7 @@ impl Adsr {
         }
     }
 
-    fn next(&mut self) -> f32 {
+    pub(crate) fn next(&mut self) -> f32 {
         match self.stage {
             AdsrStage::Attack => {
                 let rate = 1.0 / (self.attack_s * self.sr);
@@ -492,192 +379,19 @@ impl Adsr {
         self.value
     }
 
-    fn done(&self) -> bool {
+    pub(crate) fn done(&self) -> bool {
         matches!(self.stage, AdsrStage::Done)
     }
 
-    fn is_releasing(&self) -> bool {
+    pub(crate) fn is_releasing(&self) -> bool {
         matches!(self.stage, AdsrStage::Release | AdsrStage::Done)
     }
 }
 
 // ---------------------------------------------------------------------------
-// Subtractive: saw -> SVF lowpass (cutoff env) -> ADSR amp
+// KsString: shared single-delay-line primitive used by every plucked-string
+// voice (Ks/KsRich/Piano/Koto) and by the SympatheticBank.
 // ---------------------------------------------------------------------------
-//
-// State-Variable Filter is the TPT (topology-preserving transform) form by
-// Andrew Simper / Cytomic. It stays stable across the full audio range and
-// has no zero-delay-feedback issues.
-
-pub struct SubVoice {
-    sr: f32,
-    freq: f32,
-    amp: f32,
-    phase: f32, // 0..1 for sawtooth
-    amp_env: Adsr,
-    filt_env: Adsr,
-    // Cutoff: cutoff_base + cutoff_env_amount * filt_env (Hz)
-    cutoff_base: f32,
-    cutoff_env_amount: f32,
-    q: f32,
-    // SVF state
-    ic1eq: f32,
-    ic2eq: f32,
-}
-
-impl SubVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        Self {
-            sr,
-            freq,
-            amp,
-            phase: 0.0,
-            // Punchy bass-synth defaults: fast attack, fast filter sweep.
-            amp_env: Adsr::new(sr, 0.005, 0.250, 0.55, 0.250),
-            filt_env: Adsr::new(sr, 0.001, 0.180, 0.20, 0.250),
-            cutoff_base: 200.0,
-            cutoff_env_amount: 5500.0,
-            q: 1.4,
-            ic1eq: 0.0,
-            ic2eq: 0.0,
-        }
-    }
-
-    #[inline]
-    fn svf_lowpass(&mut self, x: f32, cutoff: f32) -> f32 {
-        let g = (std::f32::consts::PI * cutoff / self.sr).tan();
-        let k = 1.0 / self.q.max(0.5);
-        let denom = 1.0 + g * (g + k);
-        let a1 = 1.0 / denom;
-        let a2 = g * a1;
-        let a3 = g * a2;
-        let v3 = x - self.ic2eq;
-        let v1 = a1 * self.ic1eq + a2 * v3;
-        let v2 = self.ic2eq + a2 * self.ic1eq + a3 * v3;
-        self.ic1eq = 2.0 * v1 - self.ic1eq;
-        self.ic2eq = 2.0 * v2 - self.ic2eq;
-        v2
-    }
-}
-
-impl VoiceImpl for SubVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        let inc = self.freq / self.sr;
-        let nyq = self.sr * 0.45;
-        for sample in buf.iter_mut() {
-            // Naive sawtooth -1..+1; aliases above ~5kHz fundamental but
-            // pleasantly rough for most playable range.
-            let osc = self.phase * 2.0 - 1.0;
-            self.phase += inc;
-            if self.phase >= 1.0 {
-                self.phase -= 1.0;
-            }
-
-            let fe = self.filt_env.next();
-            let cutoff = (self.cutoff_base + self.cutoff_env_amount * fe).clamp(20.0, nyq);
-            let filtered = self.svf_lowpass(osc, cutoff);
-            let ae = self.amp_env.next();
-
-            *sample += filtered * ae * self.amp;
-        }
-    }
-    // SubVoice uses dual ADSR envelopes (amp + filter) rather than the
-    // shared ReleaseEnvelope, so it overrides the trait methods.
-    fn trigger_release(&mut self) {
-        self.amp_env.release();
-        self.filt_env.release();
-    }
-    fn is_done(&self) -> bool {
-        self.amp_env.done()
-    }
-    fn is_releasing(&self) -> bool {
-        self.amp_env.is_releasing()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// FM: 2-op (carrier + modulator), modulator has its own ADSR
-// ---------------------------------------------------------------------------
-//
-// modulator_out = sin(TAU * mod_phase) * mod_index * mod_env
-// carrier_out   = sin(TAU * car_phase + modulator_out) * amp_env
-//
-// Default ratio 14:1 + fast mod-env decay = DX7-ish bell / EP "tine" sound.
-
-pub struct FmVoice {
-    sr: f32,
-    car_freq: f32,
-    car_phase: f32,
-    mod_freq: f32,
-    mod_phase: f32,
-    mod_index: f32,
-    amp: f32,
-    amp_env: Adsr,
-    mod_env: Adsr,
-}
-
-impl FmVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        let ratio = 14.0_f32;
-        Self {
-            sr,
-            car_freq: freq,
-            car_phase: 0.0,
-            mod_freq: freq * ratio,
-            mod_phase: 0.0,
-            mod_index: 4.0,
-            amp,
-            amp_env: Adsr::new(sr, 0.002, 0.800, 0.0, 0.500),
-            mod_env: Adsr::new(sr, 0.001, 0.350, 0.0, 0.350),
-        }
-    }
-}
-
-impl VoiceImpl for FmVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        use std::f32::consts::TAU;
-        let car_inc = self.car_freq / self.sr;
-        let mod_inc = self.mod_freq / self.sr;
-        for sample in buf.iter_mut() {
-            let me = self.mod_env.next();
-            let modulator = (TAU * self.mod_phase).sin() * self.mod_index * me;
-            let carrier = (TAU * self.car_phase + modulator).sin();
-            let ae = self.amp_env.next();
-            *sample += carrier * ae * self.amp;
-            self.car_phase += car_inc;
-            if self.car_phase >= 1.0 {
-                self.car_phase -= 1.0;
-            }
-            self.mod_phase += mod_inc;
-            if self.mod_phase >= 1.0 {
-                self.mod_phase -= 1.0;
-            }
-        }
-    }
-    // FmVoice uses dual ADSR envelopes (amp + mod-index) rather than the
-    // shared ReleaseEnvelope, so it overrides the trait methods.
-    fn trigger_release(&mut self) {
-        self.amp_env.release();
-        self.mod_env.release();
-    }
-    fn is_done(&self) -> bool {
-        self.amp_env.done()
-    }
-    fn is_releasing(&self) -> bool {
-        self.amp_env.is_releasing()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// KS-rich: 3 detuned strings + 1-pole allpass dispersion (stiffness)
-// ---------------------------------------------------------------------------
-//
-// Each "string" is an independent KS delay loop. Per-string detune (cents)
-// gives chorus/unison thickness like real piano triple-stringing. A single
-// allpass in the feedback path adds frequency-dependent phase delay -> the
-// inharmonicity that makes piano upper partials slightly sharp.
 
 pub struct KsString {
     buf: Vec<f32>,
@@ -884,59 +598,6 @@ impl KsString {
     }
 }
 
-pub struct KsRichVoice {
-    strings: [KsString; 3],
-    release: ReleaseEnvelope,
-}
-
-impl KsRichVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        // Detune cents: -7, 0, +7 -> classic piano triple-string spread
-        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let detunes = [cents_to_ratio(-7.0), 1.0, cents_to_ratio(7.0)];
-        // Higher notes get slightly more allpass coefficient (more stiffness),
-        // mimicking real piano string behaviour where shorter strings are
-        // stiffer relative to their length.
-        let ap = (0.18 + (freq / 2000.0).min(0.20)).min(0.40);
-        // Same hammer hits all 3 strings in phase; detune drives them apart
-        // over time, producing the classic chorus / beating effect.
-        let hammer_w = hammer_width_for_velocity(velocity);
-        let strings = [
-            KsString::new(sr, freq * detunes[0], amp, ap, hammer_w),
-            KsString::new(sr, freq * detunes[1], amp, ap, hammer_w),
-            KsString::new(sr, freq * detunes[2], amp, ap, hammer_w),
-        ];
-        Self {
-            strings,
-            release: ReleaseEnvelope::new(0.250, sr),
-        }
-    }
-}
-
-// (is_releasing override added on each piano-family voice impl below so the
-// MIDI eviction in main.rs can identify "release-tail" voices for eviction
-// before falling back to slot-0 (which silently kills currently-sounding
-// notes when the user plays >= 32 simultaneous notes).)
-
-impl VoiceImpl for KsRichVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        // Mix the 3 strings; equal-power-ish gain (1/sqrt(3) ~= 0.577).
-        let gain = 0.577_f32;
-        for sample in buf.iter_mut() {
-            let s = self.strings[0].step() + self.strings[1].step() + self.strings[2].step();
-            let env = self.release.step();
-            *sample += s * gain * env;
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Hammer excitation (shared by ks / ks-rich)
 // ---------------------------------------------------------------------------
@@ -976,17 +637,8 @@ pub fn hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
-// Piano-leaning DWS engine
+// Piano hammer: ms-scale asymmetric (Hann rise + exponential decay).
 // ---------------------------------------------------------------------------
-//
-// Differences from `ks-rich`:
-//   - WIDER, ms-scale hammer contact (20-200 samples vs 3-19)
-//     -> contact pulse closer to real piano (hammer felt compresses over ms)
-//   - ASYMMETRIC hammer profile: linear rise + exponential decay
-//     -> mimics felt strike physics (sharp impact, slow release)
-//   - FREQUENCY-DEPENDENT decay: high notes die faster
-//     -> matches real piano where treble strings have less mass / faster damp
-//   - Stronger allpass dispersion -> more inharmonicity (piano stretch tuning)
 
 pub fn piano_hammer_width(vel: u8) -> usize {
     // vel=127 -> 20 samples (~0.45 ms): firm but felt
@@ -1020,308 +672,6 @@ pub fn piano_hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
         buf[rise + i] = (-t / tau).exp() * amp;
     }
     buf
-}
-
-// ---------------------------------------------------------------------------
-// Piano preset container (issue #2 transition: unify Piano/PianoThick/PianoLite
-// into one parameterised voice). Adding a new preset = one const-struct entry.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SoundboardKind {
-    /// Full 16-mode bank used by the original `Piano` preset.
-    ConcertGrand,
-    /// 12-mode lite bank — drops the high-Q upper-band modes that were
-    /// ringing through the bridge feedback loop in the full preset.
-    Lite,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PianoPreset {
-    /// Number of detuned KS strings ganged in unison.
-    pub string_count: usize,
-    /// Half-spread of the detune in cents. Strings are placed symmetrically
-    /// around 1.0 (centre). For odd counts the centre string is at 0 cents.
-    pub detune_cents_half_spread: f32,
-    /// Which soundboard mode bank to use.
-    pub soundboard: SoundboardKind,
-    /// Per-string KS in-loop decay at low freq (~110 Hz).
-    pub decay_base: f32,
-    /// Decay slope at 2 kHz. The per-string decay multiplier is
-    /// `decay_base - decay_slope * (freq/2000).clamp(0,1)`.
-    pub decay_slope: f32,
-    /// Bridge feedback coefficient injected into each string per sample.
-    /// Already pre-divided by string_count for presets where total bridge
-    /// energy is normalised; raw (un-divided) for presets that explicitly
-    /// want stronger per-string coupling.
-    pub coupling_per_string: f32,
-    /// Dry string-sum gain in the final mix.
-    pub dry_gain: f32,
-    /// Wet soundboard-output gain in the final mix.
-    pub wet_gain: f32,
-    /// Voice release time (seconds) handed to the shared ReleaseEnvelope.
-    pub release_sec: f32,
-}
-
-impl PianoPreset {
-    /// Original `Piano` engine: 7 strings, full ConcertGrand 16-mode body,
-    /// dry/wet 0.5/0.35. Bridge feedback normalised across the 7 strings.
-    pub const PIANO: Self = Self {
-        string_count: 7,
-        detune_cents_half_spread: 3.0,
-        soundboard: SoundboardKind::ConcertGrand,
-        decay_base: 0.9985,
-        decay_slope: 0.0035,
-        coupling_per_string: 0.012 / 7.0,
-        dry_gain: 0.5,
-        wet_gain: 0.35,
-        release_sec: 0.300,
-    };
-    /// `PianoThick`: 7 strings + 12-mode lite body so the high-Q upper-band
-    /// modes don't ring through the bridge loop. Decay base lifted to keep
-    /// the fundamental sustaining (closer to the SFZ Salamander C4 ref) and
-    /// dry-dominant 0.7/0.20 mix to suppress the metallic body sustain.
-    pub const PIANO_THICK: Self = Self {
-        string_count: 7,
-        detune_cents_half_spread: 3.0,
-        soundboard: SoundboardKind::Lite,
-        decay_base: 0.9990,
-        decay_slope: 0.0050,
-        coupling_per_string: 0.015 / 7.0,
-        dry_gain: 0.7,
-        wet_gain: 0.20,
-        release_sec: 0.300,
-    };
-    /// `PianoLite`: 3 strings + 12-mode lite body. v4 tuning lands h1 T60
-    /// within 8% of the SFZ Salamander C4 reference. Coupling is NOT
-    /// pre-divided here — the original PianoLite ran 0.015/string × 3
-    /// strings = 0.045 total bridge energy by design.
-    pub const PIANO_LITE: Self = Self {
-        string_count: 3,
-        detune_cents_half_spread: 1.5,
-        soundboard: SoundboardKind::Lite,
-        decay_base: 0.9980,
-        decay_slope: 0.0025,
-        coupling_per_string: 0.015,
-        dry_gain: 0.5,
-        wet_gain: 0.35,
-        release_sec: 0.300,
-    };
-}
-
-/// Build the symmetric per-string detune ratios for a preset's string count
-/// and half-spread. Reproduces the explicit arrays the pre-unification
-/// `PianoVoice` / `PianoVoiceThick` (7-string, ±3 c) and `PianoVoiceLite`
-/// (3-string, ±1.5 c) used.
-fn piano_detunes(count: usize, half_cents: f32) -> Vec<f32> {
-    if count == 0 {
-        return Vec::new();
-    }
-    if count == 1 {
-        return vec![1.0];
-    }
-    let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-    let mut v = Vec::with_capacity(count);
-    if count % 2 == 1 {
-        let half = (count - 1) / 2;
-        let step = half_cents / (half as f32);
-        for i in 0..count {
-            let offset_cents = (i as f32 - half as f32) * step;
-            v.push(if offset_cents == 0.0 {
-                1.0
-            } else {
-                cents_to_ratio(offset_cents)
-            });
-        }
-    } else {
-        let step = (2.0 * half_cents) / ((count - 1) as f32);
-        for i in 0..count {
-            let offset_cents = -half_cents + (i as f32) * step;
-            v.push(cents_to_ratio(offset_cents));
-        }
-    }
-    v
-}
-
-pub struct PianoVoice {
-    /// Detuned KS strings (count comes from `PianoPreset::string_count`).
-    /// `Vec` rather than a fixed array so a single struct serves all
-    /// presets — this is the issue #2 transition fix.
-    strings: Vec<KsString>,
-    release: ReleaseEnvelope,
-    /// Modal soundboard resonator bank. Receives the summed string output
-    /// every sample and feeds back into the strings via `coupling_per_string`
-    /// for physical bridge coupling (Bank/Lehtonen DWS).
-    soundboard: crate::soundboard::Soundboard,
-    coupling_per_string: f32,
-    dry_gain: f32,
-    wet_gain: f32,
-    /// 1.0 / string_count — applied to the string sum so the in-phase
-    /// attack peak stays bounded regardless of preset.
-    string_norm: f32,
-}
-
-impl PianoVoice {
-    /// Construct a piano voice using `PianoPreset::PIANO` (the original
-    /// 7-string ConcertGrand defaults). Kept as `new` for backward
-    /// compatibility with existing tests.
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        Self::with_preset(PianoPreset::PIANO, sr, freq, velocity)
-    }
-
-    /// Construct a piano voice using an arbitrary preset. This is the
-    /// canonical entry point — `Engine::Piano`/`PianoThick`/`PianoLite`
-    /// all dispatch here with different presets.
-    pub fn with_preset(preset: PianoPreset, sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        let detunes = piano_detunes(preset.string_count, preset.detune_cents_half_spread);
-        // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; the
-        // shallow fixed range puts B near the reference.
-        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
-        let decay_for = |f: f32| -> f32 {
-            let high = (f / 2000.0).clamp(0.0, 1.0);
-            preset.decay_base - preset.decay_slope * high
-        };
-        let hammer_w = piano_hammer_width(velocity);
-        let mk = |freq_string: f32| -> KsString {
-            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
-            let buf = piano_hammer_excitation(n, hammer_w, amp);
-            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
-                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
-        };
-        let strings: Vec<KsString> = detunes.iter().map(|d| mk(freq * *d)).collect();
-        let soundboard = match preset.soundboard {
-            SoundboardKind::ConcertGrand => crate::soundboard::Soundboard::new_concert_grand(sr),
-            SoundboardKind::Lite => crate::soundboard::Soundboard::new_concert_grand_lite(sr),
-        };
-        let string_norm = if preset.string_count == 0 {
-            1.0
-        } else {
-            1.0 / (preset.string_count as f32)
-        };
-        Self {
-            strings,
-            release: ReleaseEnvelope::new(preset.release_sec, sr),
-            soundboard,
-            coupling_per_string: preset.coupling_per_string,
-            dry_gain: preset.dry_gain,
-            wet_gain: preset.wet_gain,
-            string_norm,
-        }
-    }
-}
-
-impl VoiceImpl for PianoVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        let dry_gain = self.dry_gain;
-        let wet_gain = self.wet_gain;
-        let string_norm = self.string_norm;
-        for sample in buf.iter_mut() {
-            // 1. Inject the previous-sample soundboard output back into
-            //    every string via the bridge. One-sample delay keeps the
-            //    feedback loop strictly causal (no algebraic loop).
-            let fb = self.soundboard.last_output() * self.coupling_per_string;
-            if fb != 0.0 {
-                for s in &mut self.strings {
-                    s.inject_feedback(fb);
-                }
-            }
-            // 2. Step the strings (consumes the feedback we just queued).
-            let mut s_sum = 0.0_f32;
-            for s in &mut self.strings {
-                s_sum += s.step();
-            }
-            let s_avg = s_sum * string_norm;
-            // 3. Drive the soundboard with the averaged string output.
-            let board_out = self.soundboard.process(s_avg);
-            // 4. Mix dry strings + wet soundboard into the audio bus.
-            let env = self.release.step();
-            *sample += (s_avg * dry_gain + board_out * wet_gain) * env;
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Koto / shamisen-leaning DWS engine
-// ---------------------------------------------------------------------------
-//
-// KS is plucked-string physics. This engine leans into that:
-//   - SINGLE string (no unison) - koto/shamisen are not unison-strung
-//   - SHARP narrow plectrum (width=2 always; only amplitude scales w/ vel)
-//     -> tsume / bachi (爪・撥) is much sharper than a hammer felt
-//   - PLUCK POSITION OFFSET: inject impulse at delay-line offset n/4 instead
-//     of 0. Combined with the natural reflection physics, this introduces
-//     the classic "comb-filter" effect that defines pluck-position timbre
-//     (plucking near the bridge sounds twangy/bright; near middle = mellow)
-//   - LONG sustain (decay closer to 1.0) - acoustic koto strings ring 5-15s
-//   - MINIMAL allpass dispersion - low stiffness, harmonic spectrum
-
-pub fn koto_pluck_excitation(n: usize, amp: f32, pluck_pos: usize) -> Vec<f32> {
-    let mut buf = vec![0.0_f32; n];
-    if n == 0 {
-        return buf;
-    }
-    // Pluck-position FIR comb (1 - z^-p): inject the plectrum at offset 0
-    // AND a sign-reversed copy at offset `pluck_pos`. This is the standard
-    // pluck-position model in Karplus-Strong (the original a-spike-at-offset
-    // form was just a time shift, not a comb, so it produced no notches).
-    // Result: spectrum has nulls at every (sr / pluck_pos) Hz, giving the
-    // classic bridge-vs-middle pluck timbre.
-    //
-    // Two-sample plectrum shape kept (sharp + small negative snap-back),
-    // so each "tap" of the comb is a (+amp, -0.3*amp) pair.
-    buf[0] = amp;
-    buf[1 % n] += -amp * 0.3;
-    let p = pluck_pos % n;
-    buf[p] += -amp;
-    buf[(p + 1) % n] += amp * 0.3;
-    buf
-}
-
-pub struct KotoVoice {
-    string: KsString,
-    release: ReleaseEnvelope,
-}
-
-impl KotoVoice {
-    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
-        let amp = (velocity.max(1) as f32) / 127.0;
-        let koto_ap = 0.05_f32;
-        let (n, _frac) = KsString::delay_length_compensated(sr, freq, koto_ap);
-        // Pluck near 1/4 of string length (typical koto tsume position).
-        // Combined with the comb-FIR shape in koto_pluck_excitation, this
-        // gives the bridge-side bright/twangy timbre.
-        let pluck_pos = n / 4;
-        let buf = koto_pluck_excitation(n, amp, pluck_pos);
-        // Long sustain, very mild stiffness.
-        let string = KsString::with_buf(sr, freq, buf, 0.9992, koto_ap);
-        Self {
-            string,
-            release: ReleaseEnvelope::new(0.500, sr), // longer release = "ふわっと消える"
-        }
-    }
-}
-
-impl VoiceImpl for KotoVoice {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        for sample in buf.iter_mut() {
-            let s = self.string.step();
-            let env = self.release.step();
-            *sample += s * env;
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,73 +728,6 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
     }
 }
 
-// ---------------------------------------------------------------------------
-// SoundFont placeholder voice
-// ---------------------------------------------------------------------------
-//
-// The `rustysynth::Synthesizer` is a shared, mutable engine that handles all
-// channels at once -- it is NOT one-instance-per-voice. We keep the voice
-// pool's per-note bookkeeping (eviction, note-off matching) by pushing a
-// silent placeholder voice for each SfPiano note_on. Audio is rendered by
-// the audio callback calling `synth.render(...)` once per buffer and mixing
-// the result onto the voice bus.
-//
-// `is_done` returns true a few seconds after release so the placeholder is
-// eventually reaped; the underlying synth voice may continue to ring out
-// inside rustysynth's own envelope, which is fine -- the synth tracks its
-// own active voices independently.
-
-pub struct SfPianoPlaceholder {
-    /// Adopted ReleaseEnvelope so this placeholder participates in the
-    /// shared eviction discipline (is_done / is_releasing). The release
-    /// time is 3 s, matching the previous hard-coded 132_300-sample
-    /// post-release window at 44.1 kHz; with done_threshold lowered to
-    /// 1e-6 the envelope stays well below 1e-3 across the window so
-    /// is_done() fires at roughly the same wall-clock instant.
-    release: ReleaseEnvelope,
-}
-
-impl SfPianoPlaceholder {
-    pub fn new(sr: f32) -> Self {
-        // 3 s release × done_threshold 1e-3 reproduces the historical
-        // ~3 s eviction window (which was sample-counted as 132_300 @
-        // 44.1 kHz). The ReleaseEnvelope step is sized so rel_mul hits
-        // 1e-3 exactly at `release_sec` post-trigger, matching the
-        // original sample-counted semantics. Centralising via
-        // ReleaseEnvelope means the placeholder now reports
-        // `is_releasing()` like every other voice, fixing the
-        // eviction-policy bug where the pool couldn't see SfPiano
-        // placeholders as candidates for eviction.
-        Self {
-            release: ReleaseEnvelope::with_done_threshold(3.0, sr, 1e-3),
-        }
-    }
-}
-
-impl Default for SfPianoPlaceholder {
-    fn default() -> Self {
-        // 44.1 kHz default keeps the historical 3-s eviction window.
-        Self::new(44_100.0)
-    }
-}
-
-impl VoiceImpl for SfPianoPlaceholder {
-    fn render_add(&mut self, buf: &mut [f32]) {
-        // Audio for this engine is rendered by the shared Synthesizer in
-        // the audio callback. We just step the release envelope so the
-        // pool can eventually evict us via is_done().
-        for _ in 0..buf.len() {
-            let _ = self.release.step();
-        }
-    }
-    fn release_env(&self) -> Option<&ReleaseEnvelope> {
-        Some(&self.release)
-    }
-    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
-        Some(&mut self.release)
-    }
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1452,6 +735,7 @@ impl VoiceImpl for SfPianoPlaceholder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::voices::piano::piano_detunes;
 
     const SR: f32 = 44_100.0;
 

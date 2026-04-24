@@ -13,6 +13,7 @@ pub mod soundboard;
 pub mod sympathetic;
 pub mod synth;
 pub mod ui;
+pub mod voices;
 
 // Re-export the dashboard-facing types at the crate root so older callers
 // that imported them via `crate::{LiveParams, DashState, Engine}` keep
