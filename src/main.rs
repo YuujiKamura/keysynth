@@ -72,9 +72,13 @@ impl Default for Args {
             sf2_bank: 0,
             sfz: None,
             ir_path: None,
-            // 0.3 default body-IR wet — user finding 2026-04-25:
-            // "リバーブ0.3くらいに設定するとかなり生のピアノと遜色ない感じ".
-            reverb_wet: 0.3,
+            // Body-IR wet default lowered 0.3 -> 0.15 once the piano engine
+            // gained a bidirectional modal soundboard (see synth::PianoVoice
+            // / soundboard::Soundboard). The soundboard now provides the
+            // body / "halo" character that the IR reverb was masking with;
+            // keep the IR as room-character seasoning, not as the body.
+            // Easy to dial back up via GUI / CC for sustain-pedal vibes.
+            reverb_wet: 0.15,
         }
     }
 }

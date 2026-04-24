@@ -563,6 +563,11 @@ pub struct KsString {
     lpf_w0_steady: f32,
     attack_samples_remaining: u32,
     attack_total_samples: u32,
+    /// One-sample additive feedback register. Anything written here via
+    /// `inject_feedback` is summed into the in-loop LPF output (`lp`)
+    /// during the next `step`, then cleared. Used by `PianoVoice` to
+    /// route soundboard output back into the string via the bridge.
+    pending_feedback: f32,
 }
 
 impl KsString {
@@ -601,7 +606,17 @@ impl KsString {
             lpf_w0_steady: 0.97,
             attack_samples_remaining: attack_total_samples,
             attack_total_samples,
+            pending_feedback: 0.0,
         }
+    }
+
+    /// Add `x` to the one-sample feedback register. Called BEFORE `step`
+    /// each sample by `PianoVoice` so the soundboard's previous-sample
+    /// output enters the next loop iteration. Additive across multiple
+    /// callers per sample; cleared inside `step` after consumption.
+    #[inline]
+    pub fn inject_feedback(&mut self, x: f32) {
+        self.pending_feedback += x;
     }
 
     /// Fix B: configure a per-voice attack envelope on the in-loop LPF
@@ -682,7 +697,17 @@ impl KsString {
             self.lpf_w0_steady
         };
         let w1 = 1.0 - w0;
-        let lp = (cur * w0 + prev * w1) * self.decay;
+        let mut lp = (cur * w0 + prev * w1) * self.decay;
+        // Bridge feedback: sum any externally-injected sample (e.g. from
+        // the soundboard) into the post-LPF point of the loop, then
+        // clear the register. Done BEFORE dispersion so the feedback
+        // experiences the same downstream filter chain as the string
+        // signal itself — this is where the bridge sits in the physical
+        // model.
+        if self.pending_feedback != 0.0 {
+            lp += self.pending_feedback;
+            self.pending_feedback = 0.0;
+        }
         // Dispersion 1-pole allpass (stiffness): textbook Smith form.
         //   y[n] = a * x[n] + x[n-1] - a * y[n-1]
         let a = self.ap_coef;
@@ -859,12 +884,18 @@ pub struct PianoVoice {
     released: bool,
     rel_mul: f32,
     rel_step: f32,
-    /// Pre-rendered hammer "click" — short broadband transient mixed in for
-    /// the first ~50 samples to model the felt-on-string mechanical thump
-    /// (the part of the onset that is NOT string vibration). Dramatically
-    /// improves onset RMS envelope match against real piano samples.
-    click_buf: Vec<f32>,
-    click_pos: usize,
+    /// Modal soundboard resonator bank. Receives the summed string output
+    /// every sample and feeds back into the strings via `coupling` for
+    /// physical bridge coupling (Bank/Lehtonen DWS). Replaces the older
+    /// pre-rendered click/Thump/Bright additive transient — the soundboard
+    /// gives that "body / halo" character organically and bidirectionally.
+    soundboard: crate::soundboard::Soundboard,
+    /// Bridge coupling coefficient. Controls how much of the soundboard
+    /// output gets injected back into each string per sample. Must be
+    /// kept small enough that `coupling * resonator_peak_gain < 1` for
+    /// every mode or the loop runs away. 0.025 = ~5% energy returned
+    /// across the bank, well inside the stable region.
+    coupling: f32,
 }
 
 impl PianoVoice {
@@ -916,135 +947,62 @@ impl PianoVoice {
         let release_samples = (release_sec * sr).max(1.0);
         let rel_step = (1e-3_f32.ln() / release_samples).exp();
         // ---------------------------------------------------------------
-        // Hammer/action click — TWO parallel components mixed (Fix A v2):
+        // Modal soundboard with bridge coupling (Bank/Lehtonen DWS).
         //
-        //  (1) Legacy broadband thump (200 Hz HPF + 8 kHz LPF, 0.7 ms),
-        //      already calibrated for body-resonance / impact RMS.
+        // Replaces the previous pre-rendered click_buf (Thump + Bright
+        // noise/sine bursts mixed at the output). The additive approach
+        // was whack-a-mole: every HF noise component the ear could pick
+        // up read as breath/click/cloth. Real piano body radiation is
+        // bidirectional — string drives the soundboard, the soundboard's
+        // resonant modes pump back into the string through the bridge,
+        // and the body's modal radiation IS the perceived sound.
         //
-        //  (2) NEW high-band "transparency" burst: bandpass at 3.5..6.5 kHz
-        //      (velocity-shifted center), short ~10 ms with fast exp decay,
-        //      adds the early-frame brilliance the user describes as
-        //      アタックの透き通り感 (raises spectral centroid in frames 0-3).
-        //
-        // The two run additively in parallel so each can be tuned without
-        // breaking the other's contribution.
-        let vel_norm = (velocity.max(1) as f32) / 127.0;
-        // (1) Legacy thump: disabled. Filtered noise burst (200 Hz - 8 kHz
-        // white-noise over 0.8 ms) is audible as a "breath / shhh" during
-        // the attack — the very thing we added it for (mechanical hammer
-        // impact) turns out to be a negative in clean-attack perception.
-        // The Hann-shaped hammer envelope (Fix 1) already provides enough
-        // onset transient character without a separate noise component.
-        let thump_samples = ((sr * 0.0008) as usize).clamp(16, 80);
-        let thump_amp = 0.0_f32;
-        // (2) High-band transparency "ping" — a SINUSOID (not noise) at a
-        // single high frequency picked to land BETWEEN any meaningful note's
-        // partials so it does not contaminate inharmonicity B fitting.
-        // Decays over ~40 ms, lifts early-frame spectral centroid +
-        // contributes to early RMS (closer to SF2 reference). Velocity
-        // shifts the frequency and amplitude.
-        let bright_samples = ((sr * 0.080) as usize).clamp(256, 4096);
-        let bright_amp = 0.0_f32;
-        // Ping frequency: 6.5k + vel*1.5k. At C4 partials are at integer mult
-        // of 261.6Hz; this lands between partial 24 (6279) and 25 (6540) for
-        // vel=64-ish, well above the 16-partial fitter window.
-        let ping_freq_hz = 6500.0 + vel_norm * 1500.0;
-        let bright_tau = sr * 0.018;
-        let bright_attack_n = ((sr * 0.0015) as usize).max(1);
-
-        let click_samples = thump_samples.max(bright_samples);
-        let mut click_buf = vec![0.0_f32; click_samples];
-        // Deterministic per-voice seed so unit tests are reproducible.
-        let mut rng_state: u32 = 0x9E37_79B9
-            ^ ((freq.to_bits() as u32).wrapping_mul(2654435761))
-            ^ ((velocity as u32).wrapping_mul(0x85EB_CA77));
-        // (1) Legacy thump: HP 200Hz + LP 8kHz windowed by half-cosine.
-        {
-            let mut lp_prev = 0.0f32;
-            let mut hp_prev_x = 0.0f32;
-            let mut hp_prev_y = 0.0f32;
-            let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 200.0 / sr;
-            let lp_a = (-2.0 * std::f32::consts::PI * 8000.0 / sr).exp();
-            for i in 0..thump_samples {
-                rng_state ^= rng_state << 13;
-                rng_state ^= rng_state >> 17;
-                rng_state ^= rng_state << 5;
-                let raw = ((rng_state as i32) as f32) / (i32::MAX as f32);
-                let hp = hp_a * (hp_prev_y + raw - hp_prev_x);
-                hp_prev_x = raw;
-                hp_prev_y = hp;
-                lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
-                let t = i as f32 / (thump_samples - 1).max(1) as f32;
-                let win = 0.5 * (1.0 - (std::f32::consts::TAU * t).cos());
-                click_buf[i] += lp_prev * win * thump_amp;
-            }
-        }
-        // (2) High-band ping CHORD: 4 sinusoids at 5500/6500/7500/8500 Hz.
-        // Each is one FFT bin so partial-peak picking is unaffected (these
-        // sit above the 16-partial fitter range for any note <= MIDI 60+).
-        // Stack of pings spreads enough energy across the upper band to
-        // shift early-frame spectral centroid significantly.
-        {
-            let ping_freqs = [5500.0_f32, 6500.0, 7500.0, 8500.0];
-            let n_pings = ping_freqs.len() as f32;
-            // Spread amp evenly; adjust per-ping for combined gain target.
-            let per_amp = bright_amp / n_pings.sqrt();
-            let mut phases = [0.0f32; 4];
-            let phase_incs: [f32; 4] = [
-                std::f32::consts::TAU * ping_freqs[0] / sr,
-                std::f32::consts::TAU * ping_freqs[1] / sr,
-                std::f32::consts::TAU * ping_freqs[2] / sr,
-                std::f32::consts::TAU * ping_freqs[3] / sr,
-            ];
-            for i in 0..bright_samples {
-                let env = if i < bright_attack_n {
-                    (i as f32) / (bright_attack_n as f32)
-                } else {
-                    let t = (i - bright_attack_n) as f32;
-                    (-t / bright_tau).exp()
-                };
-                let mut sum = 0.0f32;
-                for k in 0..4 {
-                    sum += phases[k].sin();
-                    phases[k] += phase_incs[k];
-                    if phases[k] >= std::f32::consts::TAU {
-                        phases[k] -= std::f32::consts::TAU;
-                    }
-                }
-                click_buf[i] += sum * env * per_amp;
-            }
-            let _ = rng_state; // legacy thump consumed it; keep var live.
-            let _ = ping_freq_hz;
-        }
+        // Coupling 0.025 = ~5% energy returned per sample. With
+        // soundboard peak response ~1, this stays well below the
+        // unity-gain instability threshold across all modes.
+        let _ = velocity; // velocity already mixed into amp above
+        let soundboard = crate::soundboard::Soundboard::new_concert_grand(sr);
+        let coupling = 0.025_f32;
         Self {
             strings,
             released: false,
             rel_mul: 1.0,
             rel_step,
-            click_buf,
-            click_pos: 0,
+            soundboard,
+            coupling,
         }
     }
 }
 
 impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        // 3-string sum: in-phase at attack (3x peak), decorrelated after
-        // detune drift (~sqrt(3)x). Use 1/3 = 0.333 to keep the in-phase
-        // attack peak <= 1.0 per voice. Sustain RMS drops slightly vs the
-        // old 0.577 (1/sqrt(3)) scaling but it stops attack peaks from
-        // saturating tanh.
-        let gain = 0.333_f32;
+        // String sum scaled by 1/3 keeps the in-phase attack peak ~1.0
+        // (3 strings hammer in phase, decorrelate over ~sqrt(3) after
+        // detune drift). The dry direct-radiation mix is intentionally
+        // small (0.2) — most of what an audience hears from a real piano
+        // is soundboard-radiated, not direct string sound.
+        let dry_gain = 0.2_f32;
+        let wet_gain = 0.7_f32;
+        let string_norm = 0.333_f32;
         for sample in buf.iter_mut() {
-            let s = self.strings[0].step()
+            // 1. Inject the previous-sample soundboard output back into
+            //    the strings via the bridge. One-sample delay keeps the
+            //    feedback loop strictly causal (no algebraic loop).
+            let fb = self.soundboard.last_output() * self.coupling;
+            if fb != 0.0 {
+                self.strings[0].inject_feedback(fb);
+                self.strings[1].inject_feedback(fb);
+                self.strings[2].inject_feedback(fb);
+            }
+            // 2. Step the strings (consumes the feedback we just queued).
+            let s_sum = self.strings[0].step()
                 + self.strings[1].step()
                 + self.strings[2].step();
-            let mut out_sample = s * gain;
-            // Mix in remaining click samples (mechanical hammer-strike thump).
-            if self.click_pos < self.click_buf.len() {
-                out_sample += self.click_buf[self.click_pos];
-                self.click_pos += 1;
-            }
+            let s_avg = s_sum * string_norm;
+            // 3. Drive the soundboard with the averaged string output.
+            let board_out = self.soundboard.process(s_avg);
+            // 4. Mix dry strings + wet soundboard into the audio bus.
+            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
             if self.released {
                 self.rel_mul *= self.rel_step;
                 out_sample *= self.rel_mul;

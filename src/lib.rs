@@ -9,6 +9,7 @@ pub mod analysis;
 pub mod gm;
 pub mod reverb;
 pub mod sfz;
+pub mod soundboard;
 pub mod synth;
 pub mod ui;
 
