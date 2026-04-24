@@ -131,6 +131,11 @@ trait VoiceImpl: Send {
     /// Mark released; envelope should fade and `is_done()` will go true.
     fn trigger_release(&mut self);
     fn is_done(&self) -> bool;
+    /// True if the voice has been released but is still ringing out.
+    /// Default returns false; voice impls may override for smarter eviction.
+    fn is_releasing(&self) -> bool {
+        false
+    }
 }
 
 struct Voice {
@@ -1057,6 +1062,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
                         *slot = v;
                     } else {
+                        // Hard cap voice pool to bound CPU/memory growth under
+                        // sustained MIDI input. When at cap, prefer evicting an
+                        // already-released voice; fall back to the oldest entry.
+                        const MAX_VOICES: usize = 32;
+                        if pool.len() >= MAX_VOICES {
+                            let evict_idx = pool
+                                .iter()
+                                .position(|x| x.inner.is_done() || x.inner.is_releasing())
+                                .unwrap_or(0);
+                            pool.remove(evict_idx);
+                        }
                         pool.push(v);
                     }
                 }
@@ -1122,29 +1138,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live_for_audio = live.clone();
     let err_fn = |err| eprintln!("audio stream error: {err}");
 
+    // Build an F32 output stream. Used both for the native F32 path and as a
+    // fallback when cpal reports a non-{F32,I16,U16} format we don't handle.
+    let build_f32_stream = |dev: &cpal::Device, cfg: &StreamConfig| {
+        let voices_arc = voices_for_audio.clone();
+        let live_arc = live_for_audio.clone();
+        // Preallocated mono scratch reused across audio callbacks. Sized lazily
+        // on the first callback once we know the buffer size; cpal callbacks
+        // are FnMut so capturing `mut` state is fine.
+        let mut mono_scratch: Vec<f32> = Vec::new();
+        dev.build_output_stream(
+            cfg,
+            move |out: &mut [f32], _| {
+                let master = live_arc.lock().unwrap().master;
+                audio_callback(out, channels, &voices_arc, master, &mut mono_scratch);
+            },
+            err_fn,
+            None,
+        )
+    };
+
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            let live_arc = live_for_audio.clone();
-            device.build_output_stream(
-                &stream_cfg,
-                move |out: &mut [f32], _| {
-                    let master = live_arc.lock().unwrap().master;
-                    audio_callback(out, channels, &voices_for_audio, master);
-                },
-                err_fn,
-                None,
-            )?
-        }
+        SampleFormat::F32 => build_f32_stream(&device, &stream_cfg)?,
         SampleFormat::I16 => {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
+            let mut mono_scratch: Vec<f32> = Vec::new();
+            let mut interleaved_scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
                     let master = live_arc.lock().unwrap().master;
-                    let mut scratch = vec![0.0_f32; out.len()];
-                    audio_callback(&mut scratch, channels, &voices_arc, master);
-                    for (dst, &src) in out.iter_mut().zip(scratch.iter()) {
+                    if interleaved_scratch.len() != out.len() {
+                        interleaved_scratch.resize(out.len(), 0.0);
+                    }
+                    audio_callback(
+                        &mut interleaved_scratch,
+                        channels,
+                        &voices_arc,
+                        master,
+                        &mut mono_scratch,
+                    );
+                    for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.max(-1.0).min(1.0);
                         *dst = (clamped * i16::MAX as f32) as i16;
                     }
@@ -1156,13 +1191,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SampleFormat::U16 => {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
+            let mut mono_scratch: Vec<f32> = Vec::new();
+            let mut interleaved_scratch: Vec<f32> = Vec::new();
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
                     let master = live_arc.lock().unwrap().master;
-                    let mut scratch = vec![0.0_f32; out.len()];
-                    audio_callback(&mut scratch, channels, &voices_arc, master);
-                    for (dst, &src) in out.iter_mut().zip(scratch.iter()) {
+                    if interleaved_scratch.len() != out.len() {
+                        interleaved_scratch.resize(out.len(), 0.0);
+                    }
+                    audio_callback(
+                        &mut interleaved_scratch,
+                        channels,
+                        &voices_arc,
+                        master,
+                        &mut mono_scratch,
+                    );
+                    for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.max(-1.0).min(1.0);
                         let unsigned = ((clamped + 1.0) * 0.5 * u16::MAX as f32) as u16;
                         *dst = unsigned;
@@ -1172,7 +1217,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None,
             )?
         }
-        other => return Err(format!("unsupported sample format: {other:?}").into()),
+        other => {
+            // cpal's SampleFormat is #[non_exhaustive]; modern backends may
+            // hand back I32/I8/U8/F64/etc. Try opening the device with an F32
+            // stream regardless - many backends will accept it - and surface
+            // the original error only if that also fails.
+            eprintln!(
+                "keysynth: sample format {other:?} not natively handled, \
+                 attempting F32 fallback"
+            );
+            match build_f32_stream(&device, &stream_cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Err(format!(
+                        "unsupported sample format: {other:?} (F32 fallback also failed: {e})"
+                    )
+                    .into());
+                }
+            }
+        }
     };
     stream.play()?;
 
@@ -1197,14 +1260,21 @@ fn audio_callback(
     channels: u16,
     voices: &Arc<Mutex<Vec<Voice>>>,
     master: f32,
+    mono: &mut Vec<f32>,
 ) {
     let frames = out.len() / channels as usize;
-    let mut mono = vec![0.0_f32; frames];
+    // Reuse the caller-owned scratch buffer to avoid per-callback heap
+    // allocation on the audio thread (~every 11 ms at 1024 frames / 48 kHz).
+    if mono.len() != frames {
+        mono.resize(frames, 0.0);
+    } else {
+        mono.fill(0.0);
+    }
 
     {
         let mut pool = voices.lock().unwrap();
         for v in pool.iter_mut() {
-            v.inner.render_add(&mut mono);
+            v.inner.render_add(mono.as_mut_slice());
         }
         pool.retain(|v| !v.inner.is_done());
     }
