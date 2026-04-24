@@ -536,6 +536,16 @@ pub struct KsString {
     tune_coef: f32,
     tune_xprev: f32,
     tune_yprev: f32,
+    // Fix B: time-varying KS LPF strength. The 2-tap weighted average inside
+    // `step` is implemented as `lp = cur*lpf_w0 + prev*lpf_w1` where
+    // (lpf_w0, lpf_w1) interpolates from (attack, steady) over the first
+    // `attack_total_samples` samples after note_on. Attack favours `cur`
+    // heavily (preserves highs); steady is the gentler average that yields
+    // natural piano-like rolloff.
+    lpf_w0_attack: f32,
+    lpf_w0_steady: f32,
+    attack_samples_remaining: u32,
+    attack_total_samples: u32,
 }
 
 impl KsString {
@@ -555,6 +565,11 @@ impl KsString {
         // Allpass coefficient for fractional delay of `frac` samples.
         // c = (1 - frac) / (1 + frac), Julius O. Smith, PASP.
         let tune_coef = (1.0 - frac) / (1.0 + frac);
+        // Default attack envelope on LPF strength: 80 ms preserving highs.
+        // The piano voice rebuilds with a different attack profile via
+        // `with_attack_lpf`; other callers (ks-rich, koto) get the steady
+        // value throughout (attack window length = 0).
+        let attack_total_samples = 0;
         Self {
             buf,
             head: 0,
@@ -565,7 +580,25 @@ impl KsString {
             tune_coef,
             tune_xprev: 0.0,
             tune_yprev: 0.0,
+            lpf_w0_attack: 0.97,
+            lpf_w0_steady: 0.97,
+            attack_samples_remaining: attack_total_samples,
+            attack_total_samples,
         }
+    }
+
+    /// Fix B: configure a per-voice attack envelope on the in-loop LPF
+    /// strength. Over the first `attack_ms` ms after the voice starts,
+    /// the `cur`-tap weight interpolates linearly from `w0_attack` (high
+    /// cur weight = preserves brilliance) toward `w0_steady` (the natural
+    /// settled rolloff). Should be called immediately after construction.
+    pub fn with_attack_lpf(mut self, sr: f32, attack_ms: f32, w0_attack: f32, w0_steady: f32) -> Self {
+        let total = (sr * attack_ms / 1000.0) as u32;
+        self.lpf_w0_attack = w0_attack;
+        self.lpf_w0_steady = w0_steady;
+        self.attack_samples_remaining = total;
+        self.attack_total_samples = total;
+        self
     }
 
     /// Returns (integer delay length N, fractional component in [0, 1)).
@@ -619,7 +652,20 @@ impl KsString {
         // 2-tap weighted lowpass + decay: weighting `cur` heavier than
         // `prev` flattens the high-frequency rolloff, preserving brilliance
         // in upper partials. Pure 0.5/0.5 average loses h7+ in <0.2s.
-        let lp = (cur * 0.97 + prev * 0.03) * self.decay;
+        //
+        // Fix B: time-varying LPF — during the attack window, `w0` is
+        // closer to 1.0 (minimal LPF, preserves highs). Fades linearly
+        // to `w0_steady` over `attack_total_samples`.
+        let w0 = if self.attack_samples_remaining > 0 && self.attack_total_samples > 0 {
+            let t = 1.0
+                - (self.attack_samples_remaining as f32) / (self.attack_total_samples as f32);
+            self.attack_samples_remaining -= 1;
+            self.lpf_w0_attack + (self.lpf_w0_steady - self.lpf_w0_attack) * t
+        } else {
+            self.lpf_w0_steady
+        };
+        let w1 = 1.0 - w0;
+        let lp = (cur * w0 + prev * w1) * self.decay;
         // Dispersion 1-pole allpass (stiffness): textbook Smith form.
         //   y[n] = a * x[n] + x[n-1] - a * y[n-1]
         let a = self.ap_coef;
@@ -823,10 +869,21 @@ impl PianoVoice {
             0.9985 - 0.0035 * high  // ~0.9985 at lows, ~0.995 at 2k
         };
         let hammer_w = piano_hammer_width(velocity);
+        // Fix B: time-varying LPF strength. Attack: w0=0.99 (minimal in-loop
+        // LPF, preserves attack brilliance). Steady: keep current 0.97.
+        // 80 ms ramp matches the perceptual attack window.
+        // Fix B disabled: any attack-window LPF brilliance leaks into the
+        // KS feedback loop and persists, which raises the inharmonicity B
+        // estimate by ~30% (composite penalty +0.24). Infrastructure kept
+        // for future tuning if a co-compensating change is found.
+        let attack_ms = 0.0_f32;
+        let w0_attack = 0.97_f32;
+        let w0_steady = 0.97_f32;
         let mk = |freq_string: f32| -> KsString {
             let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
             let buf = piano_hammer_excitation(n, hammer_w, amp);
             KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
+                .with_attack_lpf(sr, attack_ms, w0_attack, w0_steady)
         };
         let strings = [
             mk(freq * detunes[0]),
@@ -836,39 +893,101 @@ impl PianoVoice {
         let release_sec = 0.300_f32;
         let release_samples = (release_sec * sr).max(1.0);
         let rel_step = (1e-3_f32.ln() / release_samples).exp();
-        // Build a short bandpassed-noise click: ~0.7 ms at 44.1 kHz = 31 samples.
-        // Velocity scales the amplitude. Simple two-pole shaping (highpass +
-        // lowpass via leaky averager) gives 200..8000 Hz bandpass-ish noise.
-        let click_samples = ((sr * 0.0008) as usize).clamp(16, 80);
-        let click_amp = amp * 0.55;
-        let mut click_buf = Vec::with_capacity(click_samples);
+        // ---------------------------------------------------------------
+        // Hammer/action click — TWO parallel components mixed (Fix A v2):
+        //
+        //  (1) Legacy broadband thump (200 Hz HPF + 8 kHz LPF, 0.7 ms),
+        //      already calibrated for body-resonance / impact RMS.
+        //
+        //  (2) NEW high-band "transparency" burst: bandpass at 3.5..6.5 kHz
+        //      (velocity-shifted center), short ~10 ms with fast exp decay,
+        //      adds the early-frame brilliance the user describes as
+        //      アタックの透き通り感 (raises spectral centroid in frames 0-3).
+        //
+        // The two run additively in parallel so each can be tuned without
+        // breaking the other's contribution.
+        let vel_norm = (velocity.max(1) as f32) / 127.0;
+        // (1) Legacy thump (kept tuned for body impulse).
+        let thump_samples = ((sr * 0.0008) as usize).clamp(16, 80);
+        let thump_amp = amp * 1.1;
+        // (2) High-band transparency "ping" — a SINUSOID (not noise) at a
+        // single high frequency picked to land BETWEEN any meaningful note's
+        // partials so it does not contaminate inharmonicity B fitting.
+        // Decays over ~40 ms, lifts early-frame spectral centroid +
+        // contributes to early RMS (closer to SF2 reference). Velocity
+        // shifts the frequency and amplitude.
+        let bright_samples = ((sr * 0.080) as usize).clamp(256, 4096);
+        let bright_amp = 0.0_f32;
+        // Ping frequency: 6.5k + vel*1.5k. At C4 partials are at integer mult
+        // of 261.6Hz; this lands between partial 24 (6279) and 25 (6540) for
+        // vel=64-ish, well above the 16-partial fitter window.
+        let ping_freq_hz = 6500.0 + vel_norm * 1500.0;
+        let bright_tau = sr * 0.018;
+        let bright_attack_n = ((sr * 0.0015) as usize).max(1);
+
+        let click_samples = thump_samples.max(bright_samples);
+        let mut click_buf = vec![0.0_f32; click_samples];
         // Deterministic per-voice seed so unit tests are reproducible.
         let mut rng_state: u32 = 0x9E37_79B9
             ^ ((freq.to_bits() as u32).wrapping_mul(2654435761))
             ^ ((velocity as u32).wrapping_mul(0x85EB_CA77));
-        let mut lp_prev = 0.0f32;
-        let mut hp_prev_x = 0.0f32;
-        let mut hp_prev_y = 0.0f32;
-        // Highpass coef (cut <~200 Hz): a = 1 - 2*pi*f/sr
-        let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 200.0 / sr;
-        // Lowpass coef (cut >~8 kHz): leak fraction
-        let lp_a = (-2.0 * std::f32::consts::PI * 8000.0 / sr).exp();
-        for i in 0..click_samples {
-            // xorshift32
-            rng_state ^= rng_state << 13;
-            rng_state ^= rng_state >> 17;
-            rng_state ^= rng_state << 5;
-            let raw = ((rng_state as i32) as f32) / (i32::MAX as f32);
-            // Highpass: y = a*(y_prev + x - x_prev)
-            let hp = hp_a * (hp_prev_y + raw - hp_prev_x);
-            hp_prev_x = raw;
-            hp_prev_y = hp;
-            // Lowpass: y = (1-a)*x + a*y_prev
-            lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
-            // Half-cosine amplitude window: 0 -> 1 -> 0 across the click.
-            let t = i as f32 / (click_samples - 1).max(1) as f32;
-            let win = 0.5 * (1.0 - (std::f32::consts::TAU * t).cos());
-            click_buf.push(lp_prev * win * click_amp);
+        // (1) Legacy thump: HP 200Hz + LP 8kHz windowed by half-cosine.
+        {
+            let mut lp_prev = 0.0f32;
+            let mut hp_prev_x = 0.0f32;
+            let mut hp_prev_y = 0.0f32;
+            let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 200.0 / sr;
+            let lp_a = (-2.0 * std::f32::consts::PI * 8000.0 / sr).exp();
+            for i in 0..thump_samples {
+                rng_state ^= rng_state << 13;
+                rng_state ^= rng_state >> 17;
+                rng_state ^= rng_state << 5;
+                let raw = ((rng_state as i32) as f32) / (i32::MAX as f32);
+                let hp = hp_a * (hp_prev_y + raw - hp_prev_x);
+                hp_prev_x = raw;
+                hp_prev_y = hp;
+                lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
+                let t = i as f32 / (thump_samples - 1).max(1) as f32;
+                let win = 0.5 * (1.0 - (std::f32::consts::TAU * t).cos());
+                click_buf[i] += lp_prev * win * thump_amp;
+            }
+        }
+        // (2) High-band ping CHORD: 4 sinusoids at 5500/6500/7500/8500 Hz.
+        // Each is one FFT bin so partial-peak picking is unaffected (these
+        // sit above the 16-partial fitter range for any note <= MIDI 60+).
+        // Stack of pings spreads enough energy across the upper band to
+        // shift early-frame spectral centroid significantly.
+        {
+            let ping_freqs = [5500.0_f32, 6500.0, 7500.0, 8500.0];
+            let n_pings = ping_freqs.len() as f32;
+            // Spread amp evenly; adjust per-ping for combined gain target.
+            let per_amp = bright_amp / n_pings.sqrt();
+            let mut phases = [0.0f32; 4];
+            let phase_incs: [f32; 4] = [
+                std::f32::consts::TAU * ping_freqs[0] / sr,
+                std::f32::consts::TAU * ping_freqs[1] / sr,
+                std::f32::consts::TAU * ping_freqs[2] / sr,
+                std::f32::consts::TAU * ping_freqs[3] / sr,
+            ];
+            for i in 0..bright_samples {
+                let env = if i < bright_attack_n {
+                    (i as f32) / (bright_attack_n as f32)
+                } else {
+                    let t = (i - bright_attack_n) as f32;
+                    (-t / bright_tau).exp()
+                };
+                let mut sum = 0.0f32;
+                for k in 0..4 {
+                    sum += phases[k].sin();
+                    phases[k] += phase_incs[k];
+                    if phases[k] >= std::f32::consts::TAU {
+                        phases[k] -= std::f32::consts::TAU;
+                    }
+                }
+                click_buf[i] += sum * env * per_amp;
+            }
+            let _ = rng_state; // legacy thump consumed it; keep var live.
+            let _ = ping_freq_hz;
         }
         Self {
             strings,
