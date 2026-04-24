@@ -31,9 +31,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
 use keysynth::sympathetic::SympatheticBank;
-use keysynth::synth::{
-    make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl,
-};
+use keysynth::synth::{make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl};
 use keysynth::ui;
 
 /// Shared rustysynth instance for `sf-piano`. `None` until `--sf2` is loaded
@@ -117,31 +115,32 @@ fn parse_args() -> Result<Args, String> {
                 out.master = v.parse().map_err(|e| format!("bad --master: {e}"))?;
             }
             "--sf2" => {
-                out.sf2 = Some(PathBuf::from(
-                    iter.next().ok_or("--sf2 needs a path")?,
-                ));
+                out.sf2 = Some(PathBuf::from(iter.next().ok_or("--sf2 needs a path")?));
             }
             "--sf2-program" => {
-                out.sf2_program = iter.next().ok_or("--sf2-program needs an integer")?
-                    .parse().map_err(|e| format!("bad --sf2-program: {e}"))?;
+                out.sf2_program = iter
+                    .next()
+                    .ok_or("--sf2-program needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --sf2-program: {e}"))?;
             }
             "--sf2-bank" => {
-                out.sf2_bank = iter.next().ok_or("--sf2-bank needs an integer")?
-                    .parse().map_err(|e| format!("bad --sf2-bank: {e}"))?;
+                out.sf2_bank = iter
+                    .next()
+                    .ok_or("--sf2-bank needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --sf2-bank: {e}"))?;
             }
             "--sfz" => {
-                out.sfz = Some(PathBuf::from(
-                    iter.next().ok_or("--sfz needs a path")?,
-                ));
+                out.sfz = Some(PathBuf::from(iter.next().ok_or("--sfz needs a path")?));
             }
             "--ir" => {
-                out.ir_path = Some(PathBuf::from(
-                    iter.next().ok_or("--ir needs a path")?,
-                ));
+                out.ir_path = Some(PathBuf::from(iter.next().ok_or("--ir needs a path")?));
             }
             "--reverb" => {
                 let v = iter.next().ok_or("--reverb needs a float 0..1")?;
-                out.reverb_wet = v.parse::<f32>()
+                out.reverb_wet = v
+                    .parse::<f32>()
                     .map_err(|e| format!("bad --reverb: {e}"))?
                     .clamp(0.0, 1.0);
             }
@@ -223,9 +222,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Ok(sub) = std::fs::read_dir(&p) {
                             for se in sub.flatten() {
                                 let sp = se.path();
-                                if sp.extension().and_then(|s| s.to_str())
-                                    == Some("sfz")
-                                {
+                                if sp.extension().and_then(|s| s.to_str()) == Some("sfz") {
                                     found = Some(sp);
                                     break;
                                 }
@@ -305,8 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shared_synth: SharedSynth = Arc::new(Mutex::new(None));
     if let Some(sf2_path) = &args.sf2 {
         let mut file = BufReader::new(
-            File::open(sf2_path)
-                .map_err(|e| format!("opening SoundFont {:?}: {e}", sf2_path))?,
+            File::open(sf2_path).map_err(|e| format!("opening SoundFont {:?}: {e}", sf2_path))?,
         );
         let sf = Arc::new(SoundFont::new(&mut file)?);
         let mut settings = SynthesizerSettings::new(sr_hz as i32);
@@ -323,12 +319,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *shared_synth.lock().unwrap() = Some(synth);
         eprintln!(
             "keysynth: loaded SoundFont '{}' (program={} bank={})",
-            sf2_path.display(), args.sf2_program, args.sf2_bank
+            sf2_path.display(),
+            args.sf2_program,
+            args.sf2_bank
         );
     } else if args.engine == Engine::SfPiano {
-        return Err(
-            "engine 'sf-piano' requires --sf2 PATH (no SoundFont loaded)".into(),
-        );
+        return Err("engine 'sf-piano' requires --sf2 PATH (no SoundFont loaded)".into());
     }
 
     // -- SFZ sampler (sfz-piano engine) --
@@ -351,9 +347,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         *shared_sfz.lock().unwrap() = Some(player);
     } else if args.engine == Engine::SfzPiano {
-        return Err(
-            "engine 'sfz-piano' requires --sfz PATH (no SFZ manifest loaded)".into(),
-        );
+        return Err("engine 'sfz-piano' requires --sfz PATH (no SFZ manifest loaded)".into());
     }
 
     // -- Body IR reverb --
@@ -366,7 +360,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let ir = reverb::load_ir_wav(p)?;
             eprintln!(
                 "keysynth: loaded IR '{}' ({} samples, ~{:.0} ms @ {} Hz)",
-                p.display(), ir.len(), 1000.0 * ir.len() as f32 / sr_hz as f32, sr_hz
+                p.display(),
+                ir.len(),
+                1000.0 * ir.len() as f32 / sr_hz as f32,
+                sr_hz
             );
             ir
         }
@@ -554,8 +551,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 0xB0 => {
                     // Control Change. raw[1] = CC number, raw[2] = value (0..127).
-                    let cc_num = note;       // (raw[1])
-                    let cc_val = velocity;   // (raw[2])
+                    let cc_num = note; // (raw[1])
+                    let cc_val = velocity; // (raw[2])
                     {
                         let mut d = dash_for_midi.lock().unwrap();
                         d.cc_raw.insert(cc_num, cc_val);
@@ -570,7 +567,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let delta_ticks: i32 = match cc_val {
                         0 | 64 => 0,
                         1..=63 => cc_val as i32,
-                        65..=127 => -((128 - cc_val as i32)),
+                        65..=127 => -(128 - cc_val as i32),
                         _ => 0, // MIDI CC values are 0..127 in spec; defensive
                     };
 
@@ -626,9 +623,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
-                let (master, wet) = {
+                let (master, wet, engine) = {
                     let lp = live_arc.lock().unwrap();
-                    (lp.master, lp.reverb_wet)
+                    (lp.master, lp.reverb_wet, lp.engine)
                 };
                 audio_callback(
                     out,
@@ -644,6 +641,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut reverb,
                     &mut limiter_gain,
                     &mut sympathetic,
+                    engine,
                 );
             },
             err_fn,
@@ -668,9 +666,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
-                    let (master, wet) = {
+                    let (master, wet, engine) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet)
+                        (lp.master, lp.reverb_wet, lp.engine)
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -689,6 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut reverb,
                         &mut limiter_gain,
                         &mut sympathetic,
+                        engine,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -714,9 +713,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
-                    let (master, wet) = {
+                    let (master, wet, engine) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet)
+                        (lp.master, lp.reverb_wet, lp.engine)
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -735,6 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut reverb,
                         &mut limiter_gain,
                         &mut sympathetic,
+                        engine,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -809,6 +809,12 @@ fn audio_callback(
     // "halo of neighbor strings" the user perceived missing from our
     // piano vs Salamander SFZ samples).
     sympathetic: &mut SympatheticBank,
+    // Currently selected engine. The sympathetic bank only runs when this
+    // is in the piano family (`Engine::is_piano_family()`); for SF/SFZ
+    // engines it would double-resonate the sample-recorded body, and for
+    // non-piano engines (square/sub/fm/koto) the piano-tuned bank just
+    // adds inappropriate piano halo. Per issue #2 audit acb2f0360b347a623.
+    engine: Engine,
 ) {
     let frames = out.len() / channels as usize;
     // Reuse the caller-owned scratch buffer to avoid per-callback heap
@@ -870,19 +876,31 @@ fn audio_callback(
 
     // Sympathetic string bank (shared across voices): drive the bank with
     // the current mixed bus as a soundboard-output proxy, then add its
-    // output back into the bus. Coupling 0.02 (bank takes ~2% of the bus
-    // per sample); mix gain 0.3 (bank contributes ~30% of its output
-    // amplitude to the final mix). No closed feedback loop — the bank
-    // only reads from the bus, never writes into any voice's private
-    // soundboard — so stability reduces to the per-string KS decay
-    // (0.9994) being below unity.
-    {
+    // output back into the bus.
+    //
+    // Gated to the piano family (Engine::Piano / PianoThick / PianoLite).
+    // For SF/SFZ engines the recorded sample already includes the body
+    // resonance — running the bank on top double-resonates and produced
+    // the audit-noted (#2 / acb2f0360b347a623) sustained metallic ring on
+    // the SFZ Salamander reference during bench. For non-piano engines
+    // (square/sub/fm/koto) the piano-tuned 24-string bank just adds
+    // inappropriate piano halo. Bank state is still ticked when other
+    // engines are active so any prior energy decays naturally — we just
+    // skip the drive-and-mix.
+    if engine.is_piano_family() {
         const COUPLING: f32 = 0.02;
         const MIX: f32 = 0.3;
         for sample in mono.iter_mut() {
             let board_drive = *sample;
             let sym_out = sympathetic.process(board_drive, COUPLING);
             *sample += sym_out * MIX;
+        }
+    } else {
+        // Let any residual ringing from a prior piano-family note decay
+        // out (zero drive, zero coupling) so the bank doesn't carry a
+        // stale impulse if the engine flips back to piano.
+        for _ in 0..mono.len() {
+            let _ = sympathetic.process(0.0, 0.0);
         }
     }
 

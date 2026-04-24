@@ -64,6 +64,18 @@ pub enum Engine {
     PianoLite,
 }
 
+impl Engine {
+    /// True if this engine is one of the KS-string-based piano models
+    /// (`Piano`, `PianoThick`, `PianoLite`). Sample-based engines (`SfPiano`,
+    /// `SfzPiano`) and non-piano engines (`Square`, `Ks`, `Sub`, etc.) return
+    /// false. Used by the audio callback to gate the shared sympathetic
+    /// string bank — sample-based engines already include body resonance in
+    /// the recording, so adding sympathetic on top double-resonates.
+    pub fn is_piano_family(self) -> bool {
+        matches!(self, Engine::Piano | Engine::PianoThick | Engine::PianoLite)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ReleaseEnvelope: shared multiplicative exponential release helper.
 // ---------------------------------------------------------------------------
@@ -185,7 +197,9 @@ pub trait VoiceImpl: Send {
     /// `false`, which caused new notes to evict slot-0 (often a still-
     /// sounding note) instead of an actually-releasing voice.
     fn is_releasing(&self) -> bool {
-        self.release_env().map(|e| e.is_releasing()).unwrap_or(false)
+        self.release_env()
+            .map(|e| e.is_releasing())
+            .unwrap_or(false)
     }
 }
 
@@ -410,7 +424,7 @@ struct Adsr {
     sr: f32,
     attack_s: f32,
     decay_s: f32,
-    sustain: f32,    // 0..1 sustain level
+    sustain: f32, // 0..1 sustain level
     release_s: f32,
     stage: AdsrStage,
     value: f32,
@@ -499,7 +513,7 @@ pub struct SubVoice {
     sr: f32,
     freq: f32,
     amp: f32,
-    phase: f32,         // 0..1 for sawtooth
+    phase: f32, // 0..1 for sawtooth
     amp_env: Adsr,
     filt_env: Adsr,
     // Cutoff: cutoff_base + cutoff_env_amount * filt_env (Hz)
@@ -752,7 +766,13 @@ impl KsString {
     /// the `cur`-tap weight interpolates linearly from `w0_attack` (high
     /// cur weight = preserves brilliance) toward `w0_steady` (the natural
     /// settled rolloff). Should be called immediately after construction.
-    pub fn with_attack_lpf(mut self, sr: f32, attack_ms: f32, w0_attack: f32, w0_steady: f32) -> Self {
+    pub fn with_attack_lpf(
+        mut self,
+        sr: f32,
+        attack_ms: f32,
+        w0_attack: f32,
+        w0_steady: f32,
+    ) -> Self {
         let total = (sr * attack_ms / 1000.0) as u32;
         self.lpf_w0_attack = w0_attack;
         self.lpf_w0_steady = w0_steady;
@@ -824,8 +844,8 @@ impl KsString {
         // closer to 1.0 (minimal LPF, preserves highs). Fades linearly
         // to `w0_steady` over `attack_total_samples`.
         let w0 = if self.attack_samples_remaining > 0 && self.attack_total_samples > 0 {
-            let t = 1.0
-                - (self.attack_samples_remaining as f32) / (self.attack_total_samples as f32);
+            let t =
+                1.0 - (self.attack_samples_remaining as f32) / (self.attack_total_samples as f32);
             self.attack_samples_remaining -= 1;
             self.lpf_w0_attack + (self.lpf_w0_steady - self.lpf_w0_attack) * t
         } else {
@@ -874,11 +894,7 @@ impl KsRichVoice {
         let amp = (velocity.max(1) as f32) / 127.0;
         // Detune cents: -7, 0, +7 -> classic piano triple-string spread
         let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let detunes = [
-            cents_to_ratio(-7.0),
-            1.0,
-            cents_to_ratio(7.0),
-        ];
+        let detunes = [cents_to_ratio(-7.0), 1.0, cents_to_ratio(7.0)];
         // Higher notes get slightly more allpass coefficient (more stiffness),
         // mimicking real piano string behaviour where shorter strings are
         // stiffer relative to their length.
@@ -908,9 +924,7 @@ impl VoiceImpl for KsRichVoice {
         // Mix the 3 strings; equal-power-ish gain (1/sqrt(3) ~= 0.577).
         let gain = 0.577_f32;
         for sample in buf.iter_mut() {
-            let s = self.strings[0].step()
-                + self.strings[1].step()
-                + self.strings[2].step();
+            let s = self.strings[0].step() + self.strings[1].step() + self.strings[2].step();
             let env = self.release.step();
             *sample += s * gain * env;
         }
@@ -954,7 +968,7 @@ pub fn hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
     use std::f32::consts::TAU;
     let denom = (w - 1) as f32;
     for i in 0..w {
-        let t = i as f32 / denom;       // 0..1
+        let t = i as f32 / denom; // 0..1
         let val = 0.5 * (1.0 - (TAU * t).cos()); // Hann: 0 -> 1 -> 0
         buf[i] = val * amp;
     }
@@ -1330,12 +1344,7 @@ pub fn midi_to_freq(note: u8) -> f32 {
 /// `rustysynth::Synthesizer` owned by the audio callback; the placeholder
 /// only exists so the voice-pool eviction logic can still track which
 /// (channel, note) pairs are sounding.
-pub fn make_voice(
-    engine: Engine,
-    sr: f32,
-    freq: f32,
-    velocity: u8,
-) -> Box<dyn VoiceImpl + Send> {
+pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn VoiceImpl + Send> {
     match engine {
         Engine::Square => Box::new(SquareVoice::new(sr, freq, velocity)),
         Engine::Ks => Box::new(KsVoice::new(sr, freq, velocity)),
@@ -1488,7 +1497,10 @@ mod tests {
         let mut prev = 1.0_f32;
         for _ in 0..100 {
             let v = env.step();
-            assert!(v < prev || v == 0.0, "envelope should be monotonically decreasing");
+            assert!(
+                v < prev || v == 0.0,
+                "envelope should be monotonically decreasing"
+            );
             prev = v;
         }
     }
@@ -1504,7 +1516,10 @@ mod tests {
         for _ in 0..n {
             let _ = env.step();
         }
-        assert!(env.is_done(), "envelope should be done after 2x release window");
+        assert!(
+            env.is_done(),
+            "envelope should be done after 2x release window"
+        );
     }
 
     #[test]
@@ -1565,7 +1580,10 @@ mod tests {
     fn hammer_width_decreasing_with_velocity() {
         let w_soft = hammer_width_for_velocity(20);
         let w_hard = hammer_width_for_velocity(127);
-        assert!(w_hard < w_soft, "hard hits should have narrower contact ({w_hard} < {w_soft})");
+        assert!(
+            w_hard < w_soft,
+            "hard hits should have narrower contact ({w_hard} < {w_soft})"
+        );
     }
 
     #[test]
@@ -1586,7 +1604,11 @@ mod tests {
     fn hammer_excitation_starts_zero() {
         let buf = hammer_excitation(100, 10, 1.0);
         // Hann starts at 0
-        assert!(buf[0].abs() < 1e-6, "Hann hammer should start at 0, got {}", buf[0]);
+        assert!(
+            buf[0].abs() < 1e-6,
+            "Hann hammer should start at 0, got {}",
+            buf[0]
+        );
     }
 
     #[test]
@@ -1648,12 +1670,16 @@ mod tests {
     fn piano_hammer_excitation_decay_after_rise() {
         // Find the peak; everything after should be decreasing.
         let buf = piano_hammer_excitation(200, 80, 1.0);
-        let (peak_idx, _) = buf
-            .iter()
-            .enumerate()
-            .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
-                if v.abs() > v_max { (i, v.abs()) } else { (i_max, v_max) }
-            });
+        let (peak_idx, _) =
+            buf.iter()
+                .enumerate()
+                .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
+                    if v.abs() > v_max {
+                        (i, v.abs())
+                    } else {
+                        (i_max, v_max)
+                    }
+                });
         // After peak: monotonic decay (allow 1 sample tolerance).
         let mut prev = buf[peak_idx];
         for v in buf.iter().skip(peak_idx + 1).take(50) {
@@ -1764,7 +1790,10 @@ mod tests {
             let _ = s.step();
         }
         let late_peak: f32 = (0..500).map(|_| s.step().abs()).fold(0.0_f32, f32::max);
-        assert!(late_peak < early_peak, "string should decay: early {early_peak} late {late_peak}");
+        assert!(
+            late_peak < early_peak,
+            "string should decay: early {early_peak} late {late_peak}"
+        );
     }
 
     // --- SquareVoice -----------------------------------------------------
@@ -2000,11 +2029,16 @@ mod tests {
         let mut buf = vec![0.0_f32; frames_per_buf];
         let mut rendered = 0;
         while rendered < total_frames {
-            for s in buf.iter_mut() { *s = 0.0; }
+            for s in buf.iter_mut() {
+                *s = 0.0;
+            }
             p.render_add(&mut buf);
             rendered += frames_per_buf;
         }
-        assert!(p.is_done(), "placeholder should be done after >3s post-release");
+        assert!(
+            p.is_done(),
+            "placeholder should be done after >3s post-release"
+        );
     }
 
     #[test]
@@ -2122,7 +2156,11 @@ mod tests {
             // an immediately-released voice is treated as Done with
             // value <= 1e-6. Render a tiny block first.
             let _ = render_n(v.as_mut(), 64);
-            assert!(!v.is_releasing(), "engine {:?} reports releasing pre-trigger", engine);
+            assert!(
+                !v.is_releasing(),
+                "engine {:?} reports releasing pre-trigger",
+                engine
+            );
             v.trigger_release();
             assert!(
                 v.is_releasing(),
@@ -2146,7 +2184,10 @@ mod tests {
             .iter()
             .position(|x| x.is_done() || x.is_releasing())
             .unwrap_or(0);
-        assert_eq!(evict_idx, 1, "should evict the released voice (slot 1), got {evict_idx}");
+        assert_eq!(
+            evict_idx, 1,
+            "should evict the released voice (slot 1), got {evict_idx}"
+        );
     }
 
     #[test]
