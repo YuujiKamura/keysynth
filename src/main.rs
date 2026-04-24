@@ -29,6 +29,7 @@ use midir::{Ignore, MidiInput};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use keysynth::reverb::{self, Reverb};
+use keysynth::sfz::SfzPlayer;
 use keysynth::synth::{
     make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl,
 };
@@ -40,6 +41,11 @@ use keysynth::ui;
 /// and the audio callback (render).
 pub type SharedSynth = Arc<Mutex<Option<Synthesizer>>>;
 
+/// Shared SFZ sampler instance for `sfz-piano`. `None` until `--sfz` is
+/// loaded. Same Mutex pattern as `SharedSynth`: MIDI thread calls
+/// note_on/off, audio thread calls render.
+pub type SharedSfz = Arc<Mutex<Option<SfzPlayer>>>;
+
 #[derive(Clone, Debug)]
 struct Args {
     engine: Engine,
@@ -49,6 +55,7 @@ struct Args {
     sf2: Option<PathBuf>,
     sf2_program: u8,
     sf2_bank: u8,
+    sfz: Option<PathBuf>,
     ir_path: Option<PathBuf>,
     reverb_wet: f32,
 }
@@ -63,8 +70,11 @@ impl Default for Args {
             sf2: None,
             sf2_program: 0,
             sf2_bank: 0,
+            sfz: None,
             ir_path: None,
-            reverb_wet: 0.0,
+            // 0.3 default body-IR wet — user finding 2026-04-25:
+            // "リバーブ0.3くらいに設定するとかなり生のピアノと遜色ない感じ".
+            reverb_wet: 0.3,
         }
     }
 }
@@ -86,8 +96,9 @@ fn parse_args() -> Result<Args, String> {
                     "piano" => Engine::Piano,
                     "koto" => Engine::Koto,
                     "sf-piano" => Engine::SfPiano,
+                    "sfz-piano" => Engine::SfzPiano,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano)"
                     )),
                 };
             }
@@ -110,6 +121,11 @@ fn parse_args() -> Result<Args, String> {
             "--sf2-bank" => {
                 out.sf2_bank = iter.next().ok_or("--sf2-bank needs an integer")?
                     .parse().map_err(|e| format!("bad --sf2-bank: {e}"))?;
+            }
+            "--sfz" => {
+                out.sfz = Some(PathBuf::from(
+                    iter.next().ok_or("--sfz needs a path")?,
+                ));
             }
             "--ir" => {
                 out.ir_path = Some(PathBuf::from(
@@ -138,18 +154,21 @@ fn print_help() {
          USAGE:\n  \
             keysynth [--engine ENGINE] [--port NAME] [--master FLOAT]\n  \
                      [--sf2 PATH [--sf2-program N] [--sf2-bank N]]\n  \
+                     [--sfz PATH]\n  \
                      [--ir PATH] [--reverb 0..1]\n  \
             keysynth --list\n\n\
          OPTIONS:\n  \
-            --engine ENGINE   square|ks|ks-rich|sub|fm|piano|koto|sf-piano\n  \
+            --engine ENGINE   square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano\n  \
                               (sub = analog subtractive, fm = 2-op bell,\n  \
                                piano = wide-hammer DWS, koto = pluck-pos DWS,\n  \
-                               sf-piano = SoundFont real-piano via rustysynth)\n  \
+                               sf-piano = SoundFont real-piano via rustysynth,\n  \
+                               sfz-piano = SFZ sample library, e.g. Salamander Grand V3)\n  \
             --port NAME       MIDI input port (default: first available)\n  \
             --master FLOAT    Master gain pre-tanh (default: 0.3)\n  \
             --sf2 PATH        SoundFont .sf2 (required for --engine sf-piano)\n  \
             --sf2-program N   GM program 0..127 (default: 0 = Acoustic Grand)\n  \
             --sf2-bank N      Bank 0..128 (default: 0)\n  \
+            --sfz PATH        SFZ manifest .sfz (required for --engine sfz-piano)\n  \
             --ir PATH         WAV impulse response for body reverb\n  \
                               (default: built-in synthetic piano body IR)\n  \
             --reverb FLOAT    Reverb wet 0..1 (default: 0 = dry)\n  \
@@ -161,7 +180,7 @@ fn print_help() {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = match parse_args() {
+    let mut args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
@@ -169,6 +188,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(2);
         }
     };
+
+    // Auto-discover SF2 / SFZ in CWD if not explicitly given via CLI.
+    // Lets the user freely live-switch between sf-piano / sfz-piano in
+    // the GUI without having to remember to pass both flags at startup.
+    if args.sf2.is_none() {
+        if let Ok(entries) = std::fs::read_dir(".") {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("sf2") {
+                    eprintln!("keysynth: auto-discovered SF2 {}", p.display());
+                    args.sf2 = Some(p);
+                    break;
+                }
+            }
+        }
+    }
+    if args.sfz.is_none() {
+        for root in [PathBuf::from("."), PathBuf::from("Salamander")] {
+            if let Ok(entries) = std::fs::read_dir(&root) {
+                let mut found: Option<PathBuf> = None;
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        // One level deep — Salamander's SFZ lives in a
+                        // subdirectory next to its sample folder.
+                        if let Ok(sub) = std::fs::read_dir(&p) {
+                            for se in sub.flatten() {
+                                let sp = se.path();
+                                if sp.extension().and_then(|s| s.to_str())
+                                    == Some("sfz")
+                                {
+                                    found = Some(sp);
+                                    break;
+                                }
+                            }
+                        }
+                    } else if p.extension().and_then(|s| s.to_str()) == Some("sfz") {
+                        found = Some(p);
+                        break;
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                if let Some(p) = found {
+                    eprintln!("keysynth: auto-discovered SFZ {}", p.display());
+                    args.sfz = Some(p);
+                    break;
+                }
+            }
+        }
+    }
 
     let mut midi_in = MidiInput::new("keysynth")?;
     midi_in.ignore(Ignore::None);
@@ -231,7 +302,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|e| format!("opening SoundFont {:?}: {e}", sf2_path))?,
         );
         let sf = Arc::new(SoundFont::new(&mut file)?);
-        let settings = SynthesizerSettings::new(sr_hz as i32);
+        let mut settings = SynthesizerSettings::new(sr_hz as i32);
+        // rustysynth default maximum_polyphony = 64. Piano patches can use
+        // 2-4 internal voices per note (stereo + velocity layers), so chords
+        // hit the cap fast and notes get stolen mid-decay. Raise to 256 -
+        // tests show it stays under 5% CPU even when fully saturated.
+        settings.maximum_polyphony = 256;
         let mut synth = Synthesizer::new(&sf, &settings)?;
         if args.sf2_bank > 0 {
             synth.process_midi_message(0, 0xB0, 0, args.sf2_bank as i32);
@@ -245,6 +321,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if args.engine == Engine::SfPiano {
         return Err(
             "engine 'sf-piano' requires --sf2 PATH (no SoundFont loaded)".into(),
+        );
+    }
+
+    // -- SFZ sampler (sfz-piano engine) --
+    //
+    // Loaded eagerly when --sfz is given. Decodes every WAV referenced by the
+    // manifest into memory (~400-1300 MB for Salamander Grand V3 depending on
+    // bit depth / sample rate); the read is one-shot at startup so the audio
+    // thread never blocks on disk I/O.
+    let shared_sfz: SharedSfz = Arc::new(Mutex::new(None));
+    if let Some(sfz_path) = &args.sfz {
+        let started = std::time::Instant::now();
+        let player = SfzPlayer::load(sfz_path, sr_hz as f32)
+            .map_err(|e| format!("loading SFZ {:?}: {e}", sfz_path))?;
+        eprintln!(
+            "keysynth: loaded SFZ '{}' ({} regions, {} samples, {:.1}s)",
+            sfz_path.display(),
+            player.regions_len(),
+            player.samples_len(),
+            started.elapsed().as_secs_f32()
+        );
+        *shared_sfz.lock().unwrap() = Some(player);
+    } else if args.engine == Engine::SfzPiano {
+        return Err(
+            "engine 'sfz-piano' requires --sfz PATH (no SFZ manifest loaded)".into(),
         );
     }
 
@@ -286,6 +387,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live_for_midi = live.clone();
     let dash_for_midi = dash.clone();
     let synth_for_midi = shared_synth.clone();
+    let sfz_for_midi = shared_sfz.clone();
     let sr_for_voices = sr_hz as f32;
     // Track the last (program, bank) we pushed into the shared synth so
     // we don't spam a Program Change per note. `u16::MAX` sentinel forces
@@ -349,7 +451,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // sf-piano (or whenever a synth is loaded -- harmless
                     // for other engines because the placeholder is what
                     // routes audio for them, not the synth).
-                    if engine == Engine::SfPiano {
+                    if engine == Engine::SfzPiano {
+                        if let Some(player) = sfz_for_midi.lock().unwrap().as_mut() {
+                            player.note_on(channel, note, velocity);
+                        }
+                    } else if engine == Engine::SfPiano {
                         if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
                             // Push Bank Select + Program Change ONLY when
                             // the desired pair has actually changed since
@@ -417,6 +523,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
                         synth.note_off(channel as i32, note as i32);
                     }
+                    // Forward to SFZ player too. Like rustysynth above, this
+                    // is safe whether or not sfz-piano is the active engine —
+                    // an inactive note_off is a no-op inside the player.
+                    if let Some(player) = sfz_for_midi.lock().unwrap().as_mut() {
+                        player.note_off(channel, note);
+                    }
                     let mut pool = voices_for_midi.lock().unwrap();
                     if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
                         slot.inner.trigger_release();
@@ -446,16 +558,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     match cc_num {
                         // CC 7 = absolute MIDI Volume (rare on MPK).
-                        // Top out at 3.0 to match the GUI slider + CC70 range.
+                        // Top out at 10.0 to match the GUI slider + CC70 range.
+                        // tanh soft-clip handles saturation past ~3.
                         7 => {
-                            let new_master = (cc_val as f32 / 127.0) * 3.0;
+                            let new_master = (cc_val as f32 / 127.0) * 10.0;
                             live_for_midi.lock().unwrap().master = new_master;
                         }
                         // CC 70 = MPK K1 (relative encoder by default).
-                        // 1 tick = +/- 0.05 master gain, clamped 0..3.0.
+                        // 1 tick = +/- 0.1 master gain, clamped 0..10.0.
                         70 => {
                             let mut p = live_for_midi.lock().unwrap();
-                            p.master = (p.master + delta_ticks as f32 * 0.05).clamp(0.0, 3.0);
+                            p.master = (p.master + delta_ticks as f32 * 0.1).clamp(0.0, 10.0);
                         }
                         _ => {}
                     }
@@ -469,6 +582,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let voices_for_audio = voices.clone();
     let live_for_audio = live.clone();
     let synth_for_audio = shared_synth.clone();
+    let sfz_for_audio = shared_sfz.clone();
     let err_fn = |err| eprintln!("audio stream error: {err}");
 
     // Build an F32 output stream. Used both for the native F32 path and as a
@@ -477,6 +591,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let voices_arc = voices_for_audio.clone();
         let live_arc = live_for_audio.clone();
         let synth_arc = synth_for_audio.clone();
+        let sfz_arc = sfz_for_audio.clone();
         // Preallocated mono / sf-stereo scratch reused across audio callbacks.
         // Sized lazily on the first callback once we know the buffer size;
         // cpal callbacks are FnMut so capturing `mut` state is fine.
@@ -484,6 +599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sf_left: Vec<f32> = Vec::new();
         let mut sf_right: Vec<f32> = Vec::new();
         let mut reverb = Reverb::new(ir_samples.clone());
+        let mut limiter_gain: f32 = 1.0;
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
@@ -496,12 +612,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     channels,
                     &voices_arc,
                     &synth_arc,
+                    &sfz_arc,
                     master,
                     wet,
                     &mut mono_scratch,
                     &mut sf_left,
                     &mut sf_right,
                     &mut reverb,
+                    &mut limiter_gain,
                 );
             },
             err_fn,
@@ -515,11 +633,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
             let synth_arc = synth_for_audio.clone();
+            let sfz_arc = sfz_for_audio.clone();
             let mut mono_scratch: Vec<f32> = Vec::new();
             let mut sf_left: Vec<f32> = Vec::new();
             let mut sf_right: Vec<f32> = Vec::new();
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
+            let mut limiter_gain: f32 = 1.0;
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
@@ -535,12 +655,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         channels,
                         &voices_arc,
                         &synth_arc,
+                        &sfz_arc,
                         master,
                         wet,
                         &mut mono_scratch,
                         &mut sf_left,
                         &mut sf_right,
                         &mut reverb,
+                        &mut limiter_gain,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -555,11 +677,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
             let synth_arc = synth_for_audio.clone();
+            let sfz_arc = sfz_for_audio.clone();
             let mut mono_scratch: Vec<f32> = Vec::new();
             let mut sf_left: Vec<f32> = Vec::new();
             let mut sf_right: Vec<f32> = Vec::new();
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
+            let mut limiter_gain: f32 = 1.0;
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
@@ -575,12 +699,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         channels,
                         &voices_arc,
                         &synth_arc,
+                        &sfz_arc,
                         master,
                         wet,
                         &mut mono_scratch,
                         &mut sf_left,
                         &mut sf_right,
                         &mut reverb,
+                        &mut limiter_gain,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -636,12 +762,17 @@ fn audio_callback(
     channels: u16,
     voices: &Arc<Mutex<Vec<Voice>>>,
     synth: &SharedSynth,
+    sfz: &SharedSfz,
     master: f32,
     reverb_wet: f32,
     mono: &mut Vec<f32>,
     sf_left: &mut Vec<f32>,
     sf_right: &mut Vec<f32>,
     reverb: &mut Reverb,
+    // Persistent gain state for the limiter, kept across callbacks so we
+    // can ramp smoothly from prev block's gain to this block's target,
+    // avoiding the per-block step discontinuity that sounds like chopping.
+    limiter_gain: &mut f32,
 ) {
     let frames = out.len() / channels as usize;
     // Reuse the caller-owned scratch buffer to avoid per-callback heap
@@ -680,10 +811,34 @@ fn audio_callback(
         }
     }
 
+    // Mix the shared SFZ player into the mono bus. Same downmix story as
+    // the SF2 path; reuses the same sf_left/sf_right scratch since the two
+    // engines are mutually exclusive in any sane configuration (and even
+    // if both were loaded, mixing both is harmless).
+    {
+        let mut guard = sfz.lock().unwrap();
+        if let Some(player) = guard.as_mut() {
+            if sf_left.len() != frames {
+                sf_left.resize(frames, 0.0);
+                sf_right.resize(frames, 0.0);
+            } else {
+                sf_left.fill(0.0);
+                sf_right.fill(0.0);
+            }
+            player.render(sf_left.as_mut_slice(), sf_right.as_mut_slice());
+            for i in 0..frames {
+                mono[i] += (sf_left[i] + sf_right[i]) * 0.5;
+            }
+        }
+    }
+
     // Body IR convolution before soft-clip so saturation acts on the
     // post-reverb signal -- otherwise reverb tail clips against tanh.
     reverb.process(mono.as_mut_slice(), reverb_wet);
 
+    // Compressor reverted — didn't help perceptibly. Physical ceiling
+    // (±1.0 digital full-scale × Shokz hardware max) dominates. Plain tanh.
+    let _ = limiter_gain;
     for sample in mono.iter_mut() {
         *sample = (*sample * master).tanh();
     }

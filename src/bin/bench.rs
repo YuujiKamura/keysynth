@@ -39,6 +39,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use keysynth::reverb::{self, Reverb};
+use keysynth::sfz::SfzPlayer;
 use keysynth::synth::{make_voice, midi_to_freq, Engine};
 
 const SR: u32 = 44100;
@@ -56,6 +57,7 @@ struct BenchArgs {
     only: OnlyTarget,
     reverb_wet: f32,
     ir_path: Option<PathBuf>,
+    sfz_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -111,7 +113,27 @@ fn render_keysynth(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut buf = vec![0.0_f32; total_samples];
 
-    if args.engine == Engine::SfPiano {
+    if args.engine == Engine::SfzPiano {
+        // sfz-piano renders via the SfzPlayer; mono-mix its stereo output
+        // exactly like the live audio callback does.
+        let sfz_path = args.sfz_path.as_ref().ok_or(
+            "engine 'sfz-piano' requires --sfz PATH (no SFZ manifest provided)",
+        )?;
+        let mut player = SfzPlayer::load(sfz_path, SR as f32)?;
+        player.note_on(0, args.note, args.velocity);
+        let mut left = vec![0.0_f32; total_samples];
+        let mut right = vec![0.0_f32; total_samples];
+        if release_at > 0 {
+            player.render(&mut left[..release_at], &mut right[..release_at]);
+        }
+        player.note_off(0, args.note);
+        if release_at < total_samples {
+            player.render(&mut left[release_at..], &mut right[release_at..]);
+        }
+        for i in 0..total_samples {
+            buf[i] = (left[i] + right[i]) * 0.5;
+        }
+    } else if args.engine == Engine::SfPiano {
         // sf-piano routes through rustysynth -- the placeholder voice
         // produces no audio on its own, so we drive the synth here and
         // mix its stereo output to mono, exactly like the live audio
@@ -266,6 +288,7 @@ fn engine_slug(e: Engine) -> &'static str {
         Engine::Piano => "piano",
         Engine::Koto => "koto",
         Engine::SfPiano => "sf-piano",
+        Engine::SfzPiano => "sfz-piano",
     }
 }
 
@@ -282,6 +305,7 @@ fn parse_args() -> Result<BenchArgs, String> {
     let mut only = OnlyTarget::Both;
     let mut reverb_wet: f32 = 0.0;
     let mut ir_path: Option<PathBuf> = None;
+    let mut sfz_path: Option<PathBuf> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -318,6 +342,7 @@ fn parse_args() -> Result<BenchArgs, String> {
                     "piano" => Engine::Piano,
                     "koto" => Engine::Koto,
                     "sf-piano" => Engine::SfPiano,
+                    "sfz-piano" => Engine::SfzPiano,
                     other => return Err(format!("unknown engine: {other}")),
                 };
             }
@@ -353,6 +378,11 @@ fn parse_args() -> Result<BenchArgs, String> {
                     iter.next().ok_or("--ir needs a path")?,
                 ));
             }
+            "--sfz" => {
+                sfz_path = Some(PathBuf::from(
+                    iter.next().ok_or("--sfz needs a path")?,
+                ));
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -362,13 +392,17 @@ fn parse_args() -> Result<BenchArgs, String> {
     }
 
     // sf-piano on the keysynth side also needs the SoundFont, so it counts
-    // as a "needs --sf2" case even when --only keysynth.
-    let needs_sf2 = only != OnlyTarget::Keysynth || engine == Engine::SfPiano;
+    // as a "needs --sf2" case even when --only keysynth. sfz-piano does NOT
+    // need an .sf2 — it has its own --sfz, and --only keysynth + sfz-piano
+    // is a perfectly fine config.
+    let needs_sf2 =
+        (only != OnlyTarget::Keysynth && engine != Engine::SfzPiano) || engine == Engine::SfPiano;
     let sf2_path = match (sf2, needs_sf2) {
         (Some(p), _) => p,
         (None, false) => PathBuf::new(),
         (None, true) => return Err(
-            "--sf2 PATH is required (omit only when --only keysynth and --engine != sf-piano)".into(),
+            "--sf2 PATH is required (omit only when --only keysynth with --engine != sf-piano, \
+             or when using --engine sfz-piano with --only keysynth)".into(),
         ),
     };
 
@@ -391,6 +425,7 @@ fn parse_args() -> Result<BenchArgs, String> {
         only,
         reverb_wet,
         ir_path,
+        sfz_path,
     })
 }
 

@@ -42,6 +42,13 @@ pub enum Engine {
     /// eviction; the actual audio is rendered by the shared Synthesizer in
     /// the audio callback and mixed into the voice bus.
     SfPiano,
+    /// SFZ-driven sampler piano: routes (channel, note, velocity) to a
+    /// shared `SfzPlayer` loaded from a `.sfz` manifest at startup. Same
+    /// placeholder pattern as SfPiano — audio is rendered by the shared
+    /// player in the audio callback. Intended for high-quality sample
+    /// libraries (Salamander Grand V3 etc.) that the SF2 format can't
+    /// represent at full fidelity.
+    SfzPiano,
 }
 
 // ---------------------------------------------------------------------------
@@ -827,12 +834,17 @@ pub fn piano_hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
         buf[0] = amp;
         return buf;
     }
-    // Asymmetric envelope: linear rise (1/4), exponential decay (3/4).
+    // Asymmetric envelope: Hann-shaped rise (1/4), exponential decay (3/4).
+    // Was linear rise which has a slope corner at i=0 (silence -> linear
+    // ramp = discontinuous first derivative = audible broadband click).
+    // Hann half-window (0.5*(1-cos(pi*t))) starts at zero VALUE AND zero
+    // SLOPE, so the onset is C1-continuous and the click disappears.
     let rise = (w / 4).max(1);
     let decay_n = w - rise;
     for i in 0..rise {
         let t = i as f32 / rise as f32;
-        buf[i] = t * amp;
+        let hann = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
+        buf[i] = hann * amp;
     }
     let tau = (decay_n as f32 / 3.0).max(1.0); // ~95% decayed at end
     for i in 0..decay_n {
@@ -917,9 +929,14 @@ impl PianoVoice {
         // The two run additively in parallel so each can be tuned without
         // breaking the other's contribution.
         let vel_norm = (velocity.max(1) as f32) / 127.0;
-        // (1) Legacy thump (kept tuned for body impulse).
+        // (1) Legacy thump: disabled. Filtered noise burst (200 Hz - 8 kHz
+        // white-noise over 0.8 ms) is audible as a "breath / shhh" during
+        // the attack — the very thing we added it for (mechanical hammer
+        // impact) turns out to be a negative in clean-attack perception.
+        // The Hann-shaped hammer envelope (Fix 1) already provides enough
+        // onset transient character without a separate noise component.
         let thump_samples = ((sr * 0.0008) as usize).clamp(16, 80);
-        let thump_amp = amp * 1.1;
+        let thump_amp = 0.0_f32;
         // (2) High-band transparency "ping" — a SINUSOID (not noise) at a
         // single high frequency picked to land BETWEEN any meaningful note's
         // partials so it does not contaminate inharmonicity B fitting.
@@ -1012,7 +1029,12 @@ impl PianoVoice {
 
 impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        let gain = 0.577_f32;
+        // 3-string sum: in-phase at attack (3x peak), decorrelated after
+        // detune drift (~sqrt(3)x). Use 1/3 = 0.333 to keep the in-phase
+        // attack peak <= 1.0 per voice. Sustain RMS drops slightly vs the
+        // old 0.577 (1/sqrt(3)) scaling but it stops attack peaks from
+        // saturating tanh.
+        let gain = 0.333_f32;
         for sample in buf.iter_mut() {
             let s = self.strings[0].step()
                 + self.strings[1].step()
@@ -1160,6 +1182,10 @@ pub fn make_voice(
         Engine::Piano => Box::new(PianoVoice::new(sr, freq, velocity)),
         Engine::Koto => Box::new(KotoVoice::new(sr, freq, velocity)),
         Engine::SfPiano => Box::new(SfPianoPlaceholder::new()),
+        // SfzPiano shares the placeholder voice strategy with SfPiano: the
+        // pool entry only tracks (channel, note) for eviction; audio comes
+        // from the shared SfzPlayer rendered in the audio callback.
+        Engine::SfzPiano => Box::new(SfPianoPlaceholder::new()),
     }
 }
 

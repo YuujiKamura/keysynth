@@ -48,3 +48,12 @@ reference/*.wav
 *.tar
 *.tar.gz
 *.tgz
+*.tar.bz2
+*.tbz2
+
+# SFZ sample libraries (Salamander Grand V3, etc.). The .sfz manifests are
+# small text, but the linked WAVs are GB-scale; gitignore the whole tree
+# including any uncompressed Salamander dump the user drops in.
+Salamander/
+sfz-libraries/
+.claude/worktrees/

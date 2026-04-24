@@ -105,8 +105,8 @@ impl eframe::App for KeysynthApp {
             ui.horizontal(|ui| {
                 ui.label("master:");
                 ui.add(
-                    egui::Slider::new(&mut master, 0.0..=3.0)
-                        .step_by(0.05)
+                    egui::Slider::new(&mut master, 0.0..=10.0)
+                        .step_by(0.1)
                         .text("(K1/CC70/CC7)"),
                 );
                 ui.separator();
@@ -383,7 +383,7 @@ impl eframe::App for KeysynthApp {
         {
             let mut lp = self.ctx.live.lock().unwrap();
             if master_changed {
-                lp.master = (lp.master + gui_master_delta).clamp(0.0, 3.0);
+                lp.master = (lp.master + gui_master_delta).clamp(0.0, 10.0);
             }
             if engine_changed {
                 lp.engine = engine;
@@ -419,4 +419,5 @@ const ENGINE_CHOICES: &[(&str, Engine)] = &[
     ("sub", Engine::Sub),
     ("fm", Engine::Fm),
     ("sf-piano", Engine::SfPiano),
+    ("sfz-piano", Engine::SfzPiano),
 ];
