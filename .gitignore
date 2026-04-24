@@ -1,0 +1,19 @@
+/target
+
+# CARGO_TARGET_DIR may point elsewhere; keep the default rule too.
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+*.code-workspace
+
+# Local state from oh-my-claudecode plugin
+.omc/
+
+# Logs / scratch
+*.log
+*.tmp
