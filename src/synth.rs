@@ -988,7 +988,19 @@ impl PianoVoice {
         // unity-gain instability threshold across all modes.
         let _ = velocity; // velocity already mixed into amp above
         let soundboard = crate::soundboard::Soundboard::new_concert_grand(sr);
-        let coupling = 0.025_f32;
+        // 2026-04-25 piano-tuning pass against SFZ Salamander C4 reference.
+        // Bench analysis showed the candidate centroid drifting +495 Hz at
+        // the tail (high-Q soundboard modes ringing past string death,
+        // perceived as harpsichord-like sustained metallic ring) and mid-
+        // band partials n=2..4 running 1-2 s longer than the SFZ ref.
+        //
+        // Coupling cut from 0.025 → 0.012 / 7. Dividing by string count
+        // keeps total bridge feedback constant regardless of N (was
+        // 0.025 × 7 = 0.175 effective when summed across 7 strings,
+        // pushing the loop into "ビョーオン" sustained ringing). Halving
+        // again to 0.012/7 cuts the bridge-loop sustain contribution
+        // without killing the body resonance entirely.
+        let coupling = 0.012_f32 / 7.0;
         Self {
             strings,
             released: false,
