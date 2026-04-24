@@ -503,6 +503,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // Hard cap voice pool to bound CPU/memory growth under
                         // sustained MIDI input. When at cap, prefer evicting an
                         // already-released voice; fall back to the oldest entry.
+                        //
+                        // Pre-2026-04-25: most VoiceImpls forgot to override
+                        // `is_releasing` (only SfPianoPlaceholder did). The
+                        // released-voice scan therefore returned None on
+                        // every Piano/Ks/etc. voice and `unwrap_or(0)`
+                        // killed slot 0 — often a still-sustained note,
+                        // perceived as "no sound after pressing many keys".
+                        // ReleaseEnvelope-based VoiceImpl trait now provides
+                        // is_releasing() by default, so the scan finds a
+                        // real candidate as long as ANY voice in the pool
+                        // has been released.
                         const MAX_VOICES: usize = 32;
                         if pool.len() >= MAX_VOICES {
                             let evict_idx = pool

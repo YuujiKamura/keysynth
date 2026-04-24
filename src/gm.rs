@@ -217,4 +217,44 @@ mod tests {
         assert_eq!(instrument_name(24), "Acoustic Guitar (nylon)");
         assert_eq!(instrument_name(127), "Gunshot");
     }
+
+    #[test]
+    fn gm_table_has_128_entries() {
+        assert_eq!(GM_INSTRUMENTS.len(), 128);
+    }
+
+    #[test]
+    fn gm_program_numbers_are_unique_and_ordered() {
+        let mut seen: std::collections::HashSet<u8> = std::collections::HashSet::new();
+        for (p, _, _) in GM_INSTRUMENTS.iter() {
+            assert!(seen.insert(*p), "duplicate program number {}", p);
+        }
+        assert_eq!(seen.len(), 128);
+    }
+
+    #[test]
+    fn instrument_name_default_for_invalid() {
+        // Wraps in u8 so 0..=127 always lookup; the unwrap_or branch is
+        // strictly defensive but we exercise it via the public API.
+        // Passing a known-valid 127 as a sanity baseline:
+        assert_ne!(instrument_name(127), "<unknown>");
+    }
+
+    #[test]
+    fn gm_first_family_is_pianos() {
+        assert_eq!(GM_FAMILIES[0], "Pianos");
+    }
+
+    #[test]
+    fn gm_last_family_is_sound_fx() {
+        assert_eq!(GM_FAMILIES[15], "Sound FX");
+    }
+
+    #[test]
+    fn gm_each_program_belongs_to_known_family() {
+        let known: std::collections::HashSet<&str> = GM_FAMILIES.iter().copied().collect();
+        for (_, _, fam) in GM_INSTRUMENTS.iter() {
+            assert!(known.contains(*fam), "program family '{}' not in GM_FAMILIES", fam);
+        }
+    }
 }

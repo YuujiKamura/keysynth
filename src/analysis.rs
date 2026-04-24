@@ -960,4 +960,163 @@ mod tests {
         let mse = centroid_trajectory_mse(&s, &s);
         assert!(mse < 1e-3, "identity centroid MSE not ~0: {}", mse);
     }
+
+    #[test]
+    fn stft_n_bins_and_n_frames_consistent() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.2, 440.0);
+        let s = stft(&sig, sr);
+        assert_eq!(s.n_bins(), s.fft_size / 2 + 1);
+        assert_eq!(s.n_frames(), s.mag.len());
+    }
+
+    #[test]
+    fn stft_bin_to_hz_matches_formula() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.1, 440.0);
+        let s = stft(&sig, sr);
+        // bin 0 = DC = 0 Hz.
+        assert_eq!(s.bin_to_hz(0), 0.0);
+        // bin (fft_size/2) = Nyquist = sr/2.
+        let nyq = s.bin_to_hz(s.fft_size / 2);
+        assert!((nyq - sr as f32 / 2.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn stft_frame_to_sec_starts_zero() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.1, 440.0);
+        let s = stft(&sig, sr);
+        assert_eq!(s.frame_to_sec(0), 0.0);
+        let t1 = s.frame_to_sec(1);
+        assert!((t1 - s.hop_size as f32 / sr as f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stft_empty_input_yields_no_frames() {
+        let s = stft(&[], 44100);
+        assert_eq!(s.n_frames(), 0);
+    }
+
+    #[test]
+    fn stft_finds_peak_near_440hz_for_a4_sine() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.5, 440.0);
+        let s = stft(&sig, sr);
+        // Look at the middle frame, find max bin.
+        let mid = s.n_frames() / 2;
+        let frame = &s.mag[mid];
+        let (peak_bin, _) = frame
+            .iter()
+            .enumerate()
+            .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
+                if v > v_max { (i, v) } else { (i_max, v_max) }
+            });
+        let peak_hz = s.bin_to_hz(peak_bin);
+        assert!(
+            (peak_hz - 440.0).abs() < 30.0,
+            "peak should be near 440 Hz, got {peak_hz}"
+        );
+    }
+
+    #[test]
+    fn spectral_centroid_returns_one_per_frame() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.2, 440.0);
+        let s = stft(&sig, sr);
+        let c = spectral_centroid_per_frame(&s);
+        assert_eq!(c.len(), s.n_frames());
+    }
+
+    #[test]
+    fn spectral_centroid_higher_for_higher_freq() {
+        let sr = 44100;
+        let low = stft(&synth_sine(sr, 0.2, 200.0), sr);
+        let high = stft(&synth_sine(sr, 0.2, 4000.0), sr);
+        let c_low = spectral_centroid_per_frame(&low);
+        let c_high = spectral_centroid_per_frame(&high);
+        // Centroids are computed per frame; compare middle-frame values.
+        let mid = c_low.len() / 2;
+        assert!(c_high[mid] > c_low[mid], "high tone centroid should be higher");
+    }
+
+    #[test]
+    fn spectral_flux_returns_one_per_frame() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.2, 440.0);
+        let s = stft(&sig, sr);
+        let f = spectral_flux_per_frame(&s);
+        assert_eq!(f.len(), s.n_frames());
+    }
+
+    #[test]
+    fn spectral_flux_zero_for_steady_sine() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.5, 440.0);
+        let s = stft(&sig, sr);
+        let f = spectral_flux_per_frame(&s);
+        // After the first few frames the spectrum is ~constant; flux should be tiny.
+        for &v in f.iter().skip(8).take(8) {
+            assert!(v < 0.5, "steady sine flux should be small, got {v}");
+        }
+    }
+
+    #[test]
+    fn log_spectral_distance_zero_for_identity() {
+        let sr = 44100;
+        let sig = synth_sine(sr, 0.3, 440.0);
+        let s = stft(&sig, sr);
+        let d = log_spectral_distance_db(&s, &s);
+        assert!(d < 1e-3, "identity LSD should be ~0, got {d}");
+    }
+
+    #[test]
+    fn log_spectral_distance_nonzero_for_different_freqs() {
+        let sr = 44100;
+        let a = stft(&synth_sine(sr, 0.3, 220.0), sr);
+        let b = stft(&synth_sine(sr, 0.3, 880.0), sr);
+        let d = log_spectral_distance_db(&a, &b);
+        assert!(d > 0.5, "different freqs should give LSD > 0.5, got {d}");
+        assert!(d.is_finite());
+    }
+
+    #[test]
+    fn harmonic_tracks_finds_first_partial() {
+        let sr = 44100;
+        let f0 = 261.63;
+        let sig = synth_inharmonic_signal(sr, 0.5, f0, 0.0, 6);
+        let s = stft(&sig, sr);
+        let tracks = harmonic_tracks(&s, f0, 6);
+        assert!(!tracks.is_empty(), "should produce at least one track");
+        assert_eq!(tracks[0].n, 1);
+        // Observed should be close to expected for the harmonic series.
+        assert!(
+            (tracks[0].freq_observed_hz - f0).abs() < 5.0,
+            "n=1 observed {} vs expected {}",
+            tracks[0].freq_observed_hz, f0
+        );
+    }
+
+    #[test]
+    fn t60_vector_loss_increases_with_difference() {
+        let make_with_t60 = |t60_scale: f32| -> Vec<HarmonicTrack> {
+            (1..=6)
+                .map(|n| HarmonicTrack {
+                    n,
+                    freq_expected_hz: 440.0 * n as f32,
+                    freq_observed_hz: 440.0 * n as f32,
+                    inharmonicity_cents: 0.0,
+                    initial_db: -6.0,
+                    t60_sec: 1.0 * t60_scale - 0.1 * n as f32,
+                    fit_quality_r2: 0.99,
+                })
+                .collect()
+        };
+        let ref_tracks = make_with_t60(1.0);
+        let close = make_with_t60(1.05);
+        let far = make_with_t60(2.0);
+        let loss_close = t60_vector_loss(&ref_tracks, &close);
+        let loss_far = t60_vector_loss(&ref_tracks, &far);
+        assert!(loss_far > loss_close, "farther T60s should give larger loss");
+    }
 }

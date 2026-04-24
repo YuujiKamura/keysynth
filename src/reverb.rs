@@ -218,3 +218,114 @@ pub fn load_ir_wav(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> 
 
     Ok(mono)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_ir_no_op() {
+        let mut r = Reverb::new(vec![]);
+        assert_eq!(r.ir_len(), 0);
+        let mut buf = vec![1.0_f32; 16];
+        r.process(&mut buf, 0.5);
+        for v in &buf {
+            assert_eq!(*v, 1.0, "empty IR must not modify the buffer");
+        }
+    }
+
+    #[test]
+    fn wet_zero_passthrough() {
+        let ir = vec![0.5_f32, 0.25, 0.125];
+        let mut r = Reverb::new(ir);
+        let mut buf = vec![0.7_f32; 8];
+        r.process(&mut buf, 0.0);
+        for v in &buf {
+            assert_eq!(*v, 0.7, "wet=0 must be a passthrough");
+        }
+    }
+
+    #[test]
+    fn impulse_ir_is_passthrough_at_wet_one() {
+        // IR = [1.0]: convolution = identity. wet=1.0 should reproduce input.
+        let ir = vec![1.0_f32];
+        let mut r = Reverb::new(ir);
+        let mut buf = vec![0.3_f32, 0.7, -0.5, 1.0];
+        let original = buf.clone();
+        r.process(&mut buf, 1.0);
+        for (a, b) in buf.iter().zip(original.iter()) {
+            assert!((a - b).abs() < 1e-6, "expected passthrough, got {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn ir_truncated_to_max_samples() {
+        let big = vec![0.1_f32; MAX_IR_SAMPLES + 100];
+        let r = Reverb::new(big);
+        assert_eq!(r.ir_len(), MAX_IR_SAMPLES);
+    }
+
+    #[test]
+    fn ir_len_reports_actual_taps() {
+        let r = Reverb::new(vec![1.0, 2.0, 3.0]);
+        assert_eq!(r.ir_len(), 3);
+    }
+
+    #[test]
+    fn synthetic_body_ir_nonempty() {
+        let ir = synthetic_body_ir(44_100);
+        assert!(!ir.is_empty());
+        // Length is 100 ms = 4410 samples (capped to MAX_IR_SAMPLES).
+        assert!(ir.len() <= MAX_IR_SAMPLES);
+    }
+
+    #[test]
+    fn synthetic_body_ir_normalised_to_unit_peak() {
+        let ir = synthetic_body_ir(44_100);
+        let peak = ir.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+        assert!(peak > 0.0);
+        assert!((peak - 1.0).abs() < 1e-3, "peak should be ~1.0, got {peak}");
+    }
+
+    #[test]
+    fn synthetic_body_ir_starts_with_direct_hit() {
+        let ir = synthetic_body_ir(44_100);
+        // Direct hit at t=0 dominates (was 1.0 pre-normalisation, plus
+        // a small noise sample). It should be one of the largest values.
+        assert!(ir[0].abs() > 0.5);
+    }
+
+    #[test]
+    fn synthetic_body_ir_reproducible_for_same_sr() {
+        let a = synthetic_body_ir(44_100);
+        let b = synthetic_body_ir(44_100);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reverb_zero_input_zero_output() {
+        let ir = vec![0.5_f32, 0.25];
+        let mut r = Reverb::new(ir);
+        let mut buf = vec![0.0_f32; 64];
+        r.process(&mut buf, 0.7);
+        for v in &buf {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn reverb_finite_for_random_input() {
+        let ir = synthetic_body_ir(44_100);
+        let mut r = Reverb::new(ir);
+        let mut state: u32 = 0xC0FFEE;
+        let mut buf = vec![0.0_f32; 4096];
+        for s in buf.iter_mut() {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            *s = (state as i32 as f32) / (i32::MAX as f32);
+        }
+        r.process(&mut buf, 0.5);
+        for v in &buf {
+            assert!(v.is_finite());
+        }
+    }
+}

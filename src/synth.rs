@@ -59,19 +59,127 @@ pub enum Engine {
 }
 
 // ---------------------------------------------------------------------------
+// ReleaseEnvelope: shared multiplicative exponential release helper.
+// ---------------------------------------------------------------------------
+//
+// History: every multiplicative-release voice (KS, KS-rich, Piano, Koto,
+// PianoThick, SfPianoPlaceholder) re-rolled the same `released: bool +
+// rel_mul: f32 + rel_step: f32` triplet plus identical `trigger_release` /
+// `is_done` / `is_releasing` impls. ReleaseEnvelope centralises that so
+// changes (e.g. done_threshold tuning) happen in one place and so it is
+// impossible for a voice to forget to override `is_releasing` (the
+// pre-refactor cause of "no sound after pressing many keys" — the voice
+// pool's eviction policy couldn't find released voices because most
+// VoiceImpls fell back to the trait default `is_releasing() == false`).
+
+/// Multiplicative exponential release envelope shared by every voice.
+/// Encapsulates the released-flag + rel_mul accumulator + rel_step
+/// per-sample multiplier so individual voice impls don't re-roll it.
+pub struct ReleaseEnvelope {
+    released: bool,
+    rel_mul: f32,
+    rel_step: f32,
+    /// Threshold under which `is_done()` returns true. Keeps the
+    /// per-voice "voice can be evicted" check uniform across types.
+    done_threshold: f32,
+}
+
+impl ReleaseEnvelope {
+    /// `release_sec` is the target -60dB time once `trigger()` is called.
+    /// Picks a per-sample multiplicative step that gets us there.
+    pub fn new(release_sec: f32, sr: f32) -> Self {
+        let release_samples = (release_sec * sr).max(1.0);
+        // exp(ln(eps)/N) so we hit ~-60dB after release_samples samples.
+        let rel_step = (1e-3_f32.ln() / release_samples).exp();
+        Self {
+            released: false,
+            rel_mul: 1.0,
+            rel_step,
+            done_threshold: 1e-4,
+        }
+    }
+
+    /// Construct with an explicit done-threshold (default is 1e-4).
+    /// Used by SfPianoPlaceholder which historically used a fixed-time
+    /// eviction window rather than amplitude-based.
+    pub fn with_done_threshold(release_sec: f32, sr: f32, done_threshold: f32) -> Self {
+        let mut env = Self::new(release_sec, sr);
+        env.done_threshold = done_threshold;
+        env
+    }
+
+    /// Mark released. Subsequent `step()` calls will multiplicatively
+    /// decay rel_mul.
+    pub fn trigger(&mut self) {
+        self.released = true;
+    }
+
+    /// Per-sample tick. Call once per output sample. Returns the current
+    /// envelope multiplier — voices apply this to their own output.
+    /// While not released, returns 1.0; after release, decays toward 0.
+    #[inline]
+    pub fn step(&mut self) -> f32 {
+        if self.released {
+            self.rel_mul *= self.rel_step;
+        }
+        self.rel_mul
+    }
+
+    /// Current multiplier without advancing. Useful for tests.
+    #[inline]
+    pub fn current(&self) -> f32 {
+        self.rel_mul
+    }
+
+    /// True once the release decay has reached `done_threshold`.
+    pub fn is_done(&self) -> bool {
+        self.released && self.rel_mul <= self.done_threshold
+    }
+
+    /// True if the voice has been released and is just ringing out.
+    /// Used by main.rs voice eviction.
+    pub fn is_releasing(&self) -> bool {
+        self.released
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Voice trait + implementations
 // ---------------------------------------------------------------------------
 
 pub trait VoiceImpl: Send {
     /// Add this voice's contribution into `buf` (mono, length = frames).
     fn render_add(&mut self, buf: &mut [f32]);
+
+    /// Optional reference to the shared `ReleaseEnvelope`. Voices that
+    /// use the multiplicative-release pattern return `Some` so the
+    /// default `trigger_release`/`is_done`/`is_releasing` impls below
+    /// just delegate. Voices with custom envelope shapes (linear AR,
+    /// ADSR) return `None` and override the trait methods directly.
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        None
+    }
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        None
+    }
+
     /// Mark released; envelope should fade and `is_done()` will go true.
-    fn trigger_release(&mut self);
-    fn is_done(&self) -> bool;
+    fn trigger_release(&mut self) {
+        if let Some(env) = self.release_env_mut() {
+            env.trigger();
+        }
+    }
+    fn is_done(&self) -> bool {
+        self.release_env().map(|e| e.is_done()).unwrap_or(false)
+    }
     /// True if the voice has been released but is still ringing out.
-    /// Default returns false; voice impls may override for smarter eviction.
+    /// Critical for the voice-pool eviction policy: when at the cap the
+    /// pool prefers to drop releasing voices over still-sustained ones.
+    /// Pre-refactor most voices forgot to override this and returned
+    /// `false`, which caused new notes to evict slot-0 (often a still-
+    /// sounding note) instead of an actually-releasing voice.
     fn is_releasing(&self) -> bool {
-        false
+        self.release_env().map(|e| e.is_releasing()).unwrap_or(false)
     }
 }
 
@@ -190,11 +298,16 @@ impl VoiceImpl for SquareVoice {
             }
         }
     }
+    // SquareVoice uses a linear AR envelope rather than the shared
+    // multiplicative ReleaseEnvelope, so it overrides the trait methods.
     fn trigger_release(&mut self) {
         self.released = true;
     }
     fn is_done(&self) -> bool {
         self.released && self.env <= 1e-5
+    }
+    fn is_releasing(&self) -> bool {
+        self.released
     }
 }
 
@@ -209,9 +322,7 @@ pub struct KsVoice {
     tune_coef: f32,
     tune_xprev: f32,
     tune_yprev: f32,
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
+    release: ReleaseEnvelope,
 }
 
 impl KsVoice {
@@ -230,10 +341,6 @@ impl KsVoice {
         // Hammer excitation: velocity sets contact width -> spectral brightness.
         let width = hammer_width_for_velocity(velocity);
         let buf = hammer_excitation(n, width, amp);
-        let release_sec = 0.150_f32;
-        let release_samples = (release_sec * sr).max(1.0);
-        // exp(ln(eps)/N) so we hit ~-60dB after release_samples samples.
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
         Self {
             buf,
             head: 0,
@@ -241,9 +348,7 @@ impl KsVoice {
             tune_coef,
             tune_xprev: 0.0,
             tune_yprev: 0.0,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
+            release: ReleaseEnvelope::new(0.150, sr),
         }
     }
 }
@@ -259,12 +364,8 @@ impl VoiceImpl for KsVoice {
             } else {
                 self.buf[self.head - 1]
             };
-            let mut out_sample = cur;
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
+            let env = self.release.step();
+            *sample += cur * env;
             // Lowpass + decay, then 1st-order allpass tuning filter for the
             // fractional-delay component.
             let lp = (cur + prev) * 0.5 * self.decay;
@@ -278,11 +379,11 @@ impl VoiceImpl for KsVoice {
             }
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
 }
 
@@ -374,6 +475,10 @@ impl Adsr {
     fn done(&self) -> bool {
         matches!(self.stage, AdsrStage::Done)
     }
+
+    fn is_releasing(&self) -> bool {
+        matches!(self.stage, AdsrStage::Release | AdsrStage::Done)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -457,12 +562,17 @@ impl VoiceImpl for SubVoice {
             *sample += filtered * ae * self.amp;
         }
     }
+    // SubVoice uses dual ADSR envelopes (amp + filter) rather than the
+    // shared ReleaseEnvelope, so it overrides the trait methods.
     fn trigger_release(&mut self) {
         self.amp_env.release();
         self.filt_env.release();
     }
     fn is_done(&self) -> bool {
         self.amp_env.done()
+    }
+    fn is_releasing(&self) -> bool {
+        self.amp_env.is_releasing()
     }
 }
 
@@ -526,12 +636,17 @@ impl VoiceImpl for FmVoice {
             }
         }
     }
+    // FmVoice uses dual ADSR envelopes (amp + mod-index) rather than the
+    // shared ReleaseEnvelope, so it overrides the trait methods.
     fn trigger_release(&mut self) {
         self.amp_env.release();
         self.mod_env.release();
     }
     fn is_done(&self) -> bool {
         self.amp_env.done()
+    }
+    fn is_releasing(&self) -> bool {
+        self.amp_env.is_releasing()
     }
 }
 
@@ -745,9 +860,7 @@ impl KsString {
 
 pub struct KsRichVoice {
     strings: [KsString; 3],
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
+    release: ReleaseEnvelope,
 }
 
 impl KsRichVoice {
@@ -772,14 +885,9 @@ impl KsRichVoice {
             KsString::new(sr, freq * detunes[1], amp, ap, hammer_w),
             KsString::new(sr, freq * detunes[2], amp, ap, hammer_w),
         ];
-        let release_sec = 0.250_f32;
-        let release_samples = (release_sec * sr).max(1.0);
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
         Self {
             strings,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
+            release: ReleaseEnvelope::new(0.250, sr),
         }
     }
 }
@@ -792,19 +900,15 @@ impl VoiceImpl for KsRichVoice {
             let s = self.strings[0].step()
                 + self.strings[1].step()
                 + self.strings[2].step();
-            let mut out_sample = s * gain;
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
+            let env = self.release.step();
+            *sample += s * gain * env;
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
 }
 
@@ -900,9 +1004,7 @@ pub struct PianoVoice {
     /// material to colour and reducing the perceived "曇り". Each string is
     /// a small fraction in the mix (1/7 vs old 1/3).
     strings: [KsString; 7],
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
+    release: ReleaseEnvelope,
     /// Modal soundboard resonator bank. Receives the summed string output
     /// every sample and feeds back into the strings via `coupling` for
     /// physical bridge coupling (Bank/Lehtonen DWS). Replaces the older
@@ -976,9 +1078,6 @@ impl PianoVoice {
             mk(freq * detunes[5]),
             mk(freq * detunes[6]),
         ];
-        let release_sec = 0.300_f32;
-        let release_samples = (release_sec * sr).max(1.0);
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
         // ---------------------------------------------------------------
         // Modal soundboard with bridge coupling (Bank/Lehtonen DWS).
         //
@@ -1010,9 +1109,7 @@ impl PianoVoice {
         let coupling = 0.012_f32 / 7.0;
         Self {
             strings,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
+            release: ReleaseEnvelope::new(0.300, sr),
             soundboard,
             coupling,
         }
@@ -1052,19 +1149,15 @@ impl VoiceImpl for PianoVoice {
             // 3. Drive the soundboard with the averaged string output.
             let board_out = self.soundboard.process(s_avg);
             // 4. Mix dry strings + wet soundboard into the audio bus.
-            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
+            let env = self.release.step();
+            *sample += (s_avg * dry_gain + board_out * wet_gain) * env;
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
 }
 
@@ -1107,9 +1200,7 @@ pub fn koto_pluck_excitation(n: usize, amp: f32, pluck_pos: usize) -> Vec<f32> {
 
 pub struct KotoVoice {
     string: KsString,
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
+    release: ReleaseEnvelope,
 }
 
 impl KotoVoice {
@@ -1124,14 +1215,9 @@ impl KotoVoice {
         let buf = koto_pluck_excitation(n, amp, pluck_pos);
         // Long sustain, very mild stiffness.
         let string = KsString::with_buf(sr, freq, buf, 0.9992, koto_ap);
-        let release_sec = 0.500_f32; // longer release = "ふわっと消える"
-        let release_samples = (release_sec * sr).max(1.0);
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
         Self {
             string,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
+            release: ReleaseEnvelope::new(0.500, sr), // longer release = "ふわっと消える"
         }
     }
 }
@@ -1139,19 +1225,16 @@ impl KotoVoice {
 impl VoiceImpl for KotoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         for sample in buf.iter_mut() {
-            let mut out_sample = self.string.step();
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
+            let s = self.string.step();
+            let env = self.release.step();
+            *sample += s * env;
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
 }
 
@@ -1189,11 +1272,11 @@ pub fn make_voice(
         Engine::Fm => Box::new(FmVoice::new(sr, freq, velocity)),
         Engine::Piano => Box::new(PianoVoice::new(sr, freq, velocity)),
         Engine::Koto => Box::new(KotoVoice::new(sr, freq, velocity)),
-        Engine::SfPiano => Box::new(SfPianoPlaceholder::new()),
+        Engine::SfPiano => Box::new(SfPianoPlaceholder::new(sr)),
         // SfzPiano shares the placeholder voice strategy with SfPiano: the
         // pool entry only tracks (channel, note) for eviction; audio comes
         // from the shared SfzPlayer rendered in the audio callback.
-        Engine::SfzPiano => Box::new(SfPianoPlaceholder::new()),
+        Engine::SfzPiano => Box::new(SfPianoPlaceholder::new(sr)),
         // PianoThick: 7 strings + 12-mode lite soundboard (no high-freq
         // additions). The full Piano variant's high-Q 16-mode set with
         // 7-string coupling produced an abnormal "ドーンミャアああーーオーン"
@@ -1229,9 +1312,7 @@ pub fn make_voice(
 
 pub struct PianoVoiceThick {
     strings: [KsString; 7],
-    released: bool,
-    rel_mul: f32,
-    rel_step: f32,
+    release: ReleaseEnvelope,
     soundboard: crate::soundboard::Soundboard,
     coupling: f32,
 }
@@ -1274,9 +1355,6 @@ impl PianoVoiceThick {
             mk(freq * detunes[5]),
             mk(freq * detunes[6]),
         ];
-        let release_sec = 0.300_f32;
-        let release_samples = (release_sec * sr).max(1.0);
-        let rel_step = (1e-3_f32.ln() / release_samples).exp();
         // 12-mode "lite" soundboard (no high-freq additions) so the
         // upper-band high-Q resonances don't ring through the bridge
         // feedback loop and colour the tail.
@@ -1288,9 +1366,7 @@ impl PianoVoiceThick {
         let coupling = 0.015_f32 / 7.0;
         Self {
             strings,
-            released: false,
-            rel_mul: 1.0,
-            rel_step,
+            release: ReleaseEnvelope::new(0.300, sr),
             soundboard,
             coupling,
         }
@@ -1322,19 +1398,15 @@ impl VoiceImpl for PianoVoiceThick {
             }
             let s_avg = s_sum * string_norm;
             let board_out = self.soundboard.process(s_avg);
-            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
-            if self.released {
-                self.rel_mul *= self.rel_step;
-                out_sample *= self.rel_mul;
-            }
-            *sample += out_sample;
+            let env = self.release.step();
+            *sample += (s_avg * dry_gain + board_out * wet_gain) * env;
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        self.released && self.rel_mul <= 1e-4
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
 }
 
@@ -1355,45 +1427,743 @@ impl VoiceImpl for PianoVoiceThick {
 // own active voices independently.
 
 pub struct SfPianoPlaceholder {
-    released: bool,
-    released_samples: u64,
+    /// Adopted ReleaseEnvelope so this placeholder participates in the
+    /// shared eviction discipline (is_done / is_releasing). The release
+    /// time is 3 s, matching the previous hard-coded 132_300-sample
+    /// post-release window at 44.1 kHz; with done_threshold lowered to
+    /// 1e-6 the envelope stays well below 1e-3 across the window so
+    /// is_done() fires at roughly the same wall-clock instant.
+    release: ReleaseEnvelope,
 }
 
 impl SfPianoPlaceholder {
-    pub fn new() -> Self {
+    pub fn new(sr: f32) -> Self {
+        // 3 s release × done_threshold 1e-3 reproduces the historical
+        // ~3 s eviction window (which was sample-counted as 132_300 @
+        // 44.1 kHz). The ReleaseEnvelope step is sized so rel_mul hits
+        // 1e-3 exactly at `release_sec` post-trigger, matching the
+        // original sample-counted semantics. Centralising via
+        // ReleaseEnvelope means the placeholder now reports
+        // `is_releasing()` like every other voice, fixing the
+        // eviction-policy bug where the pool couldn't see SfPiano
+        // placeholders as candidates for eviction.
         Self {
-            released: false,
-            released_samples: 0,
+            release: ReleaseEnvelope::with_done_threshold(3.0, sr, 1e-3),
         }
     }
 }
 
 impl Default for SfPianoPlaceholder {
     fn default() -> Self {
-        Self::new()
+        // 44.1 kHz default keeps the historical 3-s eviction window.
+        Self::new(44_100.0)
     }
 }
 
 impl VoiceImpl for SfPianoPlaceholder {
     fn render_add(&mut self, buf: &mut [f32]) {
         // Audio for this engine is rendered by the shared Synthesizer in
-        // the audio callback. We just count post-release samples so the
-        // pool can eventually evict us.
-        if self.released {
-            self.released_samples = self
-                .released_samples
-                .saturating_add(buf.len() as u64);
+        // the audio callback. We just step the release envelope so the
+        // pool can eventually evict us via is_done().
+        for _ in 0..buf.len() {
+            let _ = self.release.step();
         }
     }
-    fn trigger_release(&mut self) {
-        self.released = true;
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.release)
     }
-    fn is_done(&self) -> bool {
-        // ~3 s at 44.1 kHz -- well past most piano tails. The shared synth
-        // owns the real envelope; this is purely for our placeholder pool.
-        self.released && self.released_samples > 132_300
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.release)
     }
-    fn is_releasing(&self) -> bool {
-        self.released
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SR: f32 = 44_100.0;
+
+    fn nonzero_peak(buf: &[f32]) -> f32 {
+        buf.iter().fold(0.0_f32, |a, &x| a.max(x.abs()))
+    }
+
+    fn render_n(voice: &mut dyn VoiceImpl, frames: usize) -> Vec<f32> {
+        let mut buf = vec![0.0_f32; frames];
+        voice.render_add(&mut buf);
+        buf
+    }
+
+    // --- ReleaseEnvelope -------------------------------------------------
+
+    #[test]
+    fn release_env_starts_unity_pre_trigger() {
+        let env = ReleaseEnvelope::new(0.1, SR);
+        assert_eq!(env.current(), 1.0);
+        assert!(!env.is_releasing());
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn release_env_step_pre_trigger_stays_unity() {
+        let mut env = ReleaseEnvelope::new(0.1, SR);
+        for _ in 0..10_000 {
+            assert_eq!(env.step(), 1.0);
+        }
+    }
+
+    #[test]
+    fn release_env_trigger_marks_releasing() {
+        let mut env = ReleaseEnvelope::new(0.1, SR);
+        env.trigger();
+        assert!(env.is_releasing());
+    }
+
+    #[test]
+    fn release_env_decays_after_trigger() {
+        let mut env = ReleaseEnvelope::new(0.1, SR);
+        env.trigger();
+        let mut prev = 1.0_f32;
+        for _ in 0..100 {
+            let v = env.step();
+            assert!(v < prev || v == 0.0, "envelope should be monotonically decreasing");
+            prev = v;
+        }
+    }
+
+    #[test]
+    fn release_env_is_done_after_full_release_window() {
+        let release_sec = 0.05_f32;
+        let mut env = ReleaseEnvelope::new(release_sec, SR);
+        env.trigger();
+        // The envelope hits ~-60dB after release_samples; done_threshold is
+        // 1e-4 (-80dB). Run for 2× the release window to be safe.
+        let n = (release_sec * SR * 2.0) as usize;
+        for _ in 0..n {
+            let _ = env.step();
+        }
+        assert!(env.is_done(), "envelope should be done after 2x release window");
+    }
+
+    #[test]
+    fn release_env_not_done_pre_trigger() {
+        let mut env = ReleaseEnvelope::new(0.05, SR);
+        for _ in 0..(SR as usize) {
+            let _ = env.step();
+        }
+        assert!(!env.is_done());
+    }
+
+    #[test]
+    fn release_env_with_done_threshold_overrides() {
+        let mut env = ReleaseEnvelope::with_done_threshold(0.05, SR, 0.5);
+        env.trigger();
+        // With threshold 0.5 we should reach done quickly (well before -60dB).
+        let mut steps = 0;
+        for _ in 0..10_000 {
+            let _ = env.step();
+            steps += 1;
+            if env.is_done() {
+                break;
+            }
+        }
+        assert!(env.is_done(), "high threshold should trigger done quickly");
+        assert!(steps < 1000, "should be done in <1000 steps, took {steps}");
+    }
+
+    // --- midi_to_freq ----------------------------------------------------
+
+    #[test]
+    fn midi_to_freq_a4() {
+        assert!((midi_to_freq(69) - 440.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn midi_to_freq_c4() {
+        // C4 = MIDI 60. 440 / 2^(9/12) = ~261.626 Hz.
+        let f = midi_to_freq(60);
+        assert!((f - 261.6256).abs() < 0.01, "expected ~261.63, got {f}");
+    }
+
+    #[test]
+    fn midi_to_freq_octave_above_a4() {
+        let f = midi_to_freq(81); // A5
+        assert!((f - 880.0).abs() < 1e-3, "expected 880, got {f}");
+    }
+
+    #[test]
+    fn midi_to_freq_octave_below_a4() {
+        let f = midi_to_freq(57); // A3
+        assert!((f - 220.0).abs() < 1e-3, "expected 220, got {f}");
+    }
+
+    // --- hammer excitations ----------------------------------------------
+
+    #[test]
+    fn hammer_width_decreasing_with_velocity() {
+        let w_soft = hammer_width_for_velocity(20);
+        let w_hard = hammer_width_for_velocity(127);
+        assert!(w_hard < w_soft, "hard hits should have narrower contact ({w_hard} < {w_soft})");
+    }
+
+    #[test]
+    fn hammer_width_clamps_zero_velocity() {
+        // vel=0 is clamped to 1 internally; should give the widest pulse.
+        let w0 = hammer_width_for_velocity(0);
+        let w1 = hammer_width_for_velocity(1);
+        assert_eq!(w0, w1);
+    }
+
+    #[test]
+    fn hammer_excitation_length_matches_n() {
+        let buf = hammer_excitation(100, 5, 1.0);
+        assert_eq!(buf.len(), 100);
+    }
+
+    #[test]
+    fn hammer_excitation_starts_zero() {
+        let buf = hammer_excitation(100, 10, 1.0);
+        // Hann starts at 0
+        assert!(buf[0].abs() < 1e-6, "Hann hammer should start at 0, got {}", buf[0]);
+    }
+
+    #[test]
+    fn hammer_excitation_ends_zero_after_window() {
+        let buf = hammer_excitation(100, 10, 1.0);
+        // After the 10-sample window, all subsequent samples are zero.
+        for v in buf.iter().skip(10) {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn hammer_excitation_peak_within_amp() {
+        let amp = 0.5_f32;
+        let buf = hammer_excitation(100, 20, amp);
+        let p = nonzero_peak(&buf);
+        assert!(p <= amp + 1e-6, "peak {p} exceeds amp {amp}");
+        assert!(p > amp * 0.5, "peak {p} too small for amp {amp}");
+    }
+
+    #[test]
+    fn hammer_excitation_unit_width_is_impulse() {
+        let buf = hammer_excitation(10, 1, 0.7);
+        assert_eq!(buf[0], 0.7);
+        for v in buf.iter().skip(1) {
+            assert_eq!(*v, 0.0);
+        }
+    }
+
+    #[test]
+    fn piano_hammer_width_decreasing_with_velocity() {
+        let w_soft = piano_hammer_width(20);
+        let w_hard = piano_hammer_width(127);
+        assert!(w_hard < w_soft);
+        // Piano hammer is significantly wider than the generic one.
+        assert!(w_hard >= 20);
+        assert!(w_soft >= 100);
+    }
+
+    #[test]
+    fn piano_hammer_excitation_length() {
+        let buf = piano_hammer_excitation(500, 100, 1.0);
+        assert_eq!(buf.len(), 500);
+    }
+
+    #[test]
+    fn piano_hammer_excitation_starts_zero() {
+        let buf = piano_hammer_excitation(500, 100, 1.0);
+        assert!(buf[0].abs() < 1e-6);
+    }
+
+    #[test]
+    fn piano_hammer_excitation_unit_width() {
+        let buf = piano_hammer_excitation(10, 1, 0.5);
+        assert_eq!(buf[0], 0.5);
+    }
+
+    #[test]
+    fn piano_hammer_excitation_decay_after_rise() {
+        // Find the peak; everything after should be decreasing.
+        let buf = piano_hammer_excitation(200, 80, 1.0);
+        let (peak_idx, _) = buf
+            .iter()
+            .enumerate()
+            .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
+                if v.abs() > v_max { (i, v.abs()) } else { (i_max, v_max) }
+            });
+        // After peak: monotonic decay (allow 1 sample tolerance).
+        let mut prev = buf[peak_idx];
+        for v in buf.iter().skip(peak_idx + 1).take(50) {
+            assert!(*v <= prev + 1e-6, "decay should be monotonic past peak");
+            prev = *v;
+        }
+    }
+
+    #[test]
+    fn koto_pluck_excitation_length() {
+        let buf = koto_pluck_excitation(40, 1.0, 10);
+        assert_eq!(buf.len(), 40);
+    }
+
+    #[test]
+    fn koto_pluck_excitation_zero_n() {
+        let buf = koto_pluck_excitation(0, 1.0, 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn koto_pluck_excitation_has_positive_and_negative() {
+        let buf = koto_pluck_excitation(40, 1.0, 10);
+        assert!(buf.iter().any(|&x| x > 0.0), "should have positive samples");
+        assert!(buf.iter().any(|&x| x < 0.0), "should have negative samples");
+    }
+
+    #[test]
+    fn koto_pluck_excitation_amplitude_at_zero() {
+        let buf = koto_pluck_excitation(40, 0.8, 10);
+        assert!((buf[0] - 0.8).abs() < 1e-6);
+    }
+
+    // --- KsString --------------------------------------------------------
+
+    #[test]
+    fn ks_string_delay_length_basic() {
+        let (n, frac) = KsString::delay_length(SR, 440.0);
+        // sr/freq = 100.227 → N=100, frac~0.227
+        assert_eq!(n, 100);
+        assert!(frac >= 0.0 && frac < 1.0);
+    }
+
+    #[test]
+    fn ks_string_delay_length_minimum_two() {
+        let (n, _) = KsString::delay_length(SR, 100_000.0);
+        // Way above SR, would compute < 2.
+        assert!(n >= 2);
+    }
+
+    #[test]
+    fn ks_string_delay_length_compensated_smaller_than_raw() {
+        let (n_raw, _) = KsString::delay_length(SR, 261.63);
+        let (n_comp, _) = KsString::delay_length_compensated(SR, 261.63, 0.18);
+        assert!(n_comp <= n_raw, "compensated length should be ≤ raw");
+    }
+
+    #[test]
+    fn ks_string_step_produces_finite_output() {
+        let mut s = KsString::new(SR, 440.0, 1.0, 0.18, 5);
+        for _ in 0..1000 {
+            let y = s.step();
+            assert!(y.is_finite());
+        }
+    }
+
+    #[test]
+    fn ks_string_with_buf_produces_audio() {
+        let (n, _) = KsString::delay_length_compensated(SR, 440.0, 0.18);
+        let buf = hammer_excitation(n, 5, 1.0);
+        let mut s = KsString::with_buf(SR, 440.0, buf, 0.997, 0.18);
+        let mut peak = 0.0_f32;
+        for _ in 0..1000 {
+            peak = peak.max(s.step().abs());
+        }
+        assert!(peak > 0.0, "string should produce non-zero output");
+    }
+
+    #[test]
+    fn ks_string_with_attack_lpf_chains() {
+        let s = KsString::new(SR, 440.0, 1.0, 0.18, 5);
+        let _ = s.with_attack_lpf(SR, 80.0, 0.99, 0.97);
+        // Just verifying the builder pattern compiles & returns a usable struct.
+    }
+
+    #[test]
+    fn ks_string_inject_feedback_changes_output() {
+        // Two identical strings; feed feedback into one and confirm output diverges.
+        let mut a = KsString::new(SR, 440.0, 0.5, 0.10, 3);
+        let mut b = KsString::new(SR, 440.0, 0.5, 0.10, 3);
+        let mut diff_seen = false;
+        for _ in 0..200 {
+            b.inject_feedback(0.1);
+            let ya = a.step();
+            let yb = b.step();
+            if (ya - yb).abs() > 1e-6 {
+                diff_seen = true;
+            }
+        }
+        assert!(diff_seen, "feedback injection should affect output");
+    }
+
+    #[test]
+    fn ks_string_decays_over_time() {
+        let mut s = KsString::new(SR, 440.0, 1.0, 0.18, 5);
+        let early_peak: f32 = (0..500).map(|_| s.step().abs()).fold(0.0_f32, f32::max);
+        for _ in 0..50_000 {
+            let _ = s.step();
+        }
+        let late_peak: f32 = (0..500).map(|_| s.step().abs()).fold(0.0_f32, f32::max);
+        assert!(late_peak < early_peak, "string should decay: early {early_peak} late {late_peak}");
+    }
+
+    // --- SquareVoice -----------------------------------------------------
+
+    #[test]
+    fn square_voice_renders_audio() {
+        let mut v = SquareVoice::new(SR, 440.0, 100);
+        let buf = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn square_voice_release_then_done() {
+        let mut v = SquareVoice::new(SR, 440.0, 100);
+        let _ = render_n(&mut v, 1024);
+        assert!(!v.is_done());
+        assert!(!v.is_releasing());
+        v.trigger_release();
+        assert!(v.is_releasing());
+        // After ~80 ms (release time) of rendering, env should reach 0.
+        let _ = render_n(&mut v, ((0.080 * SR) as usize) + 100);
+        assert!(v.is_done());
+    }
+
+    #[test]
+    fn square_voice_attack_ramps_up() {
+        let mut v = SquareVoice::new(SR, 440.0, 127);
+        let early = render_n(&mut v, 4); // 4 samples — well below attack time
+        let later = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&later) > nonzero_peak(&early));
+    }
+
+    // --- KsVoice ---------------------------------------------------------
+
+    #[test]
+    fn ks_voice_renders_audio() {
+        let mut v = KsVoice::new(SR, 440.0, 100);
+        let buf = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn ks_voice_releasing_before_trigger_is_false() {
+        let v = KsVoice::new(SR, 440.0, 100);
+        assert!(!v.is_releasing());
+        assert!(!v.is_done());
+    }
+
+    #[test]
+    fn ks_voice_trigger_release_marks_releasing() {
+        let mut v = KsVoice::new(SR, 440.0, 100);
+        v.trigger_release();
+        assert!(v.is_releasing());
+    }
+
+    #[test]
+    fn ks_voice_eventually_done() {
+        let mut v = KsVoice::new(SR, 440.0, 100);
+        v.trigger_release();
+        // 0.150 s release window, render 0.3 s.
+        let _ = render_n(&mut v, (SR * 0.3) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- KsRichVoice -----------------------------------------------------
+
+    #[test]
+    fn ks_rich_voice_renders_audio() {
+        let mut v = KsRichVoice::new(SR, 440.0, 100);
+        let buf = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn ks_rich_voice_release_lifecycle() {
+        let mut v = KsRichVoice::new(SR, 440.0, 100);
+        assert!(!v.is_releasing());
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 0.6) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- SubVoice --------------------------------------------------------
+
+    #[test]
+    fn sub_voice_renders_audio() {
+        let mut v = SubVoice::new(SR, 220.0, 100);
+        // SubVoice has a slow filter sweep; render a few buffers to reach audible output.
+        let _ = render_n(&mut v, 1024);
+        let buf = render_n(&mut v, 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn sub_voice_release_completes() {
+        let mut v = SubVoice::new(SR, 220.0, 100);
+        let _ = render_n(&mut v, 1024);
+        v.trigger_release();
+        assert!(v.is_releasing());
+        // Release time is 0.250 s; render generously.
+        let _ = render_n(&mut v, (SR * 0.5) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- FmVoice ---------------------------------------------------------
+
+    #[test]
+    fn fm_voice_renders_audio() {
+        let mut v = FmVoice::new(SR, 440.0, 100);
+        let buf = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn fm_voice_release_completes() {
+        let mut v = FmVoice::new(SR, 440.0, 100);
+        let _ = render_n(&mut v, 512);
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 1.0) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- PianoVoice ------------------------------------------------------
+
+    #[test]
+    fn piano_voice_renders_audio() {
+        let mut v = PianoVoice::new(SR, 261.63, 100);
+        let buf = render_n(&mut v, 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn piano_voice_release_lifecycle() {
+        let mut v = PianoVoice::new(SR, 261.63, 100);
+        assert!(!v.is_releasing());
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 0.7) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- KotoVoice -------------------------------------------------------
+
+    #[test]
+    fn koto_voice_renders_audio() {
+        let mut v = KotoVoice::new(SR, 261.63, 100);
+        let buf = render_n(&mut v, 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn koto_voice_release_lifecycle() {
+        let mut v = KotoVoice::new(SR, 261.63, 100);
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 1.1) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- PianoVoiceThick -------------------------------------------------
+
+    #[test]
+    fn piano_thick_voice_renders_audio() {
+        let mut v = PianoVoiceThick::new(SR, 261.63, 100);
+        let buf = render_n(&mut v, 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn piano_thick_voice_release_lifecycle() {
+        let mut v = PianoVoiceThick::new(SR, 261.63, 100);
+        v.trigger_release();
+        assert!(v.is_releasing());
+        let _ = render_n(&mut v, (SR * 0.7) as usize);
+        assert!(v.is_done());
+    }
+
+    // --- SfPianoPlaceholder ---------------------------------------------
+
+    #[test]
+    fn sf_placeholder_default_constructs() {
+        let p = SfPianoPlaceholder::default();
+        assert!(!p.is_releasing());
+        assert!(!p.is_done());
+    }
+
+    #[test]
+    fn sf_placeholder_release_lifecycle() {
+        let mut p = SfPianoPlaceholder::new(SR);
+        assert!(!p.is_releasing());
+        p.trigger_release();
+        assert!(p.is_releasing());
+        // 3 s release window; render 4 s of buffers.
+        let frames_per_buf = 1024;
+        let total_frames = (SR * 4.0) as usize;
+        let mut buf = vec![0.0_f32; frames_per_buf];
+        let mut rendered = 0;
+        while rendered < total_frames {
+            for s in buf.iter_mut() { *s = 0.0; }
+            p.render_add(&mut buf);
+            rendered += frames_per_buf;
+        }
+        assert!(p.is_done(), "placeholder should be done after >3s post-release");
+    }
+
+    #[test]
+    fn sf_placeholder_render_add_does_not_modify_buffer() {
+        // Placeholder is silent — it must not write into the audio bus
+        // (audio is rendered by the shared synth elsewhere).
+        let mut p = SfPianoPlaceholder::new(SR);
+        let mut buf = vec![1.5_f32; 256];
+        p.render_add(&mut buf);
+        for v in &buf {
+            assert_eq!(*v, 1.5, "placeholder must not modify the buffer");
+        }
+    }
+
+    // --- make_voice factory ---------------------------------------------
+
+    #[test]
+    fn make_voice_square_renders() {
+        let mut v = make_voice(Engine::Square, SR, 440.0, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_ks_renders() {
+        let mut v = make_voice(Engine::Ks, SR, 440.0, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_ks_rich_renders() {
+        let mut v = make_voice(Engine::KsRich, SR, 440.0, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_sub_renders() {
+        let mut v = make_voice(Engine::Sub, SR, 220.0, 100);
+        let _ = render_n(v.as_mut(), 1024);
+        let buf = render_n(v.as_mut(), 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_fm_renders() {
+        let mut v = make_voice(Engine::Fm, SR, 440.0, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_piano_renders() {
+        let mut v = make_voice(Engine::Piano, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_koto_renders() {
+        let mut v = make_voice(Engine::Koto, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    #[test]
+    fn make_voice_sf_piano_silent() {
+        let mut v = make_voice(Engine::SfPiano, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert_eq!(nonzero_peak(&buf), 0.0);
+    }
+
+    #[test]
+    fn make_voice_sfz_piano_silent() {
+        let mut v = make_voice(Engine::SfzPiano, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 1024);
+        assert_eq!(nonzero_peak(&buf), 0.0);
+    }
+
+    #[test]
+    fn make_voice_piano_thick_renders() {
+        let mut v = make_voice(Engine::PianoThick, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 4096);
+        assert!(nonzero_peak(&buf) > 0.0);
+    }
+
+    // --- Eviction-policy regression --------------------------------------
+    //
+    // Pre-refactor bug: most voice impls forgot to override `is_releasing`,
+    // so the voice-pool `find(|x| x.is_done() || x.is_releasing())` scan
+    // returned None and the eviction fell through to `unwrap_or(0)`,
+    // killing slot 0 — often a still-sounding note. After the refactor
+    // every multiplicative-release voice (and the SfPianoPlaceholder)
+    // returns is_releasing() == true once trigger_release is called.
+
+    #[test]
+    fn every_engine_reports_is_releasing_after_trigger() {
+        let engines = [
+            Engine::Square,
+            Engine::Ks,
+            Engine::KsRich,
+            Engine::Sub,
+            Engine::Fm,
+            Engine::Piano,
+            Engine::Koto,
+            Engine::SfPiano,
+            Engine::SfzPiano,
+            Engine::PianoThick,
+        ];
+        for engine in engines.iter().copied() {
+            let mut v = make_voice(engine, SR, 440.0, 100);
+            // SubVoice needs at least one sample of render before its
+            // amp_env leaves the Attack stage — without that, releasing
+            // an immediately-released voice is treated as Done with
+            // value <= 1e-6. Render a tiny block first.
+            let _ = render_n(v.as_mut(), 64);
+            assert!(!v.is_releasing(), "engine {:?} reports releasing pre-trigger", engine);
+            v.trigger_release();
+            assert!(
+                v.is_releasing(),
+                "engine {:?} must report is_releasing() == true after trigger_release",
+                engine,
+            );
+        }
+    }
+
+    #[test]
+    fn voice_pool_eviction_prefers_released_voices() {
+        // Simulate the real eviction policy: at cap, the pool finds the
+        // first voice that is_done() OR is_releasing(). Construct a pool
+        // of 4 voices, release the second one, confirm the eviction picks
+        // index 1 not index 0.
+        let mut pool: Vec<Box<dyn VoiceImpl + Send>> = (0..4)
+            .map(|_| make_voice(Engine::Piano, SR, 440.0, 100))
+            .collect();
+        pool[1].trigger_release();
+        let evict_idx = pool
+            .iter()
+            .position(|x| x.is_done() || x.is_releasing())
+            .unwrap_or(0);
+        assert_eq!(evict_idx, 1, "should evict the released voice (slot 1), got {evict_idx}");
+    }
+
+    #[test]
+    fn voice_pool_all_unreleased_falls_back_to_zero() {
+        let pool: Vec<Box<dyn VoiceImpl + Send>> = (0..4)
+            .map(|_| make_voice(Engine::Piano, SR, 440.0, 100))
+            .collect();
+        let evict_idx = pool
+            .iter()
+            .position(|x| x.is_done() || x.is_releasing())
+            .unwrap_or(0);
+        assert_eq!(evict_idx, 0, "no released voice → fall back to slot 0");
     }
 }

@@ -223,4 +223,85 @@ mod tests {
         // With 12 modes at peak_gain=1/sqrt(12), worst-case peak is ~1.0.
         assert!(peak < 4.0, "soundboard peak too large: {peak}");
     }
+
+    #[test]
+    fn modal_resonator_zero_input_zero_output() {
+        let mut r = ModalResonator::new(48_000.0, 200.0, 50.0, 1.0);
+        for _ in 0..1000 {
+            assert_eq!(r.process(0.0), 0.0);
+        }
+    }
+
+    #[test]
+    fn modal_resonator_finite_for_impulse() {
+        let mut r = ModalResonator::new(48_000.0, 1000.0, 80.0, 1.0);
+        let _ = r.process(1.0);
+        for _ in 0..10_000 {
+            let y = r.process(0.0);
+            assert!(y.is_finite());
+        }
+    }
+
+    #[test]
+    fn soundboard_lite_constructs() {
+        let sr = 48_000.0;
+        let mut sb = Soundboard::new_concert_grand_lite(sr);
+        // Lite has 12 modes; impulse should still ring.
+        let mut max_y = 0.0_f32;
+        let _ = sb.process(1.0);
+        for _ in 0..1000 {
+            let y = sb.process(0.0);
+            max_y = max_y.max(y.abs());
+            assert!(y.is_finite());
+        }
+        assert!(max_y > 0.0, "lite soundboard should produce non-zero ring");
+    }
+
+    #[test]
+    fn soundboard_lite_decays_faster_than_full() {
+        // Lite uses lower Q (15-35 vs 60-120) so its impulse response
+        // should decay measurably faster than the full variant.
+        let sr = 48_000.0;
+        let mut full = Soundboard::new_concert_grand(sr);
+        let mut lite = Soundboard::new_concert_grand_lite(sr);
+        let _ = full.process(1.0);
+        let _ = lite.process(1.0);
+        // Skip 100 ms then sum |y| over the next 100 ms.
+        for _ in 0..(sr as usize / 10) {
+            let _ = full.process(0.0);
+            let _ = lite.process(0.0);
+        }
+        let mut full_energy = 0.0_f32;
+        let mut lite_energy = 0.0_f32;
+        for _ in 0..(sr as usize / 10) {
+            full_energy += full.process(0.0).abs();
+            lite_energy += lite.process(0.0).abs();
+        }
+        assert!(
+            lite_energy < full_energy,
+            "lite ({lite_energy}) should decay faster than full ({full_energy})"
+        );
+    }
+
+    #[test]
+    fn soundboard_last_output_reflects_latest_process() {
+        let sr = 48_000.0;
+        let mut sb = Soundboard::new_concert_grand(sr);
+        // Initial last_output is zero.
+        assert_eq!(sb.last_output(), 0.0);
+        let y1 = sb.process(1.0);
+        assert_eq!(sb.last_output(), y1, "last_output should mirror latest process");
+        let y2 = sb.process(0.5);
+        assert_eq!(sb.last_output(), y2);
+    }
+
+    #[test]
+    fn soundboard_zero_input_zero_output() {
+        let sr = 48_000.0;
+        let mut sb = Soundboard::new_concert_grand(sr);
+        for _ in 0..10_000 {
+            assert_eq!(sb.process(0.0), 0.0);
+            assert_eq!(sb.last_output(), 0.0);
+        }
+    }
 }

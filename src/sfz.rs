@@ -827,4 +827,95 @@ sample=a.wav lokey=1 hikey=2
         assert_eq!(parse_midi_note("db4"), Some(61));
         assert_eq!(parse_midi_note("60"), Some(60));
     }
+
+    #[test]
+    fn midi_note_invalid_returns_none() {
+        assert_eq!(parse_midi_note(""), None);
+        assert_eq!(parse_midi_note("z4"), None);
+        assert_eq!(parse_midi_note("c"), None);
+    }
+
+    #[test]
+    fn midi_note_out_of_range_returns_none() {
+        // C-2 = -12 (negative MIDI), out of range.
+        assert_eq!(parse_midi_note("c-2"), None);
+        // G10 = 127+? — far above 127.
+        assert_eq!(parse_midi_note("c10"), None);
+    }
+
+    #[test]
+    fn midi_note_uppercase_accepted() {
+        // parse_midi_note lowercases internally, so uppercase letters
+        // should still match.
+        assert_eq!(parse_midi_note("C4"), Some(60));
+        assert_eq!(parse_midi_note("A4"), Some(69));
+    }
+
+    #[test]
+    fn parse_empty_sfz_yields_empty_regions() {
+        let regions = parse_sfz_regions("").unwrap();
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn parse_only_comments_yields_empty_regions() {
+        let regions = parse_sfz_regions("// only a comment\n// another\n").unwrap();
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn parse_unterminated_header_returns_err() {
+        let r = parse_sfz_regions("<region\nsample=a.wav\n");
+        assert!(r.is_err(), "unterminated header should be Err");
+    }
+
+    #[test]
+    fn parse_sample_with_spaces_in_path() {
+        let sfz = "\
+<region>
+sample=samples/A 3.wav lokey=57 hikey=60
+";
+        let regions = parse_sfz_regions(sfz).unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].get("sample").map(|s| s.as_str()), Some("samples/A 3.wav"));
+        assert_eq!(regions[0].get("lokey").map(|s| s.as_str()), Some("57"));
+    }
+
+    #[test]
+    fn parse_multiple_regions_independent() {
+        let sfz = "\
+<region>
+sample=a.wav key=60
+<region>
+sample=b.wav key=62
+";
+        let regions = parse_sfz_regions(sfz).unwrap();
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].get("key").map(|s| s.as_str()), Some("60"));
+        assert_eq!(regions[1].get("key").map(|s| s.as_str()), Some("62"));
+    }
+
+    #[test]
+    fn db_to_gain_zero_db_unity() {
+        assert!((db_to_gain(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn db_to_gain_minus_six_db_half_amplitude() {
+        // -6 dB ≈ 0.5012 amplitude.
+        let g = db_to_gain(-6.0);
+        assert!((g - 0.5012).abs() < 0.01, "expected ~0.5012, got {g}");
+    }
+
+    #[test]
+    fn cents_to_ratio_zero_unity() {
+        assert!((cents_to_ratio(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cents_to_ratio_one_octave() {
+        // 1200 cents = 1 octave = ratio 2.
+        let r = cents_to_ratio(1200.0);
+        assert!((r - 2.0).abs() < 1e-3);
+    }
 }
