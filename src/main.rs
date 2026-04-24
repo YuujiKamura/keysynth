@@ -277,6 +277,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         master: args.master,
         engine: args.engine,
         reverb_wet: args.reverb_wet,
+        sf_program: args.sf2_program,
+        sf_bank: args.sf2_bank,
     }));
     let dash: Arc<Mutex<DashState>> = Arc::new(Mutex::new(DashState::new(args.engine)));
 
@@ -285,16 +287,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dash_for_midi = dash.clone();
     let synth_for_midi = shared_synth.clone();
     let sr_for_voices = sr_hz as f32;
+    // Track the last (program, bank) we pushed into the shared synth so
+    // we don't spam a Program Change per note. `u16::MAX` sentinel forces
+    // the first note_on after startup to send the initial pair, even if
+    // the GUI never moved the picker (covers the case where args.sf2_program
+    // != 0 was already applied at SF2 load time -- still cheap).
+    let mut last_applied_program: u16 = u16::MAX;
+    let mut last_applied_bank: u16 = u16::MAX;
     let _conn = midi_in.connect(
         &chosen_port,
         "keysynth-in",
         move |_stamp, raw, _| {
-            if raw.len() < 3 {
+            if raw.is_empty() {
                 return;
             }
             let status = raw[0];
             let msg_type = status & 0xF0;
             let channel = status & 0x0F;
+
+            // Program Change is a 2-byte message: status + program.
+            // Handle BEFORE the >=3 guard below, otherwise it gets dropped.
+            if msg_type == 0xC0 {
+                if raw.len() < 2 {
+                    return;
+                }
+                let program = raw[1].min(127);
+                {
+                    let mut lp = live_for_midi.lock().unwrap();
+                    lp.sf_program = program;
+                }
+                {
+                    let mut d = dash_for_midi.lock().unwrap();
+                    d.push_event(format!("PC ch{channel} prog={program}"));
+                }
+                return;
+            }
+
+            if raw.len() < 3 {
+                return;
+            }
             let note = raw[1];
             let velocity = raw[2];
 
@@ -306,9 +337,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         d.push_event(format!("note_on  ch{channel} n{note} v{velocity}"));
                     }
                     let freq = midi_to_freq(note);
-                    // Read currently-selected engine fresh each note so GUI
-                    // changes apply immediately to subsequent keypresses.
-                    let engine = live_for_midi.lock().unwrap().engine;
+                    // Read currently-selected engine + GM patch fresh each
+                    // note so GUI changes apply immediately to subsequent
+                    // keypresses.
+                    let (engine, want_program, want_bank) = {
+                        let lp = live_for_midi.lock().unwrap();
+                        (lp.engine, lp.sf_program, lp.sf_bank)
+                    };
 
                     // Drive the shared SoundFont synth too if we're in
                     // sf-piano (or whenever a synth is loaded -- harmless
@@ -316,6 +351,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // routes audio for them, not the synth).
                     if engine == Engine::SfPiano {
                         if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
+                            // Push Bank Select + Program Change ONLY when
+                            // the desired pair has actually changed since
+                            // last note. Order: Bank Select (CC 0 MSB)
+                            // first, then Program Change -- bank select
+                            // takes effect on the next PC per GM/GS spec.
+                            if (want_bank as u16) != last_applied_bank
+                                || (want_program as u16) != last_applied_program
+                            {
+                                synth.process_midi_message(
+                                    channel as i32,
+                                    0xB0,
+                                    0,
+                                    want_bank as i32,
+                                );
+                                synth.process_midi_message(
+                                    channel as i32,
+                                    0xC0,
+                                    want_program as i32,
+                                    0,
+                                );
+                                last_applied_bank = want_bank as u16;
+                                last_applied_program = want_program as u16;
+                            }
                             synth.note_on(channel as i32, note as i32, velocity as i32);
                         }
                     }

@@ -18,6 +18,7 @@ use cpal::Stream;
 use eframe::egui;
 use midir::MidiInputConnection;
 
+use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
 use crate::synth::{DashState, Engine, LiveParams};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
@@ -66,11 +67,13 @@ impl eframe::App for KeysynthApp {
         ctx.request_repaint_after(Duration::from_millis(16));
 
         // Snapshot shared state under brief locks; release before drawing.
-        let (mut master, mut engine, mut reverb_wet, dash_snapshot) = {
+        let (mut master, mut engine, mut reverb_wet, mut sf_program, mut sf_bank, dash_snapshot) = {
             let lp = self.ctx.live.lock().unwrap();
             let m = lp.master;
             let e = lp.engine;
             let r = lp.reverb_wet;
+            let p = lp.sf_program;
+            let b = lp.sf_bank;
             drop(lp);
             let d = self.ctx.dash.lock().unwrap();
             let snap = DashSnapshot {
@@ -80,12 +83,14 @@ impl eframe::App for KeysynthApp {
                 // Only clone the tail we actually display (newest 60, pre-reversed).
                 recent: d.recent.iter().rev().take(60).cloned().collect(),
             };
-            (m, e, r, snap)
+            (m, e, r, p, b, snap)
         };
 
         let master_before = master;
         let engine_before = engine;
         let reverb_before = reverb_wet;
+        let sf_program_before = sf_program;
+        let sf_bank_before = sf_bank;
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -120,8 +125,111 @@ impl eframe::App for KeysynthApp {
                         engine = *e;
                     }
                 }
+                // Show the live SoundFont patch name beside the engine
+                // selector when sf-piano is active so the user always
+                // knows what timbre the next keypress will produce.
+                if engine == Engine::SfPiano {
+                    ui.separator();
+                    let name = GM_INSTRUMENTS
+                        .get(sf_program as usize)
+                        .map(|(_, n, _)| *n)
+                        .unwrap_or("<unknown>");
+                    let label = if sf_bank == 128 {
+                        format!("[bank128 prog{sf_program}] (drum kit)")
+                    } else {
+                        format!("[{:>3} {}]", sf_program, name)
+                    };
+                    ui.label(
+                        egui::RichText::new(label)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(255, 200, 80)),
+                    );
+                }
             });
         });
+
+        // Left side panel: GM 128 program picker. Always visible so the
+        // user can pre-select a patch before switching engine, but rows
+        // are disabled (greyed) unless sf-piano is the active engine
+        // -- the patch only matters for the SoundFont path.
+        let sf_active = engine == Engine::SfPiano;
+        egui::SidePanel::left("instruments")
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("GM 128 patches");
+                ui.add_space(2.0);
+                // Drum-kit toggle. GeneralUser GS (and most GM2/GS SF2s)
+                // map drum kits to bank 128; the program number then
+                // selects the kit (0 = Standard, 8 = Room, 16 = Power, ...).
+                ui.horizontal(|ui| {
+                    let drum_on = sf_bank == 128;
+                    let label = if drum_on {
+                        "Drum Kit (bank 128) [ON]"
+                    } else {
+                        "Drum Kit (bank 128) [off]"
+                    };
+                    if ui.selectable_label(drum_on, label).clicked() {
+                        sf_bank = if drum_on { 0 } else { 128 };
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(if sf_active {
+                        "Click an instrument to switch live."
+                    } else {
+                        "Switch engine to sf-piano to use these."
+                    })
+                    .small()
+                    .color(egui::Color32::from_rgb(170, 170, 170)),
+                );
+                ui.separator();
+
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_enabled_ui(sf_active, |ui| {
+                            for family in GM_FAMILIES.iter() {
+                                // CollapsingHeader per family. The Pianos
+                                // group opens by default since the SF2
+                                // boots into program 0; everything else
+                                // collapses to keep the panel scannable.
+                                let default_open = *family == "Pianos";
+                                egui::CollapsingHeader::new(*family)
+                                    .default_open(default_open)
+                                    .show(ui, |ui| {
+                                        for (prog, name, fam) in GM_INSTRUMENTS.iter() {
+                                            if fam != family {
+                                                continue;
+                                            }
+                                            let selected =
+                                                sf_program == *prog && sf_bank != 128;
+                                            let label_text =
+                                                format!("[{:>3}] {}", prog, name);
+                                            let rich = if selected {
+                                                egui::RichText::new(label_text)
+                                                    .monospace()
+                                                    .strong()
+                                                    .color(egui::Color32::from_rgb(
+                                                        255, 220, 120,
+                                                    ))
+                                            } else {
+                                                egui::RichText::new(label_text).monospace()
+                                            };
+                                            if ui
+                                                .selectable_label(selected, rich)
+                                                .clicked()
+                                            {
+                                                sf_program = *prog;
+                                                // Picking a melodic patch
+                                                // implicitly leaves drum
+                                                // mode (bank 128).
+                                                sf_bank = 0;
+                                            }
+                                        }
+                                    });
+                            }
+                        });
+                    });
+            });
 
         egui::SidePanel::right("log").default_width(280.0).show(ctx, |ui| {
             ui.heading("MIDI log");
@@ -260,7 +368,19 @@ impl eframe::App for KeysynthApp {
         let engine_changed = engine != engine_before;
         let gui_reverb_delta = reverb_wet - reverb_before;
         let reverb_changed = gui_reverb_delta.abs() > 1e-6;
-        if master_changed || engine_changed || reverb_changed {
+        // GM patch is a discrete pick (no slider, no encoder), so
+        // last-writer-wins is correct -- we only commit if the GUI
+        // actually moved it. If a MIDI Program Change races the GUI
+        // click, whichever ran last in the frame wins; that matches
+        // user expectation (clicking a patch should always take effect).
+        let sf_program_changed = sf_program != sf_program_before;
+        let sf_bank_changed = sf_bank != sf_bank_before;
+        if master_changed
+            || engine_changed
+            || reverb_changed
+            || sf_program_changed
+            || sf_bank_changed
+        {
             let mut lp = self.ctx.live.lock().unwrap();
             if master_changed {
                 lp.master = (lp.master + gui_master_delta).clamp(0.0, 3.0);
@@ -270,6 +390,12 @@ impl eframe::App for KeysynthApp {
             }
             if reverb_changed {
                 lp.reverb_wet = (lp.reverb_wet + gui_reverb_delta).clamp(0.0, 1.0);
+            }
+            if sf_program_changed {
+                lp.sf_program = sf_program.min(127);
+            }
+            if sf_bank_changed {
+                lp.sf_bank = sf_bank;
             }
         }
     }

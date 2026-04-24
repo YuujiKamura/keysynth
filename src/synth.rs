@@ -80,6 +80,16 @@ pub struct LiveParams {
     /// Body-IR convolution reverb wet level, 0..=1. 0 = dry (reverb stage
     /// no-ops). Read by the audio callback every buffer.
     pub reverb_wet: f32,
+    /// SoundFont GM program (0..=127). Used by the `sf-piano` engine to pick
+    /// which patch the shared `rustysynth::Synthesizer` plays. The MIDI
+    /// callback diffs this against the last applied value before each
+    /// note_on and emits a Program Change (and Bank Select if needed)
+    /// only on actual change, so per-note overhead stays at one comparison.
+    pub sf_program: u8,
+    /// SoundFont bank select (CC 0 MSB). 0 = melodic GM, 128 = drum kit
+    /// for GeneralUser GS / many GM2/GS soundfonts. Other values are
+    /// SF2-specific variation banks. Diffed alongside `sf_program`.
+    pub sf_bank: u8,
 }
 
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,
