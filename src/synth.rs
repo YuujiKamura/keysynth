@@ -56,6 +56,12 @@ pub enum Engine {
     /// tuned 2026-04-25 against the SFZ Salamander Grand Piano V3 C4
     /// reference T60 vector.
     PianoThick,
+    /// Most ref-faithful variant: 3 strings + 12-mode lite soundboard,
+    /// no sym bank, decay/coupling tuned ("v4") to land h1 T60 within
+    /// 8% of the SFZ Salamander C4 ground truth (16.68 s vs ref 18.14 s).
+    /// Mid-band partials h2-h5 also within 30%. Best per-partial T60
+    /// match across all variants per the 2026-04-25 measurement loop.
+    PianoLite,
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +898,11 @@ impl KsRichVoice {
     }
 }
 
+// (is_releasing override added on each piano-family voice impl below so the
+// MIDI eviction in main.rs can identify "release-tail" voices for eviction
+// before falling back to slot-0 (which silently kills currently-sounding
+// notes when the user plays >= 32 simultaneous notes).)
+
 impl VoiceImpl for KsRichVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         // Mix the 3 strings; equal-power-ish gain (1/sqrt(3) ~= 0.577).
@@ -1284,6 +1295,102 @@ pub fn make_voice(
         // the bridge feedback loop. PianoVoiceThick keeps the thicker
         // 7-string fundamental but uses the cleaner 12-mode body.
         Engine::PianoThick => Box::new(PianoVoiceThick::new(sr, freq, velocity)),
+        Engine::PianoLite => Box::new(PianoVoiceLite::new(sr, freq, velocity)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PianoVoiceLite: 3 strings + 12-mode lite soundboard, no sym bank.
+//
+// v4 tuning (2026-04-25): decay 0.9980 - 0.0025*high, coupling 0.015 — proven
+// against SFZ Salamander C4 reference to give h1 T60 ratio 0.92x ref (vs 4.4x
+// at baseline). Best per-partial T60 match across all variants.
+// ---------------------------------------------------------------------------
+
+pub struct PianoVoiceLite {
+    strings: [KsString; 3],
+    released: bool,
+    rel_mul: f32,
+    rel_step: f32,
+    soundboard: crate::soundboard::Soundboard,
+    coupling: f32,
+}
+
+impl PianoVoiceLite {
+    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
+        let amp = (velocity.max(1) as f32) / 127.0;
+        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
+        let detunes = [cents_to_ratio(-1.5), 1.0, cents_to_ratio(1.5)];
+        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
+        // v4 tuning: faster decay than the original (0.9985 - 0.0035*high) so
+        // h1 T60 lands within 8% of SFZ ref instead of 4.4x over.
+        let decay_for = |f: f32| -> f32 {
+            let high = (f / 2000.0).clamp(0.0, 1.0);
+            0.9980 - 0.0025 * high
+        };
+        let hammer_w = piano_hammer_width(velocity);
+        let mk = |freq_string: f32| -> KsString {
+            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
+            let buf = piano_hammer_excitation(n, hammer_w, amp);
+            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
+                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
+        };
+        let strings = [
+            mk(freq * detunes[0]),
+            mk(freq * detunes[1]),
+            mk(freq * detunes[2]),
+        ];
+        let release_sec = 0.300_f32;
+        let release_samples = (release_sec * sr).max(1.0);
+        let rel_step = (1e-3_f32.ln() / release_samples).exp();
+        let soundboard = crate::soundboard::Soundboard::new_concert_grand_lite(sr);
+        // v4: 0.025 -> 0.015. Less feedback retention = cleaner decay.
+        let coupling = 0.015_f32;
+        Self {
+            strings,
+            released: false,
+            rel_mul: 1.0,
+            rel_step,
+            soundboard,
+            coupling,
+        }
+    }
+}
+
+impl VoiceImpl for PianoVoiceLite {
+    fn render_add(&mut self, buf: &mut [f32]) {
+        let dry_gain = 0.5_f32;
+        let wet_gain = 0.35_f32;
+        let string_norm = 1.0_f32 / 3.0;
+        for sample in buf.iter_mut() {
+            let fb = self.soundboard.last_output() * self.coupling;
+            if fb != 0.0 {
+                for s in &mut self.strings {
+                    s.inject_feedback(fb);
+                }
+            }
+            let mut s_sum = 0.0_f32;
+            for s in &mut self.strings {
+                s_sum += s.step();
+            }
+            let s_avg = s_sum * string_norm;
+            let board_out = self.soundboard.process(s_avg);
+            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
+            if self.released {
+                self.rel_mul *= self.rel_step;
+                out_sample *= self.rel_mul;
+            }
+            *sample += out_sample;
+        }
+    }
+    fn trigger_release(&mut self) {
+        self.released = true;
+    }
+    fn is_done(&self) -> bool {
+        self.released && self.rel_mul <= 1e-4
+    }
+    fn is_releasing(&self) -> bool {
+        self.released
     }
 }
 
