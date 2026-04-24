@@ -17,6 +17,19 @@ verify byte/hash equivalence (modulo Rust/codegen drift).
   - sha256: `9e730eb8600ea5edc2b8c758a44dca0d9953b1ba6c8fc639bff5eb1e344ceb97`
   - size:   352844 bytes
 
+- `sfz_salamander_grand_v3_C4.wav` — render of MIDI 60 (C4) through
+  Salamander Grand Piano V3 (CC-BY 3.0 by Alexander Holm) via the
+  keysynth `bench` binary's SFZ player path, at velocity 100, mono
+  16-bit 44.1 kHz, 5.000 s. **The piano-matching reference target** for
+  the issue #2 metric stack (`analyse`) and the issue #3 extractors
+  (`src/extract/*`).
+  - sha256: `38985a167aef0893557fd48e72bd97fcfebca749e5262a469eb0d8d7f7163fc1`
+  - size:   441044 bytes
+  - **Attribution**: Salamander Grand Piano V3 © Alexander Holm,
+    licensed CC-BY 3.0 (https://creativecommons.org/licenses/by/3.0/).
+    The original `.sfz` manifest + sample WAV library is **not**
+    redistributed in this repo; only this single rendered note is.
+
 ## Regenerate
 
 The bench binary names its output `keysynth_<engine_slug>_n<note>.wav`,
