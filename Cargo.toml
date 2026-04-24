@@ -36,3 +36,9 @@ path = "src/bin/bench.rs"
 [[bin]]
 name = "analyse"
 path = "src/bin/analyse.rs"
+
+# cpubench binary: 32-voice sustained polyphony cost per engine.
+# Tracks issue #2 per-voice CPU budget.
+[[bin]]
+name = "cpubench"
+path = "src/bin/cpubench.rs"

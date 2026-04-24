@@ -37,3 +37,28 @@ subject + revert-risk tag.)
 - `be6c753` analyse: STFT + per-harmonic decay + LSD distance for falsifiable WAV comparison `[KEEP]`
 - `742004c` gitignore: block acquired sound data + compressed bundles `[KEEP]`
 - `3ad116f` bench: SoundFont reference comparison harness `[KEEP]`
+
+## CPU budget baseline (issue #2)
+
+Measured by `cargo run --release --bin cpubench` (32 voices × 4 s @ 44.1 kHz,
+no audio I/O, no reverb, no sym bank). Numbers are wall / audio = CPU%, so
+<100 % means real-time-capable on this machine.
+
+| engine        | CPU%   |
+|---------------|--------|
+| square        |  0.5 % |
+| ks            |  0.8 % |
+| ks-rich       |  1.3 % |
+| sub           |  1.2 % |
+| fm            |  2.1 % |
+| piano         |  4.4 % |
+| piano-thick   |  5.5 % |
+| piano-lite    |  2.9 % |
+| koto          |  1.2 % |
+
+Headroom is comfortable across the board — 32-voice piano-thick polyphony
+uses ~5.5 % of one core. No voice-cap reduction or soundboard SIMD is
+needed to ship; the issue #2 worry that "sustained piano polyphony eats a
+core" turns out not to bite at the current implementation. Re-measure if
+the soundboard gets denser (more modes) or if the sympathetic bank starts
+running per-engine instead of stream-shared.
