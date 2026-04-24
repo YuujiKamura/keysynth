@@ -89,7 +89,13 @@ impl Soundboard {
         // soundboard mode sets in the Bank/Lehtonen literature; the exact
         // values are not critical, only the shape (spread + Q rising
         // with freq).
-        let modes: [(f32, f32); 12] = [
+        // Extended to 16 modes: added 4 high-frequency soundboard modes
+        // (3000-7500 Hz, lower Q ~30) so the body radiates the upper-band
+        // "shimmer" the user perceives as missing brilliance. Real piano
+        // soundboards radiate effectively up to ~6 kHz; without modes
+        // there, the soundboard can only colour the bass-mid which leaves
+        // the tone "曇った" / cloth-covered at the top end.
+        let modes: [(f32, f32); 16] = [
             (80.0, 60.0),
             (110.0, 60.0),
             (150.0, 70.0),
@@ -102,6 +108,10 @@ impl Soundboard {
             (1100.0, 100.0),
             (1500.0, 110.0),
             (2200.0, 120.0),
+            (3000.0, 30.0),
+            (4000.0, 30.0),
+            (5500.0, 25.0),
+            (7500.0, 20.0),
         ];
         let n = modes.len() as f32;
         let peak_gain = 1.0 / n.sqrt();

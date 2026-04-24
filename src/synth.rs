@@ -672,8 +672,15 @@ impl KsString {
         (n, frac)
     }
 
+    /// Advance the delay line one sample, return the sample that just left
+    /// the line (i.e. the plain KS string output). Consumes any pending
+    /// feedback injected via `inject_feedback` before this call.
+    ///
+    /// Exposed `pub` so out-of-crate callers (e.g. the shared
+    /// `SympatheticBank`) can drive a bare KS string without going through
+    /// a `PianoVoice`.
     #[inline]
-    fn step(&mut self) -> f32 {
+    pub fn step(&mut self) -> f32 {
         let n = self.buf.len();
         let cur = self.buf[self.head];
         let prev = if self.head == 0 {
@@ -880,7 +887,12 @@ pub fn piano_hammer_excitation(n: usize, width: usize, amp: f32) -> Vec<f32> {
 }
 
 pub struct PianoVoice {
-    strings: [KsString; 3],
+    /// 7 strings (was 3). User intuition 2026-04-25: "弦7個くらいいるんでは"
+    /// — non-physical (real piano: 1-3 strings/note) but the extra detuned
+    /// copies thicken the source spectrum, giving the soundboard more raw
+    /// material to colour and reducing the perceived "曇り". Each string is
+    /// a small fraction in the mix (1/7 vs old 1/3).
+    strings: [KsString; 7],
     released: bool,
     rel_mul: f32,
     rel_step: f32,
@@ -905,7 +917,17 @@ impl PianoVoice {
         // Real piano triple-string unison detune: ~0.5-2 cents
         // (Weinreich 1977, "Coupled piano strings"). Wider spreads
         // (e.g. +/-7c) sound like an out-of-tune honky-tonk, not a piano.
-        let detunes = [cents_to_ratio(-1.5), 1.0, cents_to_ratio(1.5)];
+        // 7 detunes spread ±3 cents. Symmetric around the centre, slightly
+        // wider than the 3-string ±1.5 c so 7 in unison still beats audibly.
+        let detunes = [
+            cents_to_ratio(-3.0),
+            cents_to_ratio(-2.0),
+            cents_to_ratio(-1.0),
+            1.0,
+            cents_to_ratio(1.0),
+            cents_to_ratio(2.0),
+            cents_to_ratio(3.0),
+        ];
         // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; previous
         // 0.25..0.50 ap range gave B ~4.6e-4 (cand too stiff). Drop to a
         // shallow fixed range that puts B near the reference.
@@ -942,6 +964,10 @@ impl PianoVoice {
             mk(freq * detunes[0]),
             mk(freq * detunes[1]),
             mk(freq * detunes[2]),
+            mk(freq * detunes[3]),
+            mk(freq * detunes[4]),
+            mk(freq * detunes[5]),
+            mk(freq * detunes[6]),
         ];
         let release_sec = 0.300_f32;
         let release_samples = (release_sec * sr).max(1.0);
@@ -976,28 +1002,29 @@ impl PianoVoice {
 
 impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        // String sum scaled by 1/3 keeps the in-phase attack peak ~1.0
-        // (3 strings hammer in phase, decorrelate over ~sqrt(3) after
-        // detune drift). The dry direct-radiation mix is intentionally
-        // small (0.2) — most of what an audience hears from a real piano
-        // is soundboard-radiated, not direct string sound.
+        // 7-string sum normalised by 1/7 keeps the in-phase attack peak
+        // bounded (7 strings hammer in phase, decorrelate over ~sqrt(7)
+        // after detune drift). The dry direct-radiation mix is small
+        // (0.2) — most of what an audience hears from a real piano is
+        // soundboard-radiated, not direct string sound.
         let dry_gain = 0.2_f32;
         let wet_gain = 0.7_f32;
-        let string_norm = 0.333_f32;
+        let string_norm = 1.0_f32 / 7.0;
         for sample in buf.iter_mut() {
             // 1. Inject the previous-sample soundboard output back into
-            //    the strings via the bridge. One-sample delay keeps the
+            //    every string via the bridge. One-sample delay keeps the
             //    feedback loop strictly causal (no algebraic loop).
             let fb = self.soundboard.last_output() * self.coupling;
             if fb != 0.0 {
-                self.strings[0].inject_feedback(fb);
-                self.strings[1].inject_feedback(fb);
-                self.strings[2].inject_feedback(fb);
+                for s in &mut self.strings {
+                    s.inject_feedback(fb);
+                }
             }
             // 2. Step the strings (consumes the feedback we just queued).
-            let s_sum = self.strings[0].step()
-                + self.strings[1].step()
-                + self.strings[2].step();
+            let mut s_sum = 0.0_f32;
+            for s in &mut self.strings {
+                s_sum += s.step();
+            }
             let s_avg = s_sum * string_norm;
             // 3. Drive the soundboard with the averaged string output.
             let board_out = self.soundboard.process(s_avg);

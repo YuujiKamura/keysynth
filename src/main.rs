@@ -30,6 +30,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
+use keysynth::sympathetic::SympatheticBank;
 use keysynth::synth::{
     make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl,
 };
@@ -604,6 +605,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sf_right: Vec<f32> = Vec::new();
         let mut reverb = Reverb::new(ir_samples.clone());
         let mut limiter_gain: f32 = 1.0;
+        // Shared sympathetic string bank — lives for the whole stream so any
+        // note played excites the SAME 24 resonator strings and builds up a
+        // cross-voice "halo of neighbors" the way a real piano's undamped
+        // strings do.
+        let mut sympathetic = SympatheticBank::new_piano(sr_hz as f32);
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
@@ -624,6 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut sf_right,
                     &mut reverb,
                     &mut limiter_gain,
+                    &mut sympathetic,
                 );
             },
             err_fn,
@@ -644,6 +651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
             let mut limiter_gain: f32 = 1.0;
+            let mut sympathetic = SympatheticBank::new_piano(sr_hz as f32);
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
@@ -667,6 +675,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut sf_right,
                         &mut reverb,
                         &mut limiter_gain,
+                        &mut sympathetic,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -688,6 +697,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
             let mut limiter_gain: f32 = 1.0;
+            let mut sympathetic = SympatheticBank::new_piano(sr_hz as f32);
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
@@ -711,6 +721,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut sf_right,
                         &mut reverb,
                         &mut limiter_gain,
+                        &mut sympathetic,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -777,6 +788,14 @@ fn audio_callback(
     // can ramp smoothly from prev block's gain to this block's target,
     // avoiding the per-block step discontinuity that sounds like chopping.
     limiter_gain: &mut f32,
+    // Shared sympathetic string bank: 24 KS strings ringing across the
+    // piano range, driven by the mixed voice output as a soundboard proxy.
+    // Lives for the stream lifetime — any note played pumps energy into
+    // the bank, and bank strings whose partials overlap with the struck
+    // note's partials keep ringing after the note is released (the
+    // "halo of neighbor strings" the user perceived missing from our
+    // piano vs Salamander SFZ samples).
+    sympathetic: &mut SympatheticBank,
 ) {
     let frames = out.len() / channels as usize;
     // Reuse the caller-owned scratch buffer to avoid per-callback heap
@@ -833,6 +852,24 @@ fn audio_callback(
             for i in 0..frames {
                 mono[i] += (sf_left[i] + sf_right[i]) * 0.5;
             }
+        }
+    }
+
+    // Sympathetic string bank (shared across voices): drive the bank with
+    // the current mixed bus as a soundboard-output proxy, then add its
+    // output back into the bus. Coupling 0.02 (bank takes ~2% of the bus
+    // per sample); mix gain 0.3 (bank contributes ~30% of its output
+    // amplitude to the final mix). No closed feedback loop — the bank
+    // only reads from the bus, never writes into any voice's private
+    // soundboard — so stability reduces to the per-string KS decay
+    // (0.9994) being below unity.
+    {
+        const COUPLING: f32 = 0.02;
+        const MIX: f32 = 0.3;
+        for sample in mono.iter_mut() {
+            let board_drive = *sample;
+            let sym_out = sympathetic.process(board_drive, COUPLING);
+            *sample += sym_out * MIX;
         }
     }
 
