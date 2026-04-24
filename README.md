@@ -109,35 +109,63 @@ gitignored.
 
 ## analyse: quantitative WAV comparison
 
-Ear-based "does this sound like piano?" is unfalsifiable — you can't tell
-whether a parameter tweak helped or hurt. The `analyse` binary turns each
-A/B into a single number (log-spectral distance in dB) plus per-harmonic
-decay tables, spectrogram PNGs, and a centroid CSV.
+Ear-based "does this sound like piano?" is unfalsifiable. The `analyse`
+binary turns each A/B into a stack of measurable scalars from the piano-
+synthesis literature, plus per-harmonic decay tables and spectrogram PNGs.
+
+### Workflow
 
 ```bash
-# 1. Render a reference + a candidate.
-cargo run --release --bin bench -- --sf2 GeneralUser-GS.sf2 \
-    --engine piano --reverb 0.6 --note 60 --duration 3
-# -> bench-out/4_soundfont_reference.wav, bench-out/2_piano_body_ir.wav, ...
+# 0. (one time) acquire ground truth: see reference/README.md
+#    -> places reference/iowa_piano_ff_c4.wav
 
-# 2. Compare them.
+# 1. Render the candidate.
+cargo run --release --bin bench -- --sf2 GeneralUser-GS.sf2 \
+    --engine piano --note 60 --duration 3 --hold 1 \
+    --only keysynth --out bench-out
+mv bench-out/keysynth_piano_n60.wav bench-out/candidate.wav
+
+# 2. Compare against the real piano recording.
 cargo run --release --bin analyse -- \
-    --reference bench-out/4_soundfont_reference.wav \
-    --candidate bench-out/2_piano_body_ir.wav \
+    --reference reference/iowa_piano_ff_c4.wav \
+    --candidate bench-out/candidate.wav \
     --note 60 --out bench-out/report/
 
-# 3. Read summary.txt, eyeball the spectrograms, check harmonics.json.
+# 3. Read the metric stack.
 cat bench-out/report/summary.txt
-
-# 4. Tweak engine params, re-bench, re-analyse, see if the LSD dropped.
 ```
 
-Output dir contains:
+### Metric stack (issue #1)
 
-- `summary.txt`     human-readable single page (LSD, top-8 harmonics, centroid)
-- `spectrogram_reference.png` / `spectrogram_candidate.png`  (viridis dB scale)
-- `harmonics.json`  per-harmonic freq, T60, initial dB, fit R^2; plus deltas
-- `centroid.csv`    spectral centroid Hz per frame, both files
+| Metric | Captures | Lower = closer |
+|---|---|---|
+| `mrstft_l1` | Multi-resolution STFT L1 (windows 512/1024/2048, lin+log) | ✓ |
+| `b_residual` | Inharmonicity coefficient B (Fletcher 1962, Rauhala 2007 estimator) | ✓ |
+| `t60_vector_loss` | Per-partial T60 with Bank Taylor weighting | ✓ |
+| `onset_l2_80ms` | Hammer transient envelope L2, first 80 ms | ✓ |
+| `centroid_traj_mse` | Spectral brightness evolution shape | ✓ |
+| `lsd_db` | Single-window log-spectral distance (legacy, kept for back-compat) | ✓ |
+
+### Output dir
+
+- `summary.txt` — human-readable single page with all metrics
+- `metrics.json` — machine-consumable, same data
+- `harmonics.json` — per-partial freq, T60, initial dB, fit R²; plus deltas
+- `centroid.csv` — spectral centroid Hz per frame, both files
+- `spectrogram_reference.png` / `spectrogram_candidate.png`
+
+### Why these metrics, not LSD alone
+
+Single-window LSD is energy-sensitive and known to correlate poorly with
+perceived audio quality (Kilgour et al. 2018, FAD paper). The literature
+(Helsinki/Aalto group, Modartt, recent DDSP work) uses physically-meaningful
+per-partial metrics: B coefficient drives inharmonicity perception, T60
+vector drives decay character, MR-STFT captures temporal evolution at
+multiple time scales. A model that only optimises LSD can land in local
+minima that satisfy the metric but sound nothing like a piano.
+
+See [issue #1](https://github.com/YuujiKamura/keysynth/issues/1) for the
+literature synthesis and the deviation log of the original LSD-only loop.
 
 ## License
 

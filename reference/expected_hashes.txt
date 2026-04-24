@@ -1,0 +1,12 @@
+# SHA-256 checksums for canonical reference WAVs after AIF -> WAV conversion.
+# Verify with: sha256sum -c reference/expected_hashes.txt
+#
+# NOTE: hashes here are PLACEHOLDERS. After you download + convert the AIFs
+# yourself, run `sha256sum reference/iowa_piano_*.wav` and replace these.
+# A future PR will fill in real hashes once we have a canonical conversion
+# pipeline (target: `ffmpeg -i in.aif -ac 1 -ar 44100 -sample_fmt s16 out.wav`
+# with ffmpeg version pinned in the doc).
+
+PLACEHOLDER  reference/iowa_piano_ff_c4.wav
+PLACEHOLDER  reference/iowa_piano_mf_c4.wav
+PLACEHOLDER  reference/iowa_piano_pp_c4.wav

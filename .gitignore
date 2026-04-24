@@ -22,10 +22,13 @@ Thumbs.db
 # NEVER commit acquired sound data, sample libraries, or impulse responses.
 # Many free-licence packs are CC-BY / CC-NC and DO NOT permit redistribution
 # in a derived repo. Even CC0 packs add MB-GB of binary noise to git history.
+# This includes reference/*.wav (Iowa MIS, MAPS, etc.) -- documented in
+# reference/README.md but never redistributed in this repo.
 bench-out/
 recordings/
 samples/
 ir/
+reference/*.wav
 **/*.wav
 **/*.flac
 **/*.aif
