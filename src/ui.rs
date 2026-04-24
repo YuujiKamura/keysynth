@@ -66,10 +66,11 @@ impl eframe::App for KeysynthApp {
         ctx.request_repaint_after(Duration::from_millis(16));
 
         // Snapshot shared state under brief locks; release before drawing.
-        let (mut master, mut engine, dash_snapshot) = {
+        let (mut master, mut engine, mut reverb_wet, dash_snapshot) = {
             let lp = self.ctx.live.lock().unwrap();
             let m = lp.master;
             let e = lp.engine;
+            let r = lp.reverb_wet;
             drop(lp);
             let d = self.ctx.dash.lock().unwrap();
             let snap = DashSnapshot {
@@ -79,11 +80,12 @@ impl eframe::App for KeysynthApp {
                 // Only clone the tail we actually display (newest 60, pre-reversed).
                 recent: d.recent.iter().rev().take(60).cloned().collect(),
             };
-            (m, e, snap)
+            (m, e, r, snap)
         };
 
         let master_before = master;
         let engine_before = engine;
+        let reverb_before = reverb_wet;
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -101,6 +103,13 @@ impl eframe::App for KeysynthApp {
                     egui::Slider::new(&mut master, 0.0..=3.0)
                         .step_by(0.05)
                         .text("(K1/CC70/CC7)"),
+                );
+                ui.separator();
+                ui.label("reverb:");
+                ui.add(
+                    egui::Slider::new(&mut reverb_wet, 0.0..=1.0)
+                        .step_by(0.01)
+                        .text("(body IR wet)"),
                 );
             });
             ui.horizontal_wrapped(|ui| {
@@ -249,13 +258,18 @@ impl eframe::App for KeysynthApp {
         let gui_master_delta = master - master_before;
         let master_changed = gui_master_delta.abs() > 1e-6;
         let engine_changed = engine != engine_before;
-        if master_changed || engine_changed {
+        let gui_reverb_delta = reverb_wet - reverb_before;
+        let reverb_changed = gui_reverb_delta.abs() > 1e-6;
+        if master_changed || engine_changed || reverb_changed {
             let mut lp = self.ctx.live.lock().unwrap();
             if master_changed {
                 lp.master = (lp.master + gui_master_delta).clamp(0.0, 3.0);
             }
             if engine_changed {
                 lp.engine = engine;
+            }
+            if reverb_changed {
+                lp.reverb_wet = (lp.reverb_wet + gui_reverb_delta).clamp(0.0, 1.0);
             }
         }
     }
@@ -278,4 +292,5 @@ const ENGINE_CHOICES: &[(&str, Engine)] = &[
     ("koto", Engine::Koto),
     ("sub", Engine::Sub),
     ("fm", Engine::Fm),
+    ("sf-piano", Engine::SfPiano),
 ];

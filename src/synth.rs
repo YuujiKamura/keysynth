@@ -36,6 +36,12 @@ pub enum Engine {
     /// minimal stiffness, long sustain. The KS algorithm is fundamentally
     /// plucked-string physics, so this is the "natural" target.
     Koto,
+    /// SoundFont-driven piano: routes (channel, note, velocity) to a shared
+    /// `rustysynth::Synthesizer` loaded from a `.sf2` file at startup. The
+    /// per-voice slot is a placeholder used only for note-tracking and
+    /// eviction; the actual audio is rendered by the shared Synthesizer in
+    /// the audio callback and mixed into the voice bus.
+    SfPiano,
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +77,9 @@ pub struct LiveParams {
     /// note_on so changes apply immediately to new notes (already-playing
     /// notes finish out with their original engine).
     pub engine: Engine,
+    /// Body-IR convolution reverb wet level, 0..=1. 0 = dry (reverb stage
+    /// no-ops). Read by the audio callback every buffer.
+    pub reverb_wet: f32,
 }
 
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,
@@ -913,6 +922,12 @@ pub fn midi_to_freq(note: u8) -> f32 {
 /// and MIDI velocity. Lives in the library so the live MIDI callback in
 /// `main.rs` and offline harnesses (`bench`, regression tools) construct
 /// voices through one shared switch.
+///
+/// `Engine::SfPiano` returns an `SfPianoPlaceholder`: it adds nothing to the
+/// audio bus by itself. Real audio for that engine is rendered by a shared
+/// `rustysynth::Synthesizer` owned by the audio callback; the placeholder
+/// only exists so the voice-pool eviction logic can still track which
+/// (channel, note) pairs are sounding.
 pub fn make_voice(
     engine: Engine,
     sr: f32,
@@ -927,5 +942,66 @@ pub fn make_voice(
         Engine::Fm => Box::new(FmVoice::new(sr, freq, velocity)),
         Engine::Piano => Box::new(PianoVoice::new(sr, freq, velocity)),
         Engine::Koto => Box::new(KotoVoice::new(sr, freq, velocity)),
+        Engine::SfPiano => Box::new(SfPianoPlaceholder::new()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SoundFont placeholder voice
+// ---------------------------------------------------------------------------
+//
+// The `rustysynth::Synthesizer` is a shared, mutable engine that handles all
+// channels at once -- it is NOT one-instance-per-voice. We keep the voice
+// pool's per-note bookkeeping (eviction, note-off matching) by pushing a
+// silent placeholder voice for each SfPiano note_on. Audio is rendered by
+// the audio callback calling `synth.render(...)` once per buffer and mixing
+// the result onto the voice bus.
+//
+// `is_done` returns true a few seconds after release so the placeholder is
+// eventually reaped; the underlying synth voice may continue to ring out
+// inside rustysynth's own envelope, which is fine -- the synth tracks its
+// own active voices independently.
+
+pub struct SfPianoPlaceholder {
+    released: bool,
+    released_samples: u64,
+}
+
+impl SfPianoPlaceholder {
+    pub fn new() -> Self {
+        Self {
+            released: false,
+            released_samples: 0,
+        }
+    }
+}
+
+impl Default for SfPianoPlaceholder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VoiceImpl for SfPianoPlaceholder {
+    fn render_add(&mut self, buf: &mut [f32]) {
+        // Audio for this engine is rendered by the shared Synthesizer in
+        // the audio callback. We just count post-release samples so the
+        // pool can eventually evict us.
+        if self.released {
+            self.released_samples = self
+                .released_samples
+                .saturating_add(buf.len() as u64);
+        }
+    }
+    fn trigger_release(&mut self) {
+        self.released = true;
+    }
+    fn is_done(&self) -> bool {
+        // ~3 s at 44.1 kHz -- well past most piano tails. The shared synth
+        // owns the real envelope; this is purely for our placeholder pool.
+        self.released && self.released_samples > 132_300
+    }
+    fn is_releasing(&self) -> bool {
+        self.released
     }
 }

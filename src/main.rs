@@ -9,17 +9,36 @@
 //! DSP / voice / engine code lives in the `keysynth` library
 //! (`src/synth.rs`) so offline harnesses (`bench`, regression tools) reuse
 //! the exact same voices the live synth runs.
+//!
+//! Two extras live alongside the original engines:
+//!   - `sf-piano` : routes notes to a shared `rustysynth::Synthesizer`
+//!     loaded from a `.sf2` file (`--sf2 PATH`). The voice pool only
+//!     holds placeholder slots; audio comes out of the shared synth.
+//!   - body IR convolution reverb : applied to the mono mix
+//!     after voice rendering, before the tanh soft-clip. Synthetic IR by
+//!     default; pass `--ir PATH` for a real WAV impulse response.
 
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use midir::{Ignore, MidiInput};
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
+use keysynth::reverb::{self, Reverb};
 use keysynth::synth::{
     make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl,
 };
 use keysynth::ui;
+
+/// Shared rustysynth instance for `sf-piano`. `None` until `--sf2` is loaded
+/// (or always `None` for the other engines). Behind a Mutex because the
+/// synth is mutable and accessed from both the MIDI callback (note on/off)
+/// and the audio callback (render).
+pub type SharedSynth = Arc<Mutex<Option<Synthesizer>>>;
 
 #[derive(Clone, Debug)]
 struct Args {
@@ -27,6 +46,11 @@ struct Args {
     port: Option<String>,
     list: bool,
     master: f32,
+    sf2: Option<PathBuf>,
+    sf2_program: u8,
+    sf2_bank: u8,
+    ir_path: Option<PathBuf>,
+    reverb_wet: f32,
 }
 
 impl Default for Args {
@@ -36,6 +60,11 @@ impl Default for Args {
             port: None,
             list: false,
             master: 0.3,
+            sf2: None,
+            sf2_program: 0,
+            sf2_bank: 0,
+            ir_path: None,
+            reverb_wet: 0.0,
         }
     }
 }
@@ -47,7 +76,7 @@ fn parse_args() -> Result<Args, String> {
         match a.as_str() {
             "--list" => out.list = true,
             "--engine" => {
-                let v = iter.next().ok_or("--engine needs a value (square|ks)")?;
+                let v = iter.next().ok_or("--engine needs a value")?;
                 out.engine = match v.as_str() {
                     "square" => Engine::Square,
                     "ks" => Engine::Ks,
@@ -56,8 +85,9 @@ fn parse_args() -> Result<Args, String> {
                     "fm" => Engine::Fm,
                     "piano" => Engine::Piano,
                     "koto" => Engine::Koto,
+                    "sf-piano" => Engine::SfPiano,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano)"
                     )),
                 };
             }
@@ -67,6 +97,30 @@ fn parse_args() -> Result<Args, String> {
             "--master" => {
                 let v = iter.next().ok_or("--master needs a float")?;
                 out.master = v.parse().map_err(|e| format!("bad --master: {e}"))?;
+            }
+            "--sf2" => {
+                out.sf2 = Some(PathBuf::from(
+                    iter.next().ok_or("--sf2 needs a path")?,
+                ));
+            }
+            "--sf2-program" => {
+                out.sf2_program = iter.next().ok_or("--sf2-program needs an integer")?
+                    .parse().map_err(|e| format!("bad --sf2-program: {e}"))?;
+            }
+            "--sf2-bank" => {
+                out.sf2_bank = iter.next().ok_or("--sf2-bank needs an integer")?
+                    .parse().map_err(|e| format!("bad --sf2-bank: {e}"))?;
+            }
+            "--ir" => {
+                out.ir_path = Some(PathBuf::from(
+                    iter.next().ok_or("--ir needs a path")?,
+                ));
+            }
+            "--reverb" => {
+                let v = iter.next().ok_or("--reverb needs a float 0..1")?;
+                out.reverb_wet = v.parse::<f32>()
+                    .map_err(|e| format!("bad --reverb: {e}"))?
+                    .clamp(0.0, 1.0);
             }
             "--help" | "-h" => {
                 print_help();
@@ -82,14 +136,23 @@ fn print_help() {
     println!(
         "keysynth - real-time MIDI keyboard -> speaker synth\n\n\
          USAGE:\n  \
-            keysynth [--engine square|ks|ks-rich|sub|fm|piano|koto] [--port NAME] [--master FLOAT]\n  \
+            keysynth [--engine ENGINE] [--port NAME] [--master FLOAT]\n  \
+                     [--sf2 PATH [--sf2-program N] [--sf2-bank N]]\n  \
+                     [--ir PATH] [--reverb 0..1]\n  \
             keysynth --list\n\n\
          OPTIONS:\n  \
-            --engine ENGINE   square|ks|ks-rich|sub|fm|piano|koto\n  \
+            --engine ENGINE   square|ks|ks-rich|sub|fm|piano|koto|sf-piano\n  \
                               (sub = analog subtractive, fm = 2-op bell,\n  \
-                               piano = wide-hammer DWS, koto = pluck-pos DWS)\n  \
+                               piano = wide-hammer DWS, koto = pluck-pos DWS,\n  \
+                               sf-piano = SoundFont real-piano via rustysynth)\n  \
             --port NAME       MIDI input port (default: first available)\n  \
             --master FLOAT    Master gain pre-tanh (default: 0.3)\n  \
+            --sf2 PATH        SoundFont .sf2 (required for --engine sf-piano)\n  \
+            --sf2-program N   GM program 0..127 (default: 0 = Acoustic Grand)\n  \
+            --sf2-bank N      Bank 0..128 (default: 0)\n  \
+            --ir PATH         WAV impulse response for body reverb\n  \
+                              (default: built-in synthetic piano body IR)\n  \
+            --reverb FLOAT    Reverb wet 0..1 (default: 0 = dry)\n  \
             --list            List MIDI input ports and exit\n  \
             -h, --help        Show this help"
     );
@@ -156,10 +219,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channels = supported.channels();
     let stream_cfg: StreamConfig = supported.into();
 
+    // -- SoundFont (sf-piano engine) --
+    //
+    // Loaded eagerly when --sf2 is given so any errors (missing file, bad
+    // format) surface at startup rather than the first key press. Hard
+    // error if the user picked sf-piano but didn't pass an sf2 path.
+    let shared_synth: SharedSynth = Arc::new(Mutex::new(None));
+    if let Some(sf2_path) = &args.sf2 {
+        let mut file = BufReader::new(
+            File::open(sf2_path)
+                .map_err(|e| format!("opening SoundFont {:?}: {e}", sf2_path))?,
+        );
+        let sf = Arc::new(SoundFont::new(&mut file)?);
+        let settings = SynthesizerSettings::new(sr_hz as i32);
+        let mut synth = Synthesizer::new(&sf, &settings)?;
+        if args.sf2_bank > 0 {
+            synth.process_midi_message(0, 0xB0, 0, args.sf2_bank as i32);
+        }
+        synth.process_midi_message(0, 0xC0, args.sf2_program as i32, 0);
+        *shared_synth.lock().unwrap() = Some(synth);
+        eprintln!(
+            "keysynth: loaded SoundFont '{}' (program={} bank={})",
+            sf2_path.display(), args.sf2_program, args.sf2_bank
+        );
+    } else if args.engine == Engine::SfPiano {
+        return Err(
+            "engine 'sf-piano' requires --sf2 PATH (no SoundFont loaded)".into(),
+        );
+    }
+
+    // -- Body IR reverb --
+    //
+    // IR is built / loaded once at startup; the audio callback owns the
+    // Reverb instance directly so there's no per-callback locking and no
+    // heap allocation on the audio thread.
+    let ir_samples: Vec<f32> = match &args.ir_path {
+        Some(p) => {
+            let ir = reverb::load_ir_wav(p)?;
+            eprintln!(
+                "keysynth: loaded IR '{}' ({} samples, ~{:.0} ms @ {} Hz)",
+                p.display(), ir.len(), 1000.0 * ir.len() as f32 / sr_hz as f32, sr_hz
+            );
+            ir
+        }
+        None => reverb::synthetic_body_ir(sr_hz),
+    };
+
     eprintln!(
         "keysynth: midi='{port_name}' audio='{out_name}' sr={sr_hz} ch={channels} \
-         engine={:?} master={:.2}",
-        args.engine, args.master
+         engine={:?} master={:.2} reverb={:.2}",
+        args.engine, args.master, args.reverb_wet
     );
     eprintln!("press keys on your MIDI keyboard - Ctrl-C to quit");
 
@@ -167,12 +276,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let live: Arc<Mutex<LiveParams>> = Arc::new(Mutex::new(LiveParams {
         master: args.master,
         engine: args.engine,
+        reverb_wet: args.reverb_wet,
     }));
     let dash: Arc<Mutex<DashState>> = Arc::new(Mutex::new(DashState::new(args.engine)));
 
     let voices_for_midi = voices.clone();
     let live_for_midi = live.clone();
     let dash_for_midi = dash.clone();
+    let synth_for_midi = shared_synth.clone();
     let sr_for_voices = sr_hz as f32;
     let _conn = midi_in.connect(
         &chosen_port,
@@ -198,6 +309,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Read currently-selected engine fresh each note so GUI
                     // changes apply immediately to subsequent keypresses.
                     let engine = live_for_midi.lock().unwrap().engine;
+
+                    // Drive the shared SoundFont synth too if we're in
+                    // sf-piano (or whenever a synth is loaded -- harmless
+                    // for other engines because the placeholder is what
+                    // routes audio for them, not the synth).
+                    if engine == Engine::SfPiano {
+                        if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
+                            synth.note_on(channel as i32, note as i32, velocity as i32);
+                        }
+                    }
+
                     let inner: Box<dyn VoiceImpl> =
                         make_voice(engine, sr_for_voices, freq, velocity);
                     let v = Voice {
@@ -228,6 +350,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut d = dash_for_midi.lock().unwrap();
                         d.active_notes.remove(&(channel, note));
                         d.push_event(format!("note_off ch{channel} n{note}"));
+                    }
+                    // Forward note-off to the shared synth too so its envelope
+                    // moves into release. We can't tell from here whether this
+                    // particular note was an sf-piano voice without scanning
+                    // the pool, but rustysynth ignores note_off for inactive
+                    // notes, so the call is safe and cheap.
+                    if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
+                        synth.note_off(channel as i32, note as i32);
                     }
                     let mut pool = voices_for_midi.lock().unwrap();
                     if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
@@ -280,6 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let voices_for_audio = voices.clone();
     let live_for_audio = live.clone();
+    let synth_for_audio = shared_synth.clone();
     let err_fn = |err| eprintln!("audio stream error: {err}");
 
     // Build an F32 output stream. Used both for the native F32 path and as a
@@ -287,15 +418,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let build_f32_stream = |dev: &cpal::Device, cfg: &StreamConfig| {
         let voices_arc = voices_for_audio.clone();
         let live_arc = live_for_audio.clone();
-        // Preallocated mono scratch reused across audio callbacks. Sized lazily
-        // on the first callback once we know the buffer size; cpal callbacks
-        // are FnMut so capturing `mut` state is fine.
+        let synth_arc = synth_for_audio.clone();
+        // Preallocated mono / sf-stereo scratch reused across audio callbacks.
+        // Sized lazily on the first callback once we know the buffer size;
+        // cpal callbacks are FnMut so capturing `mut` state is fine.
         let mut mono_scratch: Vec<f32> = Vec::new();
+        let mut sf_left: Vec<f32> = Vec::new();
+        let mut sf_right: Vec<f32> = Vec::new();
+        let mut reverb = Reverb::new(ir_samples.clone());
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
-                let master = live_arc.lock().unwrap().master;
-                audio_callback(out, channels, &voices_arc, master, &mut mono_scratch);
+                let (master, wet) = {
+                    let lp = live_arc.lock().unwrap();
+                    (lp.master, lp.reverb_wet)
+                };
+                audio_callback(
+                    out,
+                    channels,
+                    &voices_arc,
+                    &synth_arc,
+                    master,
+                    wet,
+                    &mut mono_scratch,
+                    &mut sf_left,
+                    &mut sf_right,
+                    &mut reverb,
+                );
             },
             err_fn,
             None,
@@ -307,12 +456,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SampleFormat::I16 => {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
+            let synth_arc = synth_for_audio.clone();
             let mut mono_scratch: Vec<f32> = Vec::new();
+            let mut sf_left: Vec<f32> = Vec::new();
+            let mut sf_right: Vec<f32> = Vec::new();
             let mut interleaved_scratch: Vec<f32> = Vec::new();
+            let mut reverb = Reverb::new(ir_samples.clone());
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
-                    let master = live_arc.lock().unwrap().master;
+                    let (master, wet) = {
+                        let lp = live_arc.lock().unwrap();
+                        (lp.master, lp.reverb_wet)
+                    };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
                     }
@@ -320,8 +476,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut interleaved_scratch,
                         channels,
                         &voices_arc,
+                        &synth_arc,
                         master,
+                        wet,
                         &mut mono_scratch,
+                        &mut sf_left,
+                        &mut sf_right,
+                        &mut reverb,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -335,12 +496,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         SampleFormat::U16 => {
             let voices_arc = voices_for_audio.clone();
             let live_arc = live_for_audio.clone();
+            let synth_arc = synth_for_audio.clone();
             let mut mono_scratch: Vec<f32> = Vec::new();
+            let mut sf_left: Vec<f32> = Vec::new();
+            let mut sf_right: Vec<f32> = Vec::new();
             let mut interleaved_scratch: Vec<f32> = Vec::new();
+            let mut reverb = Reverb::new(ir_samples.clone());
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
-                    let master = live_arc.lock().unwrap().master;
+                    let (master, wet) = {
+                        let lp = live_arc.lock().unwrap();
+                        (lp.master, lp.reverb_wet)
+                    };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
                     }
@@ -348,8 +516,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut interleaved_scratch,
                         channels,
                         &voices_arc,
+                        &synth_arc,
                         master,
+                        wet,
                         &mut mono_scratch,
+                        &mut sf_left,
+                        &mut sf_right,
+                        &mut reverb,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -399,12 +572,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audio_callback(
     out: &mut [f32],
     channels: u16,
     voices: &Arc<Mutex<Vec<Voice>>>,
+    synth: &SharedSynth,
     master: f32,
+    reverb_wet: f32,
     mono: &mut Vec<f32>,
+    sf_left: &mut Vec<f32>,
+    sf_right: &mut Vec<f32>,
+    reverb: &mut Reverb,
 ) {
     let frames = out.len() / channels as usize;
     // Reuse the caller-owned scratch buffer to avoid per-callback heap
@@ -422,6 +601,30 @@ fn audio_callback(
         }
         pool.retain(|v| !v.inner.is_done());
     }
+
+    // Mix the shared SoundFont synth into the mono bus. The synth always
+    // renders stereo; we downmix (L+R)/2. If no synth is loaded (no --sf2)
+    // this whole branch is a single None check.
+    {
+        let mut guard = synth.lock().unwrap();
+        if let Some(s) = guard.as_mut() {
+            if sf_left.len() != frames {
+                sf_left.resize(frames, 0.0);
+                sf_right.resize(frames, 0.0);
+            } else {
+                sf_left.fill(0.0);
+                sf_right.fill(0.0);
+            }
+            s.render(sf_left.as_mut_slice(), sf_right.as_mut_slice());
+            for i in 0..frames {
+                mono[i] += (sf_left[i] + sf_right[i]) * 0.5;
+            }
+        }
+    }
+
+    // Body IR convolution before soft-clip so saturation acts on the
+    // post-reverb signal -- otherwise reverb tail clips against tanh.
+    reverb.process(mono.as_mut_slice(), reverb_wet);
 
     for sample in mono.iter_mut() {
         *sample = (*sample * master).tanh();
