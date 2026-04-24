@@ -153,8 +153,8 @@ pub fn synthetic_body_ir(sr: u32) -> Vec<f32> {
 /// 16/24/32-bit Int or 32-bit Float. Stereo is downmixed to mono (L+R)/2.
 /// Result is normalised to peak ~1.0 and truncated to `MAX_IR_SAMPLES`.
 pub fn load_ir_wav(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let mut reader = hound::WavReader::open(path)
-        .map_err(|e| format!("opening IR WAV {:?}: {e}", path))?;
+    let mut reader =
+        hound::WavReader::open(path).map_err(|e| format!("opening IR WAV {:?}: {e}", path))?;
     let spec = reader.spec();
     let channels = spec.channels.max(1) as usize;
 
@@ -182,9 +182,7 @@ pub fn load_ir_wav(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> 
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("reading i32 samples: {e}"))?,
         (fmt, bits) => {
-            return Err(format!(
-                "unsupported WAV format: {fmt:?} {bits}-bit"
-            ).into());
+            return Err(format!("unsupported WAV format: {fmt:?} {bits}-bit").into());
         }
     };
 

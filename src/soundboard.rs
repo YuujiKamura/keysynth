@@ -23,7 +23,7 @@
 pub struct ModalResonator {
     // Biquad coefficients, normalised to a0 = 1.
     b0: f32,
-    b2: f32,  // b1 = 0 for BPF (constant peak gain) form
+    b2: f32, // b1 = 0 for BPF (constant peak gain) form
     a1: f32,
     a2: f32,
     // State (transposed-direct-form-II)
@@ -290,7 +290,11 @@ mod tests {
         // Initial last_output is zero.
         assert_eq!(sb.last_output(), 0.0);
         let y1 = sb.process(1.0);
-        assert_eq!(sb.last_output(), y1, "last_output should mirror latest process");
+        assert_eq!(
+            sb.last_output(),
+            y1,
+            "last_output should mirror latest process"
+        );
         let y2 = sb.process(0.5);
         assert_eq!(sb.last_output(), y2);
     }

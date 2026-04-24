@@ -119,11 +119,7 @@ pub struct HarmonicTrack {
 ///   for dB drop of -60: -60 = 20 * b * T60 -> T60 = -3 / b
 /// So if `b` is the least-squares slope of log10(amp) vs time in seconds,
 /// `T60 = -3 / b`.
-pub fn harmonic_tracks(
-    stft: &StftResult,
-    f0_hz: f32,
-    max_harmonics: usize,
-) -> Vec<HarmonicTrack> {
+pub fn harmonic_tracks(stft: &StftResult, f0_hz: f32, max_harmonics: usize) -> Vec<HarmonicTrack> {
     let mut out = Vec::with_capacity(max_harmonics);
     if stft.n_frames() == 0 {
         return out;
@@ -204,8 +200,13 @@ pub fn harmonic_tracks(
 
         // Initial dB: peak magnitude in first 100ms, ref to global peak.
         let frames_per_sec = stft.sr as f32 / stft.hop_size as f32;
-        let n_initial = ((0.100 * frames_per_sec) as usize).max(1).min(frame_mags.len());
-        let initial_peak: f32 = frame_mags[..n_initial].iter().copied().fold(0.0_f32, f32::max);
+        let n_initial = ((0.100 * frames_per_sec) as usize)
+            .max(1)
+            .min(frame_mags.len());
+        let initial_peak: f32 = frame_mags[..n_initial]
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max);
         let initial_db = 20.0 * (initial_peak / global_peak_safe).max(1e-12).log10();
 
         // T60 fit: skip first ~50ms (attack transient), use remaining frames whose
@@ -214,7 +215,11 @@ pub fn harmonic_tracks(
         let n_skip = ((0.050 * frames_per_sec) as usize).min(frame_mags.len());
         let mut xs: Vec<f32> = Vec::new();
         let mut ys: Vec<f32> = Vec::new();
-        let local_peak: f32 = frame_mags.iter().copied().fold(0.0_f32, f32::max).max(1e-12);
+        let local_peak: f32 = frame_mags
+            .iter()
+            .copied()
+            .fold(0.0_f32, f32::max)
+            .max(1e-12);
         let floor = local_peak * 1e-3;
         for (i, &m) in frame_mags.iter().enumerate().skip(n_skip) {
             if m <= floor {
@@ -361,10 +366,7 @@ pub fn log_spectral_distance_db(a: &StftResult, b: &StftResult) -> f32 {
 /// Render magnitude spectrogram to PNG. Width = frames, height = fft_size/2
 /// (low freq at bottom). Magnitude in dB clipped to [-80, 0], mapped to a
 /// viridis-ish 4-stop gradient. Adds a 1-px white border.
-pub fn spectrogram_png(
-    stft: &StftResult,
-    path: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn spectrogram_png(stft: &StftResult, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use image::{ImageBuffer, Rgb};
 
     let height_bins = stft.fft_size / 2; // skip Nyquist for symmetry
@@ -384,8 +386,7 @@ pub fn spectrogram_png(
     // Image with 2-px wider/taller for border.
     let img_w = width + 2;
     let img_h = height + 2;
-    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-        ImageBuffer::new(img_w, img_h);
+    let mut img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::new(img_w, img_h);
 
     // Border colour.
     let border = Rgb([180u8, 180u8, 180u8]);
@@ -420,11 +421,11 @@ pub fn spectrogram_png(
 fn colormap_viridis_like(db: f32) -> [u8; 3] {
     // Stops in (db, [r,g,b]).
     const STOPS: [(f32, [f32; 3]); 5] = [
-        (-80.0, [0.0, 0.0, 0.0]),       // black
-        (-50.0, [0.10, 0.10, 0.55]),    // blue
-        (-25.0, [0.10, 0.60, 0.30]),    // green
-        (-5.0,  [0.95, 0.90, 0.20]),    // yellow
-        (0.0,   [1.0, 1.0, 1.0]),       // white
+        (-80.0, [0.0, 0.0, 0.0]),    // black
+        (-50.0, [0.10, 0.10, 0.55]), // blue
+        (-25.0, [0.10, 0.60, 0.30]), // green
+        (-5.0, [0.95, 0.90, 0.20]),  // yellow
+        (0.0, [1.0, 1.0, 1.0]),      // white
     ];
     let db = db.max(STOPS[0].0).min(STOPS[STOPS.len() - 1].0);
     for w in 0..(STOPS.len() - 1) {
@@ -477,7 +478,11 @@ pub fn estimate_inharmonicity_b(
     max_n: usize,
 ) -> InharmonicityResult {
     if stft.n_frames() == 0 || f0_hz <= 0.0 || max_n == 0 {
-        return InharmonicityResult { b: 0.0, r2: 0.0, n_partials_used: 0 };
+        return InharmonicityResult {
+            b: 0.0,
+            r2: 0.0,
+            n_partials_used: 0,
+        };
     }
 
     let bin_hz = stft.sr as f32 / stft.fft_size as f32;
@@ -516,7 +521,11 @@ pub fn estimate_inharmonicity_b(
         }
     }
     if fund_amp <= 0.0 {
-        return InharmonicityResult { b: 0.0, r2: 0.0, n_partials_used: 0 };
+        return InharmonicityResult {
+            b: 0.0,
+            r2: 0.0,
+            n_partials_used: 0,
+        };
     }
     let amp_floor = fund_amp * 1e-3; // -60 dB below fundamental
 
@@ -579,7 +588,11 @@ pub fn estimate_inharmonicity_b(
     }
 
     if samples.len() < 3 {
-        return InharmonicityResult { b: 0.0, r2: 0.0, n_partials_used: 0 };
+        return InharmonicityResult {
+            b: 0.0,
+            r2: 0.0,
+            n_partials_used: 0,
+        };
     }
 
     // Preliminary B from pass 1.
@@ -633,7 +646,11 @@ pub fn estimate_inharmonicity_b(
         sum_xx += x * x;
     }
     if sum_xx <= 0.0 {
-        return InharmonicityResult { b: 0.0, r2: 0.0, n_partials_used: 0 };
+        return InharmonicityResult {
+            b: 0.0,
+            r2: 0.0,
+            n_partials_used: 0,
+        };
     }
     let b_est = sum_xy / sum_xx;
 
@@ -924,7 +941,11 @@ mod tests {
         let tone = synth_sine(sr, 0.5, 440.0);
         let silence = vec![0.0_f32; tone.len()];
         let loss = mr_stft_l1(&silence, &tone, sr);
-        assert!(loss > 0.0 && loss.is_finite(), "loss not finite-positive: {}", loss);
+        assert!(
+            loss > 0.0 && loss.is_finite(),
+            "loss not finite-positive: {}",
+            loss
+        );
     }
 
     #[test]
@@ -946,10 +967,13 @@ mod tests {
             t60_sec: t60,
             fit_quality_r2: 0.99,
         };
-        let tracks: Vec<HarmonicTrack> =
-            (1..=6).map(|n| make(n, 1.5 - 0.1 * n as f32)).collect();
+        let tracks: Vec<HarmonicTrack> = (1..=6).map(|n| make(n, 1.5 - 0.1 * n as f32)).collect();
         let loss = t60_vector_loss(&tracks, &tracks);
-        assert!(loss < 1e-6, "identical T60 vectors gave nonzero loss: {}", loss);
+        assert!(
+            loss < 1e-6,
+            "identical T60 vectors gave nonzero loss: {}",
+            loss
+        );
     }
 
     #[test]
@@ -1006,12 +1030,17 @@ mod tests {
         // Look at the middle frame, find max bin.
         let mid = s.n_frames() / 2;
         let frame = &s.mag[mid];
-        let (peak_bin, _) = frame
-            .iter()
-            .enumerate()
-            .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
-                if v > v_max { (i, v) } else { (i_max, v_max) }
-            });
+        let (peak_bin, _) =
+            frame
+                .iter()
+                .enumerate()
+                .fold((0usize, 0.0_f32), |(i_max, v_max), (i, &v)| {
+                    if v > v_max {
+                        (i, v)
+                    } else {
+                        (i_max, v_max)
+                    }
+                });
         let peak_hz = s.bin_to_hz(peak_bin);
         assert!(
             (peak_hz - 440.0).abs() < 30.0,
@@ -1037,7 +1066,10 @@ mod tests {
         let c_high = spectral_centroid_per_frame(&high);
         // Centroids are computed per frame; compare middle-frame values.
         let mid = c_low.len() / 2;
-        assert!(c_high[mid] > c_low[mid], "high tone centroid should be higher");
+        assert!(
+            c_high[mid] > c_low[mid],
+            "high tone centroid should be higher"
+        );
     }
 
     #[test]
@@ -1093,7 +1125,8 @@ mod tests {
         assert!(
             (tracks[0].freq_observed_hz - f0).abs() < 5.0,
             "n=1 observed {} vs expected {}",
-            tracks[0].freq_observed_hz, f0
+            tracks[0].freq_observed_hz,
+            f0
         );
     }
 
@@ -1117,6 +1150,9 @@ mod tests {
         let far = make_with_t60(2.0);
         let loss_close = t60_vector_loss(&ref_tracks, &close);
         let loss_far = t60_vector_loss(&ref_tracks, &far);
-        assert!(loss_far > loss_close, "farther T60s should give larger loss");
+        assert!(
+            loss_far > loss_close,
+            "farther T60s should give larger loss"
+        );
     }
 }

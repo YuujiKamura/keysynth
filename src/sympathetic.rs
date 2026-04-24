@@ -186,7 +186,10 @@ mod tests {
             peak = peak.max(y.abs());
             assert!(y.is_finite(), "non-finite bank output during drive");
         }
-        assert!(peak < 5.0, "bank runaway under persistent drive: peak={peak}");
+        assert!(
+            peak < 5.0,
+            "bank runaway under persistent drive: peak={peak}"
+        );
     }
 
     #[test]

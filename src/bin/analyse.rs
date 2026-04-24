@@ -28,9 +28,9 @@ use serde::Serialize;
 use serde_json::json;
 
 use keysynth::analysis::{
-    centroid_trajectory_mse, estimate_inharmonicity_b, harmonic_tracks,
-    log_spectral_distance_db, mr_stft_l1, onset_envelope_l2, spectral_centroid_per_frame,
-    spectrogram_png, stft, t60_vector_loss, HarmonicTrack, InharmonicityResult,
+    centroid_trajectory_mse, estimate_inharmonicity_b, harmonic_tracks, log_spectral_distance_db,
+    mr_stft_l1, onset_envelope_l2, spectral_centroid_per_frame, spectrogram_png, stft,
+    t60_vector_loss, HarmonicTrack, InharmonicityResult,
 };
 
 const EXPECTED_SR: u32 = 44100;
@@ -174,10 +174,7 @@ fn load_mono_wav(path: &std::path::Path) -> Result<(Vec<f32>, u32), String> {
                 .map(|s| s.map(|v| v as f32 / max).unwrap_or(0.0))
                 .collect()
         }
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
     };
 
     let mono: Vec<f32> = if channels == 1 {
@@ -277,8 +274,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lsd_db = log_spectral_distance_db(&stft_ref, &stft_cand);
     let mrstft = mr_stft_l1(&ref_samples, &cand_samples, sr);
     let b_ref: InharmonicityResult = estimate_inharmonicity_b(&stft_ref, f0, args.max_harmonics);
-    let b_cand: InharmonicityResult =
-        estimate_inharmonicity_b(&stft_cand, f0, args.max_harmonics);
+    let b_cand: InharmonicityResult = estimate_inharmonicity_b(&stft_cand, f0, args.max_harmonics);
     let b_residual = (b_cand.b - b_ref.b).abs();
     let t60_loss = t60_vector_loss(&h_ref, &h_cand);
     let onset_l2 = onset_envelope_l2(&ref_samples, &cand_samples, sr, 80);
@@ -292,8 +288,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut deltas: Vec<HarmonicDelta> = Vec::new();
     for r in &h_ref {
         if let Some(c) = h_cand.iter().find(|c| c.n == r.n) {
-            let df_cents =
-                1200.0 * (c.freq_observed_hz / r.freq_observed_hz).max(1e-12).log2();
+            let df_cents = 1200.0 * (c.freq_observed_hz / r.freq_observed_hz).max(1e-12).log2();
             let d_t60 = c.t60_sec - r.t60_sec;
             let d_init = c.initial_db - r.initial_db;
             deltas.push(HarmonicDelta {
@@ -436,10 +431,7 @@ fn write_summary(
     let f = File::create(args.out.join("summary.txt"))?;
     let mut w = BufWriter::new(f);
 
-    writeln!(
-        w,
-        "=== keysynth analyse v0.2 (issue #1 metric stack) ==="
-    )?;
+    writeln!(w, "=== keysynth analyse v0.2 (issue #1 metric stack) ===")?;
     writeln!(
         w,
         "reference: {:<48} ({:.2} s, {} samples)",

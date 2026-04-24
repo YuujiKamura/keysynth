@@ -116,9 +116,10 @@ fn render_keysynth(
     if args.engine == Engine::SfzPiano {
         // sfz-piano renders via the SfzPlayer; mono-mix its stereo output
         // exactly like the live audio callback does.
-        let sfz_path = args.sfz_path.as_ref().ok_or(
-            "engine 'sfz-piano' requires --sfz PATH (no SFZ manifest provided)",
-        )?;
+        let sfz_path = args
+            .sfz_path
+            .as_ref()
+            .ok_or("engine 'sfz-piano' requires --sfz PATH (no SFZ manifest provided)")?;
         let mut player = SfzPlayer::load(sfz_path, SR as f32)?;
         player.note_on(0, args.note, args.velocity);
         let mut left = vec![0.0_f32; total_samples];
@@ -139,13 +140,12 @@ fn render_keysynth(
         // mix its stereo output to mono, exactly like the live audio
         // callback does.
         if args.sf2_path.as_os_str().is_empty() {
-            return Err(
-                "engine 'sf-piano' requires --sf2 PATH (no SoundFont provided)".into(),
-            );
+            return Err("engine 'sf-piano' requires --sf2 PATH (no SoundFont provided)".into());
         }
-        let mut file = BufReader::new(File::open(&args.sf2_path).map_err(|e| {
-            format!("opening SoundFont {:?}: {e}", args.sf2_path)
-        })?);
+        let mut file = BufReader::new(
+            File::open(&args.sf2_path)
+                .map_err(|e| format!("opening SoundFont {:?}: {e}", args.sf2_path))?,
+        );
         let sf = Arc::new(SoundFont::new(&mut file)?);
         let settings = SynthesizerSettings::new(SR as i32);
         let mut synth = Synthesizer::new(&sf, &settings)?;
@@ -207,9 +207,10 @@ fn render_soundfont(
     total_samples: usize,
     release_at: usize,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let mut file = BufReader::new(File::open(&args.sf2_path).map_err(|e| {
-        format!("opening SoundFont {:?}: {e}", args.sf2_path)
-    })?);
+    let mut file = BufReader::new(
+        File::open(&args.sf2_path)
+            .map_err(|e| format!("opening SoundFont {:?}: {e}", args.sf2_path))?,
+    );
     let sf = Arc::new(SoundFont::new(&mut file)?);
 
     let settings = SynthesizerSettings::new(SR as i32);
@@ -313,25 +314,35 @@ fn parse_args() -> Result<BenchArgs, String> {
     while let Some(a) = iter.next() {
         match a.as_str() {
             "--sf2" => {
-                sf2 = Some(PathBuf::from(
-                    iter.next().ok_or("--sf2 needs a path")?,
-                ));
+                sf2 = Some(PathBuf::from(iter.next().ok_or("--sf2 needs a path")?));
             }
             "--note" => {
-                note = iter.next().ok_or("--note needs an integer")?
-                    .parse().map_err(|e| format!("bad --note: {e}"))?;
+                note = iter
+                    .next()
+                    .ok_or("--note needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --note: {e}"))?;
             }
             "--velocity" => {
-                velocity = iter.next().ok_or("--velocity needs an integer")?
-                    .parse().map_err(|e| format!("bad --velocity: {e}"))?;
+                velocity = iter
+                    .next()
+                    .ok_or("--velocity needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --velocity: {e}"))?;
             }
             "--duration" => {
-                duration = iter.next().ok_or("--duration needs a float")?
-                    .parse().map_err(|e| format!("bad --duration: {e}"))?;
+                duration = iter
+                    .next()
+                    .ok_or("--duration needs a float")?
+                    .parse()
+                    .map_err(|e| format!("bad --duration: {e}"))?;
             }
             "--hold" => {
-                hold = iter.next().ok_or("--hold needs a float")?
-                    .parse().map_err(|e| format!("bad --hold: {e}"))?;
+                hold = iter
+                    .next()
+                    .ok_or("--hold needs a float")?
+                    .parse()
+                    .map_err(|e| format!("bad --hold: {e}"))?;
             }
             "--engine" => {
                 let v = iter.next().ok_or("--engine needs a value")?;
@@ -354,12 +365,18 @@ fn parse_args() -> Result<BenchArgs, String> {
                 out = PathBuf::from(iter.next().ok_or("--out needs a path")?);
             }
             "--sf2-program" => {
-                program = iter.next().ok_or("--sf2-program needs an integer")?
-                    .parse().map_err(|e| format!("bad --sf2-program: {e}"))?;
+                program = iter
+                    .next()
+                    .ok_or("--sf2-program needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --sf2-program: {e}"))?;
             }
             "--sf2-bank" => {
-                bank = iter.next().ok_or("--sf2-bank needs an integer")?
-                    .parse().map_err(|e| format!("bad --sf2-bank: {e}"))?;
+                bank = iter
+                    .next()
+                    .ok_or("--sf2-bank needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --sf2-bank: {e}"))?;
             }
             "--only" => {
                 let v = iter.next().ok_or("--only needs keysynth|soundfont|both")?;
@@ -367,25 +384,26 @@ fn parse_args() -> Result<BenchArgs, String> {
                     "keysynth" => OnlyTarget::Keysynth,
                     "soundfont" => OnlyTarget::Soundfont,
                     "both" => OnlyTarget::Both,
-                    other => return Err(format!(
-                        "--only must be keysynth|soundfont|both, got {other}"
-                    )),
+                    other => {
+                        return Err(format!(
+                            "--only must be keysynth|soundfont|both, got {other}"
+                        ))
+                    }
                 };
             }
             "--reverb" => {
-                reverb_wet = iter.next().ok_or("--reverb needs a float 0..1")?
-                    .parse::<f32>().map_err(|e| format!("bad --reverb: {e}"))?
+                reverb_wet = iter
+                    .next()
+                    .ok_or("--reverb needs a float 0..1")?
+                    .parse::<f32>()
+                    .map_err(|e| format!("bad --reverb: {e}"))?
                     .clamp(0.0, 1.0);
             }
             "--ir" => {
-                ir_path = Some(PathBuf::from(
-                    iter.next().ok_or("--ir needs a path")?,
-                ));
+                ir_path = Some(PathBuf::from(iter.next().ok_or("--ir needs a path")?));
             }
             "--sfz" => {
-                sfz_path = Some(PathBuf::from(
-                    iter.next().ok_or("--sfz needs a path")?,
-                ));
+                sfz_path = Some(PathBuf::from(iter.next().ok_or("--sfz needs a path")?));
             }
             "--help" | "-h" => {
                 print_help();
@@ -406,7 +424,8 @@ fn parse_args() -> Result<BenchArgs, String> {
         (None, false) => PathBuf::new(),
         (None, true) => return Err(
             "--sf2 PATH is required (omit only when --only keysynth with --engine != sf-piano, \
-             or when using --engine sfz-piano with --only keysynth)".into(),
+             or when using --engine sfz-piano with --only keysynth)"
+                .into(),
         ),
     };
 

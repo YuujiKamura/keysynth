@@ -254,7 +254,11 @@ mod tests {
     fn gm_each_program_belongs_to_known_family() {
         let known: std::collections::HashSet<&str> = GM_FAMILIES.iter().copied().collect();
         for (_, _, fam) in GM_INSTRUMENTS.iter() {
-            assert!(known.contains(*fam), "program family '{}' not in GM_FAMILIES", fam);
+            assert!(
+                known.contains(*fam),
+                "program family '{}' not in GM_FAMILIES",
+                fam
+            );
         }
     }
 }

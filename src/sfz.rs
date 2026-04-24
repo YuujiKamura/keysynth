@@ -46,7 +46,7 @@ use hound::{SampleFormat, WavReader};
 /// One `<region>` parsed out of the SFZ manifest.
 #[derive(Debug, Clone)]
 pub struct SfzRegion {
-    pub sample_idx: usize,   // index into SfzPlayer::samples
+    pub sample_idx: usize, // index into SfzPlayer::samples
     pub lokey: u8,
     pub hikey: u8,
     pub lovel: u8,
@@ -258,11 +258,7 @@ impl SfzPlayer {
 
         // Evict if at cap: prefer an already-released voice, else oldest.
         if self.voices.len() >= self.max_voices {
-            let evict = self
-                .voices
-                .iter()
-                .position(|v| v.released)
-                .unwrap_or(0);
+            let evict = self.voices.iter().position(|v| v.released).unwrap_or(0);
             self.voices.remove(evict);
         }
 
@@ -626,9 +622,7 @@ fn find_next_opcode_boundary(s: &str) -> Option<usize> {
             }
             // Look for identifier followed by '='
             let ident_start = i;
-            while i < bytes.len()
-                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_')
-            {
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
             if i > ident_start && i < bytes.len() && bytes[i] == b'=' {
@@ -877,7 +871,10 @@ sample=samples/A 3.wav lokey=57 hikey=60
 ";
         let regions = parse_sfz_regions(sfz).unwrap();
         assert_eq!(regions.len(), 1);
-        assert_eq!(regions[0].get("sample").map(|s| s.as_str()), Some("samples/A 3.wav"));
+        assert_eq!(
+            regions[0].get("sample").map(|s| s.as_str()),
+            Some("samples/A 3.wav")
+        );
         assert_eq!(regions[0].get("lokey").map(|s| s.as_str()), Some("57"));
     }
 

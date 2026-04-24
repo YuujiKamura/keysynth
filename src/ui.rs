@@ -200,24 +200,17 @@ impl eframe::App for KeysynthApp {
                                             if fam != family {
                                                 continue;
                                             }
-                                            let selected =
-                                                sf_program == *prog && sf_bank != 128;
-                                            let label_text =
-                                                format!("[{:>3}] {}", prog, name);
+                                            let selected = sf_program == *prog && sf_bank != 128;
+                                            let label_text = format!("[{:>3}] {}", prog, name);
                                             let rich = if selected {
                                                 egui::RichText::new(label_text)
                                                     .monospace()
                                                     .strong()
-                                                    .color(egui::Color32::from_rgb(
-                                                        255, 220, 120,
-                                                    ))
+                                                    .color(egui::Color32::from_rgb(255, 220, 120))
                                             } else {
                                                 egui::RichText::new(label_text).monospace()
                                             };
-                                            if ui
-                                                .selectable_label(selected, rich)
-                                                .clicked()
-                                            {
+                                            if ui.selectable_label(selected, rich).clicked() {
                                                 sf_program = *prog;
                                                 // Picking a melodic patch
                                                 // implicitly leaves drum
@@ -231,18 +224,20 @@ impl eframe::App for KeysynthApp {
                     });
             });
 
-        egui::SidePanel::right("log").default_width(280.0).show(ctx, |ui| {
-            ui.heading("MIDI log");
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    // Snapshot is already newest-first and capped at 60.
-                    for line in dash_snapshot.recent.iter() {
-                        ui.monospace(line);
-                    }
-                });
-        });
+        egui::SidePanel::right("log")
+            .default_width(280.0)
+            .show(ctx, |ui| {
+                ui.heading("MIDI log");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        // Snapshot is already newest-first and capped at 60.
+                        for line in dash_snapshot.recent.iter() {
+                            ui.monospace(line);
+                        }
+                    });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // ----- CC controls section ----------------------------------
@@ -281,10 +276,7 @@ impl eframe::App for KeysynthApp {
                             ui.monospace(format!("CC{cc:>3}"));
                             ui.monospace(format!("{val:>3}"));
                             let frac = val as f32 / 127.0;
-                            ui.add(
-                                egui::ProgressBar::new(frac)
-                                    .desired_width(220.0),
-                            );
+                            ui.add(egui::ProgressBar::new(frac).desired_width(220.0));
                             ui.monospace(format!("{count}"));
                             ui.end_row();
                         }
@@ -304,20 +296,14 @@ impl eframe::App for KeysynthApp {
 
             // Render a 0-95 note grid as small cells; held notes light up.
             let cell_size = egui::vec2(28.0, 22.0);
-            let held: std::collections::HashSet<u8> = dash_snapshot
-                .active_notes
-                .iter()
-                .map(|(_, n)| *n)
-                .collect();
+            let held: std::collections::HashSet<u8> =
+                dash_snapshot.active_notes.iter().map(|(_, n)| *n).collect();
 
             ui.horizontal_wrapped(|ui| {
                 for note in 24u8..96u8 {
                     let label = format!("{note}");
                     let active = held.contains(&note);
-                    let (rect, _resp) = ui.allocate_exact_size(
-                        cell_size,
-                        egui::Sense::hover(),
-                    );
+                    let (rect, _resp) = ui.allocate_exact_size(cell_size, egui::Sense::hover());
                     let painter = ui.painter();
                     let bg = if active {
                         egui::Color32::from_rgb(255, 180, 60)
@@ -341,10 +327,7 @@ impl eframe::App for KeysynthApp {
 
             if held.is_empty() {
                 ui.add_space(4.0);
-                ui.colored_label(
-                    egui::Color32::from_rgb(180, 180, 180),
-                    "(no notes held)",
-                );
+                ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "(no notes held)");
             } else {
                 ui.add_space(4.0);
                 let list: Vec<String> = held.iter().map(|n| n.to_string()).collect();
