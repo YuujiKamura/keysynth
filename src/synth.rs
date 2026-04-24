@@ -49,6 +49,13 @@ pub enum Engine {
     /// libraries (Salamander Grand V3 etc.) that the SF2 format can't
     /// represent at full fidelity.
     SfzPiano,
+    /// Mid-tier piano: 7 strings + 12-mode "lite" soundboard, no
+    /// shared sympathetic bank. Same per-voice DSP as `Piano`, but
+    /// uses the lite soundboard so the high-Q upper-band modes don't
+    /// ring through the bridge feedback loop. Decay/coupling/dry-wet
+    /// tuned 2026-04-25 against the SFZ Salamander Grand Piano V3 C4
+    /// reference T60 vector.
+    PianoThick,
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,11 +1023,15 @@ impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         // 7-string sum normalised by 1/7 keeps the in-phase attack peak
         // bounded (7 strings hammer in phase, decorrelate over ~sqrt(7)
-        // after detune drift). The dry direct-radiation mix is small
-        // (0.2) — most of what an audience hears from a real piano is
-        // soundboard-radiated, not direct string sound.
-        let dry_gain = 0.2_f32;
-        let wet_gain = 0.7_f32;
+        // after detune drift).
+        // Dry/wet rebalanced 0.2/0.7 → 0.5/0.35 (2026-04-25). At the
+        // previous wet dominance the high-Q soundboard modes ringing
+        // through the bridge loop were audible as "波がもどってくる"
+        // sustained resonance / harpsichord-like ring. Pushing dry up
+        // makes the immediate string sound primary; the soundboard
+        // sits behind as colour, not as the body of the note.
+        let dry_gain = 0.5_f32;
+        let wet_gain = 0.35_f32;
         let string_norm = 1.0_f32 / 7.0;
         for sample in buf.iter_mut() {
             // 1. Inject the previous-sample soundboard output back into
@@ -1183,6 +1194,147 @@ pub fn make_voice(
         // pool entry only tracks (channel, note) for eviction; audio comes
         // from the shared SfzPlayer rendered in the audio callback.
         Engine::SfzPiano => Box::new(SfPianoPlaceholder::new()),
+        // PianoThick: 7 strings + 12-mode lite soundboard (no high-freq
+        // additions). The full Piano variant's high-Q 16-mode set with
+        // 7-string coupling produced an abnormal "ドーンミャアああーーオーン"
+        // decay character — high-Q modes at 3000-7500 Hz ringing through
+        // the bridge feedback loop. PianoVoiceThick keeps the thicker
+        // 7-string fundamental but uses the cleaner 12-mode body.
+        Engine::PianoThick => Box::new(PianoVoiceThick::new(sr, freq, velocity)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PianoVoiceThick: 7 strings + 12-mode lite soundboard, no sym bank.
+//
+// Mid-tier between the planned 3-string PianoVoiceLite and the full
+// `PianoVoice` (7 strings + 16-mode soundboard + cross-string
+// sympathetic bank). Combines the thicker 7-string fundamental with a
+// cleaner 12-mode soundboard so the high-Q resonances of the extended
+// set don't bleed sustained ring into the decay tail.
+//
+// Decay/coupling/dry-wet tuned 2026-04-25 against the SFZ Salamander C4
+// reference. Reference T60 vector at C4 is roughly
+//     n=1: 18.1s, n=2: 11.2s, n=3: 9.6s, n=4: 7.4s, n=5..8: 5.5..9.0s
+// (fundamental decays slowest, mid/high partials decay faster). The
+// previous parameter set (decay 0.9985 - 0.0035*high, coupling 0.025/7,
+// dry 0.5 / wet 0.35) gave a fundamental T60 of only 9.2s (-8.9s vs ref)
+// while h6-h8 came in 3-4s short — the wrong overall shape. The new
+// curve lifts the low-end base (0.9990) and steepens the high slope
+// (-0.0050 at 2 kHz) so n=1 sustains longer while n=6..8 decay closer
+// to ref. Coupling is halved (0.015/7) and the dry/wet rebalanced to
+// 0.7/0.20 to keep the soundboard from contributing the sustained
+// metallic ring the user described as "ドーンミャアああーーオーン".
+// ---------------------------------------------------------------------------
+
+pub struct PianoVoiceThick {
+    strings: [KsString; 7],
+    released: bool,
+    rel_mul: f32,
+    rel_step: f32,
+    soundboard: crate::soundboard::Soundboard,
+    coupling: f32,
+}
+
+impl PianoVoiceThick {
+    pub fn new(sr: f32, freq: f32, velocity: u8) -> Self {
+        let amp = (velocity.max(1) as f32) / 127.0;
+        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
+        let detunes = [
+            cents_to_ratio(-3.0),
+            cents_to_ratio(-2.0),
+            cents_to_ratio(-1.0),
+            1.0,
+            cents_to_ratio(1.0),
+            cents_to_ratio(2.0),
+            cents_to_ratio(3.0),
+        ];
+        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
+        // Frequency-dependent decay tuned against SFZ Salamander C4:
+        //   base  0.9990  → long fundamental (n=1 ~ 10s after coupling)
+        //   slope 0.0050  → steeper high-end falloff so h6-h8 don't ring
+        //                   past their reference T60.
+        let decay_for = |f: f32| -> f32 {
+            let high = (f / 2000.0).clamp(0.0, 1.0);
+            0.9990 - 0.0050 * high
+        };
+        let hammer_w = piano_hammer_width(velocity);
+        let mk = |freq_string: f32| -> KsString {
+            let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
+            let buf = piano_hammer_excitation(n, hammer_w, amp);
+            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
+                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
+        };
+        let strings = [
+            mk(freq * detunes[0]),
+            mk(freq * detunes[1]),
+            mk(freq * detunes[2]),
+            mk(freq * detunes[3]),
+            mk(freq * detunes[4]),
+            mk(freq * detunes[5]),
+            mk(freq * detunes[6]),
+        ];
+        let release_sec = 0.300_f32;
+        let release_samples = (release_sec * sr).max(1.0);
+        let rel_step = (1e-3_f32.ln() / release_samples).exp();
+        // 12-mode "lite" soundboard (no high-freq additions) so the
+        // upper-band high-Q resonances don't ring through the bridge
+        // feedback loop and colour the tail.
+        let soundboard = crate::soundboard::Soundboard::new_concert_grand_lite(sr);
+        // Coupling halved from 0.025/7 → 0.015/7. The previous value
+        // re-injected enough mid-band soundboard energy to extend
+        // partials 2-4 by 1-2 s vs the SFZ reference; halving keeps the
+        // body resonance audible without the sustained mid-band ring.
+        let coupling = 0.015_f32 / 7.0;
+        Self {
+            strings,
+            released: false,
+            rel_mul: 1.0,
+            rel_step,
+            soundboard,
+            coupling,
+        }
+    }
+}
+
+impl VoiceImpl for PianoVoiceThick {
+    fn render_add(&mut self, buf: &mut [f32]) {
+        // dry/wet pushed from the original 0.5/0.35 balance toward dry
+        // dominance (0.7/0.20). With the lite soundboard the wet
+        // contribution was still bright enough to lift the late-decay
+        // spectral centroid well above the SFZ reference, perceived as
+        // the tail "オーン" sustained body resonance. Bringing the
+        // direct string sound forward keeps the immediate hammer attack
+        // primary; the soundboard sits behind as colour.
+        let dry_gain = 0.7_f32;
+        let wet_gain = 0.20_f32;
+        let string_norm = 1.0_f32 / 7.0;
+        for sample in buf.iter_mut() {
+            let fb = self.soundboard.last_output() * self.coupling;
+            if fb != 0.0 {
+                for s in &mut self.strings {
+                    s.inject_feedback(fb);
+                }
+            }
+            let mut s_sum = 0.0_f32;
+            for s in &mut self.strings {
+                s_sum += s.step();
+            }
+            let s_avg = s_sum * string_norm;
+            let board_out = self.soundboard.process(s_avg);
+            let mut out_sample = s_avg * dry_gain + board_out * wet_gain;
+            if self.released {
+                self.rel_mul *= self.rel_step;
+                out_sample *= self.rel_mul;
+            }
+            *sample += out_sample;
+        }
+    }
+    fn trigger_release(&mut self) {
+        self.released = true;
+    }
+    fn is_done(&self) -> bool {
+        self.released && self.rel_mul <= 1e-4
     }
 }
 

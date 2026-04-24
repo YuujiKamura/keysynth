@@ -78,6 +78,41 @@ pub struct Soundboard {
 }
 
 impl Soundboard {
+    /// Lite variant: original 12-mode set, no high-freq additions, with
+    /// damped Q values (15-35 vs the full variant's 60-120). Used by
+    /// `Engine::PianoThick` so the upper-band high-Q resonances of the
+    /// full 16-mode set don't ring through the bridge feedback loop and
+    /// colour the tail (perceived as "ミャアアーオーン" sustained
+    /// pitched ringing). Real soundboard plate modes are heavily damped
+    /// (radiating 2D plate vs discrete resonator); the damped Qs better
+    /// approximate that behaviour.
+    pub fn new_concert_grand_lite(sr: f32) -> Self {
+        let modes: [(f32, f32); 12] = [
+            (80.0, 15.0),
+            (110.0, 15.0),
+            (150.0, 18.0),
+            (200.0, 18.0),
+            (270.0, 20.0),
+            (350.0, 20.0),
+            (470.0, 22.0),
+            (600.0, 22.0),
+            (800.0, 25.0),
+            (1100.0, 25.0),
+            (1500.0, 30.0),
+            (2200.0, 35.0),
+        ];
+        let n = modes.len() as f32;
+        let peak_gain = 1.0 / n.sqrt();
+        let resonators = modes
+            .iter()
+            .map(|&(f, q)| ModalResonator::new(sr, f, q, peak_gain))
+            .collect();
+        Self {
+            resonators,
+            last_output: 0.0,
+        }
+    }
+
     /// Construct a typical small/medium concert-grand mode set.
     /// 12 modes, log-spaced 80 Hz to 2.2 kHz, Q rising with frequency
     /// (low-Q low-end gives the body "wood" thump, higher Q upper modes

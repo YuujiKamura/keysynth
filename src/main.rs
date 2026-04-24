@@ -102,8 +102,9 @@ fn parse_args() -> Result<Args, String> {
                     "koto" => Engine::Koto,
                     "sf-piano" => Engine::SfPiano,
                     "sfz-piano" => Engine::SfzPiano,
+                    "piano-thick" => Engine::PianoThick,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick)"
                     )),
                 };
             }
