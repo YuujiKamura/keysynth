@@ -17,3 +17,8 @@ Thumbs.db
 # Logs / scratch
 *.log
 *.tmp
+
+# bench artifacts
+bench-out/
+*.wav
+*.sf2
