@@ -18,7 +18,30 @@ Thumbs.db
 *.log
 *.tmp
 
-# bench artifacts
+# bench artifacts + acquired audio data
+# NEVER commit acquired sound data, sample libraries, or impulse responses.
+# Many free-licence packs are CC-BY / CC-NC and DO NOT permit redistribution
+# in a derived repo. Even CC0 packs add MB-GB of binary noise to git history.
 bench-out/
-*.wav
-*.sf2
+recordings/
+samples/
+ir/
+**/*.wav
+**/*.flac
+**/*.aif
+**/*.aiff
+**/*.mp3
+**/*.ogg
+**/*.opus
+**/*.m4a
+**/*.sf2
+**/*.sf3
+**/*.sfz
+**/*.dls
+# Compressed bundles users may drop in (sample packs, IR libraries)
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
