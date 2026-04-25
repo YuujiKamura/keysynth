@@ -328,7 +328,19 @@ impl ModalPianoVoice {
                 } else {
                     FALLBACK_T60
                 };
-                let t60 = raw.max(t60_floor_for_partial(n));
+                // Iter P: clamp T60 to [floor, 12 s]. The LUT extractor
+                // estimates partial-1 T60 around 25-33 s on the 10-s SFZ
+                // samples — physically possible only with damper pedal
+                // permanently down. In our voice the H-polarization
+                // multiplier (×1.8) further stretches that to 50+ s,
+                // making the fundamental ring far longer than any real
+                // piano. centroid_mse_hz ≈ 1000 across stimuli traced
+                // to this: fundamentals out-sustain everything else,
+                // dragging the spectral centroid below the SFZ
+                // trajectory. 12 s ceiling matches the longest plausible
+                // pedal-down sustain on a Yamaha C5.
+                const T60_CEIL_SEC: f32 = 12.0;
+                let t60 = raw.max(t60_floor_for_partial(n)).min(T60_CEIL_SEC);
                 Mode {
                     freq_hz: m.freq_hz * ratio,
                     t60_sec: t60,

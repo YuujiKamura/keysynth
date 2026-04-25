@@ -260,8 +260,60 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
             (2000, 4000, "hi (2-4k)"),
             (4000, 8000, "very-hi (4-8k)"),
         ]
+        # Inter-partial floor: how much energy lives BETWEEN the partial
+        # peaks. Real recordings (SFZ Salamander) carry soundboard
+        # resonances + room reverb + sympathetic strings → continuous
+        # spectrum *between* partials. A pure modal bank produces ~0
+        # energy between peaks (the "dead inter-partial silence" Risset
+        # & Wessel called the missing piece of spectral fusion). Reported
+        # as the ratio of floor energy ref/cand: large positive dB means
+        # cand has a deader floor than ref ("lo-fi" signature).
+        ref_avg = ref_lin.mean(axis=1)
+        n_bins = ref_avg.shape[0]
+        # Detect partial peaks in the averaged ref spectrum: local max
+        # over ±10 bins, > 5 % of global max.
+        peak_window = 10
+        peak_thresh = 0.05 * float(ref_avg.max())
+        is_peak = np.zeros(n_bins, dtype=bool)
+        for i in range(peak_window, n_bins - peak_window):
+            local = ref_avg[i - peak_window : i + peak_window + 1]
+            if ref_avg[i] == local.max() and ref_avg[i] > peak_thresh:
+                is_peak[i] = True
+        # "Near peak" mask = peak ± 3 bins. Floor mask = the rest.
+        near_radius = 3
+        near_peak = np.zeros(n_bins, dtype=bool)
+        for p in np.where(is_peak)[0]:
+            near_peak[max(0, p - near_radius) : min(n_bins, p + near_radius + 1)] = True
+        floor_mask = (~near_peak) & f_mask
+        ref_floor_e = float(np.sum(ref_lin[floor_mask, :] ** 2))
+        cand_floor_e = float(np.sum(cand_lin[floor_mask, :] ** 2))
+        if cand_floor_e > 1e-12 and ref_floor_e > 1e-12:
+            floor_ratio_db = 10.0 * np.log10(ref_floor_e / cand_floor_e)
+        else:
+            floor_ratio_db = float("inf") if ref_floor_e > 1e-12 else float("-inf")
+
+        # Centroid trajectory MSE: spectral centroid SC(t) per frame
+        # (Σ f·|X(f,t)| / Σ |X(f,t)|), MSE between ref and cand
+        # trajectories. Captures dynamic brightness behaviour (Saitis &
+        # Weinzierl 2019) which static energy comparison averages away.
+        f_for_sc = f_axis[f_mask]
+        ref_masked = ref_lin[f_mask, :]
+        cand_masked = cand_lin[f_mask, :]
+        ref_sc = (ref_masked * f_for_sc[:, None]).sum(axis=0) / np.maximum(
+            ref_masked.sum(axis=0), 1e-12
+        )
+        cand_sc = (cand_masked * f_for_sc[:, None]).sum(axis=0) / np.maximum(
+            cand_masked.sum(axis=0), 1e-12
+        )
+        centroid_mse_hz = float(np.sqrt(np.mean((ref_sc - cand_sc) ** 2)))
+
         print(f"residual_l2={residual_l2:.6f}")
         print(f"residual_l2_aw={residual_l2_aw:.6f}")
+        print(
+            f"inter_partial_floor: ref_e={ref_floor_e:.2e} cand_e={cand_floor_e:.2e} "
+            f"ref/cand={floor_ratio_db:+.1f} dB"
+        )
+        print(f"centroid_mse_hz={centroid_mse_hz:.1f}")
         for lo, hi, name in bands:
             band_mask = (f_axis >= lo) & (f_axis < hi)
             if band_mask.any():
