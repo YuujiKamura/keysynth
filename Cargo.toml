@@ -48,3 +48,10 @@ path = "src/bin/cpubench.rs"
 [[bin]]
 name = "extract_dump"
 path = "src/bin/extract_dump.rs"
+
+# render_modal binary: modal-synthesis piano voice C4 pilot (issue #3 alt path).
+# Extracts modes from a reference WAV via src/extract/* and renders them back
+# through ModalPianoVoice (parallel bandpass resonator bank).
+[[bin]]
+name = "render_modal"
+path = "src/bin/render_modal.rs"
