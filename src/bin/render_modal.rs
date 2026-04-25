@@ -24,7 +24,7 @@ use keysynth::extract::decompose::{decompose, Partial};
 use keysynth::extract::inharmonicity::fit_b;
 use keysynth::extract::t60::{extract_t60, T60Vector};
 use keysynth::synth::VoiceImpl;
-use keysynth::voices::piano_modal::{Mode, ModalPianoVoice};
+use keysynth::voices::piano_modal::{ModalPianoVoice, Mode};
 
 fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, f32), String> {
     let mut r =
@@ -55,8 +55,7 @@ fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, f32), String> {
 
 fn write_wav_mono(path: &Path, samples: &[f32], sr: f32) -> Result<(), String> {
     if let Some(p) = path.parent() {
-        std::fs::create_dir_all(p)
-            .map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
+        std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
     }
     let spec = WavSpec {
         channels: 1,
@@ -64,12 +63,12 @@ fn write_wav_mono(path: &Path, samples: &[f32], sr: f32) -> Result<(), String> {
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut w =
-        WavWriter::create(path, spec).map_err(|e| format!("WavWriter::create: {e}"))?;
+    let mut w = WavWriter::create(path, spec).map_err(|e| format!("WavWriter::create: {e}"))?;
     for &s in samples {
         let clamped = s.clamp(-1.0, 1.0);
         let i = (clamped * i16::MAX as f32) as i16;
-        w.write_sample(i).map_err(|e| format!("write_sample: {e}"))?;
+        w.write_sample(i)
+            .map_err(|e| format!("write_sample: {e}"))?;
     }
     w.finalize().map_err(|e| format!("finalize: {e}"))?;
     Ok(())
@@ -141,7 +140,9 @@ fn parse_args() -> Result<Args, String> {
     let mut iter = env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--reference" => out.reference = PathBuf::from(iter.next().ok_or("--reference needs a path")?),
+            "--reference" => {
+                out.reference = PathBuf::from(iter.next().ok_or("--reference needs a path")?)
+            }
             "--note" => {
                 out.note = iter
                     .next()
@@ -190,7 +191,9 @@ fn parse_args() -> Result<Args, String> {
                 out.source = match v.as_str() {
                     "extractor" => LutSource::Extractor,
                     "analyse" => LutSource::Analyse,
-                    other => return Err(format!("--source must be extractor|analyse, got {other}")),
+                    other => {
+                        return Err(format!("--source must be extractor|analyse, got {other}"))
+                    }
                 };
             }
             "--help" | "-h" => {
@@ -271,7 +274,11 @@ fn main() {
             );
             for (i, p) in partials.iter().enumerate() {
                 let raw_t60 = t60.seconds.get(i).copied().unwrap_or(args.default_t60);
-                let used_t60 = if raw_t60 > 0.0 { raw_t60 } else { args.default_t60 };
+                let used_t60 = if raw_t60 > 0.0 {
+                    raw_t60
+                } else {
+                    args.default_t60
+                };
                 let init_amp = 10f32.powf(p.init_db / 20.0);
                 modes.push(Mode {
                     freq_hz: p.freq_hz,

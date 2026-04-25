@@ -292,6 +292,7 @@ fn engine_slug(e: Engine) -> &'static str {
         Engine::SfzPiano => "sfz-piano",
         Engine::PianoThick => "piano-thick",
         Engine::PianoLite => "piano-lite",
+        Engine::Piano5AM => "piano-5am",
     }
 }
 
@@ -358,6 +359,7 @@ fn parse_args() -> Result<BenchArgs, String> {
                     "sfz-piano" => Engine::SfzPiano,
                     "piano-thick" => Engine::PianoThick,
                     "piano-lite" => Engine::PianoLite,
+                    "piano-5am" => Engine::Piano5AM,
                     other => return Err(format!("unknown engine: {other}")),
                 };
             }

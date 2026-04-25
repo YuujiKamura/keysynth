@@ -19,7 +19,7 @@ use eframe::egui;
 use midir::MidiInputConnection;
 
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
-use crate::synth::{DashState, Engine, LiveParams};
+use crate::synth::{DashState, Engine, LiveParams, MixMode};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
 /// MIDI handles so they aren't dropped while the GUI is open.
@@ -67,13 +67,22 @@ impl eframe::App for KeysynthApp {
         ctx.request_repaint_after(Duration::from_millis(16));
 
         // Snapshot shared state under brief locks; release before drawing.
-        let (mut master, mut engine, mut reverb_wet, mut sf_program, mut sf_bank, dash_snapshot) = {
+        let (
+            mut master,
+            mut engine,
+            mut reverb_wet,
+            mut sf_program,
+            mut sf_bank,
+            mut mix_mode,
+            dash_snapshot,
+        ) = {
             let lp = self.ctx.live.lock().unwrap();
             let m = lp.master;
             let e = lp.engine;
             let r = lp.reverb_wet;
             let p = lp.sf_program;
             let b = lp.sf_bank;
+            let mm = lp.mix_mode;
             drop(lp);
             let d = self.ctx.dash.lock().unwrap();
             let snap = DashSnapshot {
@@ -83,7 +92,7 @@ impl eframe::App for KeysynthApp {
                 // Only clone the tail we actually display (newest 60, pre-reversed).
                 recent: d.recent.iter().rev().take(60).cloned().collect(),
             };
-            (m, e, r, p, b, snap)
+            (m, e, r, p, b, mm, snap)
         };
 
         let master_before = master;
@@ -91,6 +100,7 @@ impl eframe::App for KeysynthApp {
         let reverb_before = reverb_wet;
         let sf_program_before = sf_program;
         let sf_bank_before = sf_bank;
+        let mix_mode_before = mix_mode;
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -116,6 +126,15 @@ impl eframe::App for KeysynthApp {
                         .step_by(0.01)
                         .text("(body IR wet)"),
                 );
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("mix:");
+                for m in MixMode::ALL {
+                    let selected = mix_mode == *m;
+                    if ui.selectable_label(selected, m.as_label()).clicked() {
+                        mix_mode = *m;
+                    }
+                }
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("engine:");
@@ -358,11 +377,13 @@ impl eframe::App for KeysynthApp {
         // user expectation (clicking a patch should always take effect).
         let sf_program_changed = sf_program != sf_program_before;
         let sf_bank_changed = sf_bank != sf_bank_before;
+        let mix_mode_changed = mix_mode != mix_mode_before;
         if master_changed
             || engine_changed
             || reverb_changed
             || sf_program_changed
             || sf_bank_changed
+            || mix_mode_changed
         {
             let mut lp = self.ctx.live.lock().unwrap();
             if master_changed {
@@ -379,6 +400,9 @@ impl eframe::App for KeysynthApp {
             }
             if sf_bank_changed {
                 lp.sf_bank = sf_bank;
+            }
+            if mix_mode_changed {
+                lp.mix_mode = mix_mode;
             }
         }
     }
@@ -400,6 +424,7 @@ const ENGINE_CHOICES: &[(&str, Engine)] = &[
     ("piano", Engine::Piano),
     ("piano-thick", Engine::PianoThick),
     ("piano-lite", Engine::PianoLite),
+    ("piano-5am", Engine::Piano5AM),
     ("koto", Engine::Koto),
     ("sub", Engine::Sub),
     ("fm", Engine::Fm),

@@ -31,7 +31,9 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
 use keysynth::sympathetic::SympatheticBank;
-use keysynth::synth::{make_voice, midi_to_freq, DashState, Engine, LiveParams, Voice, VoiceImpl};
+use keysynth::synth::{
+    make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, Voice, VoiceImpl,
+};
 use keysynth::ui;
 
 /// Shared rustysynth instance for `sf-piano`. `None` until `--sf2` is loaded
@@ -57,6 +59,7 @@ struct Args {
     sfz: Option<PathBuf>,
     ir_path: Option<PathBuf>,
     reverb_wet: f32,
+    mix_mode: MixMode,
 }
 
 impl Default for Args {
@@ -65,19 +68,29 @@ impl Default for Args {
             engine: Engine::Square,
             port: None,
             list: false,
-            master: 0.3,
+            // Master gain pre-tanh. 3.0 sits well into the soft-clip
+            // saturation region for any non-trivial signal — single
+            // voice peak (1.0) → tanh(3.0) ≈ 0.995, two voices already
+            // bumping the ceiling. This trades early saturation for an
+            // "always loud, always present" feel under live MIDI, vs
+            // the older 0.3 which bench-favoured a clean linear region
+            // but felt distant on real hardware. Override via --master.
+            master: 3.0,
             sf2: None,
             sf2_program: 0,
             sf2_bank: 0,
             sfz: None,
             ir_path: None,
-            // Body-IR wet default lowered 0.3 -> 0.15 once the piano engine
-            // gained a bidirectional modal soundboard (see synth::PianoVoice
-            // / soundboard::Soundboard). The soundboard now provides the
-            // body / "halo" character that the IR reverb was masking with;
-            // keep the IR as room-character seasoning, not as the body.
-            // Easy to dial back up via GUI / CC for sustain-pedal vibes.
-            reverb_wet: 0.15,
+            // Body-IR wet default. 0.3 gives the piano engines a
+            // perceptible room character without burying the soundboard
+            // halo. Was 0.15 briefly when the piano engines first
+            // grew their own modal soundboard, but live playing felt
+            // dry; restore to 0.3.
+            reverb_wet: 0.3,
+            // Default to plain tanh; user can switch to Limiter or
+            // ParallelComp via GUI dropdown / `--mix-mode <label>`.
+            // Issue #4 phase 1.
+            mix_mode: MixMode::Plain,
         }
     }
 }
@@ -102,8 +115,9 @@ fn parse_args() -> Result<Args, String> {
                     "sfz-piano" => Engine::SfzPiano,
                     "piano-thick" => Engine::PianoThick,
                     "piano-lite" => Engine::PianoLite,
+                    "piano-5am" => Engine::Piano5AM,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick|piano-lite|piano-5am)"
                     )),
                 };
             }
@@ -143,6 +157,11 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<f32>()
                     .map_err(|e| format!("bad --reverb: {e}"))?
                     .clamp(0.0, 1.0);
+            }
+            "--mix-mode" => {
+                let v = iter.next().ok_or("--mix-mode needs a label")?;
+                out.mix_mode = MixMode::from_label(&v)
+                    .ok_or_else(|| format!("bad --mix-mode: {v} (plain|limiter|parallel-comp)"))?;
             }
             "--help" | "-h" => {
                 print_help();
@@ -384,6 +403,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reverb_wet: args.reverb_wet,
         sf_program: args.sf2_program,
         sf_bank: args.sf2_bank,
+        mix_mode: args.mix_mode,
     }));
     let dash: Arc<Mutex<DashState>> = Arc::new(Mutex::new(DashState::new(args.engine)));
 
@@ -615,6 +635,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut sf_right: Vec<f32> = Vec::new();
         let mut reverb = Reverb::new(ir_samples.clone());
         let mut limiter_gain: f32 = 1.0;
+        let mut mono_compressed: Vec<f32> = Vec::new();
         // Shared sympathetic string bank — lives for the whole stream so any
         // note played excites the SAME 24 resonator strings and builds up a
         // cross-voice "halo of neighbors" the way a real piano's undamped
@@ -623,9 +644,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
-                let (master, wet, engine) = {
+                let (master, wet, engine, mix_mode) = {
                     let lp = live_arc.lock().unwrap();
-                    (lp.master, lp.reverb_wet, lp.engine)
+                    (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
                 };
                 audio_callback(
                     out,
@@ -642,6 +663,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut limiter_gain,
                     &mut sympathetic,
                     engine,
+                    mix_mode,
+                    &mut mono_compressed,
                 );
             },
             err_fn,
@@ -662,13 +685,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
             let mut limiter_gain: f32 = 1.0;
+            let mut mono_compressed: Vec<f32> = Vec::new();
             let mut sympathetic = SympatheticBank::new_piano(sr_hz as f32);
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
-                    let (master, wet, engine) = {
+                    let (master, wet, engine, mix_mode) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet, lp.engine)
+                        (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -688,6 +712,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut limiter_gain,
                         &mut sympathetic,
                         engine,
+                        mix_mode,
+                        &mut mono_compressed,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -709,13 +735,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interleaved_scratch: Vec<f32> = Vec::new();
             let mut reverb = Reverb::new(ir_samples.clone());
             let mut limiter_gain: f32 = 1.0;
+            let mut mono_compressed: Vec<f32> = Vec::new();
             let mut sympathetic = SympatheticBank::new_piano(sr_hz as f32);
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
-                    let (master, wet, engine) = {
+                    let (master, wet, engine, mix_mode) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet, lp.engine)
+                        (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -735,6 +762,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &mut limiter_gain,
                         &mut sympathetic,
                         engine,
+                        mix_mode,
+                        &mut mono_compressed,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -815,7 +844,43 @@ fn audio_callback(
     // non-piano engines (square/sub/fm/koto) the piano-tuned bank just
     // adds inappropriate piano halo. Per issue #2 audit acb2f0360b347a623.
     engine: Engine,
+    // Final-stage bus mixing strategy (issue #4 polyphony headroom).
+    // Selectable live so the user can A/B Plain / Limiter /
+    // ParallelComp under chord playing.
+    mix_mode: MixMode,
+    // Persistent scratch buffer used by ParallelComp for the
+    // "compressed" path (bus B). Caller-owned so we don't allocate on
+    // the audio thread.
+    mono_compressed: &mut Vec<f32>,
 ) {
+    // Flush-To-Zero + Denormals-Are-Zero on the audio thread.
+    //
+    // High-Q biquad resonators (the soundboard mode bank in PianoVoice
+    // and family) ring out exponentially. Once `z1`/`z2` cross
+    // ~1.18e-38 they enter f32 denormal range, where x86 SSE arithmetic
+    // is 100-1000x slower per op. With 32 voices × 12 modes × 2 state
+    // vars × 48 kHz the cumulative per-callback cost spikes enough to
+    // miss the audio deadline → cpal underruns → DAC outputs zeros →
+    // the user hears "音が出なくなる on rapid striking" specifically
+    // on piano family (Piano5AM has no soundboard, no denormals, no
+    // bug). Setting MXCSR FZ (bit 15) + DAZ (bit 6) — i.e. mask
+    // 0x8040 — makes the SSE unit treat denormals as zero on both
+    // input and output, killing the slowdown without changing audible
+    // behaviour (denormals are < -750 dB FS).
+    //
+    // Calling once per audio_callback on x86_64 is harmless (single
+    // CSR write, sub-nanosecond). On non-x86 architectures the call
+    // is compiled out; denormals on those platforms are a separate
+    // story (ARM has FPCR.FZ etc.) but most consumer audio runs x86.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        let csr = _mm_getcsr();
+        if csr & 0x8040 != 0x8040 {
+            _mm_setcsr(csr | 0x8040);
+        }
+    }
+
     let frames = out.len() / channels as usize;
     // Reuse the caller-owned scratch buffer to avoid per-callback heap
     // allocation on the audio thread (~every 11 ms at 1024 frames / 48 kHz).
@@ -887,8 +952,31 @@ fn audio_callback(
     // inappropriate piano halo. Bank state is still ticked when other
     // engines are active so any prior energy decays naturally — we just
     // skip the drive-and-mix.
+    // Sympathetic-string bank (shared across voices) — drive with the
+    // current bus level scaled by COUPLING, mix output back at MIX.
+    //
+    // Stability budget (2026-04-25 incident, "連打バグ"): the original
+    // COUPLING = 0.02 / MIX = 0.3 pair was unstable under rapid piano-
+    // family playing. Each bank string is a KS delay loop with decay
+    // 0.9994 → steady-state amplitude per unit drive ≈ 1/(1−decay) ≈
+    // 1667. With 24 strings summing through 1/√24 ≈ 0.204 normalisation
+    // and MIX = 0.3, the per-bank-string bus contribution per unit
+    // drive reached ≈ 102. Under 32-voice piano-family playing the bus
+    // peak transients hit 5–30, drive 0.1–0.6, bank ring-up exploded
+    // into f32 saturation territory; eventually `Inf − Inf = NaN`
+    // appeared in the dispersion allpass, propagated through reverb to
+    // the DAC, and the user heard it as "音が出なくなる". Verified via
+    // bisect that this was structural in the bank, not in any later
+    // commit — Piano5AM (no sym-bank gate) was symptom-free, all other
+    // piano-family voices produced the silence on rapid striking.
+    //
+    // Empirically: COUPLING = 0.0002 (1/100 of the original) is stable
+    // under sustained piano-family playing while still leaving the
+    // sympathetic halo audible. Re-tightening this requires either a
+    // per-string limiter inside the bank or a smaller MIX; tracked as
+    // a follow-up to issue #2 (sym-bank stability).
     if engine.is_piano_family() {
-        const COUPLING: f32 = 0.02;
+        const COUPLING: f32 = 0.0002;
         const MIX: f32 = 0.3;
         for sample in mono.iter_mut() {
             let board_drive = *sample;
@@ -896,11 +984,20 @@ fn audio_callback(
             *sample += sym_out * MIX;
         }
     } else {
-        // Let any residual ringing from a prior piano-family note decay
-        // out (zero drive, zero coupling) so the bank doesn't carry a
-        // stale impulse if the engine flips back to piano.
         for _ in 0..mono.len() {
             let _ = sympathetic.process(0.0, 0.0);
+        }
+    }
+
+    // Belt-and-braces NaN/Inf guard. If ANY upstream stage (a high-Q
+    // soundboard mode running away under cumulative drive, a future sym
+    // bank regression, etc.) produces a non-finite sample, replace with
+    // 0 before reverb gets it. Reverb is a convolution and would smear
+    // a single NaN across its full IR length, turning a momentary glitch
+    // into permanent silence-via-NaN-propagation.
+    for s in mono.iter_mut() {
+        if !s.is_finite() {
+            *s = 0.0;
         }
     }
 
@@ -908,11 +1005,91 @@ fn audio_callback(
     // post-reverb signal -- otherwise reverb tail clips against tanh.
     reverb.process(mono.as_mut_slice(), reverb_wet);
 
-    // Compressor reverted — didn't help perceptibly. Physical ceiling
-    // (±1.0 digital full-scale × Shokz hardware max) dominates. Plain tanh.
-    let _ = limiter_gain;
-    for sample in mono.iter_mut() {
-        *sample = (*sample * master).tanh();
+    // Final-stage bus mixing — dispatched on `mix_mode` so the user can
+    // A/B Plain / Limiter / ParallelComp live (issue #4). Each branch
+    // is responsible for writing the final tanh-clipped sample into
+    // `mono` in-place.
+    match mix_mode {
+        MixMode::Plain => {
+            // Honest physical model: just tanh the bus. Saturates hard
+            // at chord peaks; preserves exact dynamics in linear range.
+            for sample in mono.iter_mut() {
+                *sample = (*sample * master).tanh();
+            }
+        }
+        MixMode::Limiter => {
+            // Polyphony-aware peak limiter (one-pole envelope follower
+            // → 1/peak_env attenuation when peak_env > 1.0). Catches
+            // chord peaks but flattens dynamics — the listener noted
+            // it as "圧縮は本来の自然音では絶対ない挙動". Kept here as a
+            // baseline comparison for the parallel-comp variant.
+            const ATTACK_COEF: f32 = 0.5;
+            const RELEASE_COEF: f32 = 0.0001;
+            for sample in mono.iter_mut() {
+                let abs_s = sample.abs();
+                if abs_s > *limiter_gain {
+                    *limiter_gain += (abs_s - *limiter_gain) * ATTACK_COEF;
+                } else {
+                    *limiter_gain += (abs_s - *limiter_gain) * RELEASE_COEF;
+                }
+                let gain_reduction = if *limiter_gain > 1.0 {
+                    1.0 / *limiter_gain
+                } else {
+                    1.0
+                };
+                *sample = (*sample * gain_reduction * master).tanh();
+            }
+        }
+        MixMode::ParallelComp => {
+            // Parallel compression / NY trick (issue #4 phase 1).
+            //
+            //   bus_clean      = mono                  (no dynamics)
+            //   bus_compressed = mono * peak_limiter   (heavy 1/peak)
+            //   final          = α · clean + β · compressed
+            //
+            // α + β > 1 so the compressed path actively LIFTS the
+            // sustained portion of chords (where the limiter is
+            // pulling gain) instead of just clamping them. Result: the
+            // attack transient survives via the clean path (full
+            // punch) AND the chord's sustain stays audible via the
+            // compressed path (which gets a gain boost from β > 1
+            // that the clean path can't because it would overshoot).
+            //
+            // Default α = 0.7, β = 0.6 → unity gain on a single voice
+            // (peak_env < 1, compressed = clean, total = 1.3 entering
+            // tanh — slight saturation for warmth) and α + β = 1.3
+            // which lifts the limited sustain ~+2.3 dB over what a
+            // pure limiter would give. Tunable; ear-validate later.
+            const ALPHA: f32 = 0.7;
+            const BETA: f32 = 0.6;
+            const ATTACK_COEF: f32 = 0.5;
+            const RELEASE_COEF: f32 = 0.0001;
+
+            // Build the compressed copy in-place into `mono_compressed`.
+            if mono_compressed.len() != mono.len() {
+                mono_compressed.resize(mono.len(), 0.0);
+            }
+            for (i, sample) in mono.iter().enumerate() {
+                let abs_s = sample.abs();
+                if abs_s > *limiter_gain {
+                    *limiter_gain += (abs_s - *limiter_gain) * ATTACK_COEF;
+                } else {
+                    *limiter_gain += (abs_s - *limiter_gain) * RELEASE_COEF;
+                }
+                let gr = if *limiter_gain > 1.0 {
+                    1.0 / *limiter_gain
+                } else {
+                    1.0
+                };
+                mono_compressed[i] = sample * gr;
+            }
+
+            // Sum the two paths, scale by master, soft-clip.
+            for (i, sample) in mono.iter_mut().enumerate() {
+                let combined = (*sample * ALPHA + mono_compressed[i] * BETA) * master;
+                *sample = combined.tanh();
+            }
+        }
     }
 
     for (frame_idx, frame) in out.chunks_mut(channels as usize).enumerate() {

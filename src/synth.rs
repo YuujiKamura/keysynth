@@ -30,6 +30,7 @@ pub use crate::voices::koto::{koto_pluck_excitation, KotoVoice};
 pub use crate::voices::ks::KsVoice;
 pub use crate::voices::ks_rich::KsRichVoice;
 pub use crate::voices::piano::{PianoPreset, PianoVoice, SoundboardKind};
+pub use crate::voices::piano_5am::Piano5AMVoice;
 pub use crate::voices::placeholder::SfPianoPlaceholder;
 pub use crate::voices::square::SquareVoice;
 pub use crate::voices::sub::SubVoice;
@@ -85,18 +86,81 @@ pub enum Engine {
     /// Mid-band partials h2-h5 also within 30%. Best per-partial T60
     /// match across all variants per the 2026-04-25 measurement loop.
     PianoLite,
+    /// Snapshot of `PianoVoice` as it stood at commit `8f0df23`
+    /// (2026-04-25 05:38). 3 strings, no soundboard, no sym bank, no
+    /// bridge coupling — the perceptually-balanced state before the
+    /// 7-string + soundboard work began. Containerised on-request so
+    /// the morning's tone is reproducible without checking out the
+    /// old commit. Uses `voices::piano_5am::Piano5AMVoice`. The
+    /// snapshot adds an `is_releasing()` override that the original
+    /// 8f0df23 source was missing — this is the single functional
+    /// difference and the fix for the "音が出なくなる on rapid repeated
+    /// keypresses" eviction bug that has been latent since pre-session.
+    Piano5AM,
 }
 
 impl Engine {
     /// True if this engine is one of the KS-string-based piano models
-    /// (`Piano`, `PianoThick`, `PianoLite`). Sample-based engines (`SfPiano`,
-    /// `SfzPiano`) and non-piano engines (`Square`, `Ks`, `Sub`, etc.) return
-    /// false. Used by the audio callback to gate the shared sympathetic
-    /// string bank — sample-based engines already include body resonance in
-    /// the recording, so adding sympathetic on top double-resonates.
+    /// that wants the shared sympathetic-string bank running. Excludes
+    /// `Piano5AM` deliberately — that snapshot predates the sym bank
+    /// (which was added at d0ad787 / 06:14, after 8f0df23 / 05:38), so
+    /// running the bank under it would not be faithful to the captured
+    /// tone. Sample-based engines (`SfPiano`, `SfzPiano`) and
+    /// non-piano engines also return false.
     pub fn is_piano_family(self) -> bool {
         matches!(self, Engine::Piano | Engine::PianoThick | Engine::PianoLite)
     }
+}
+
+/// Final-stage bus mixing strategy applied between voice summation and
+/// the DAC. Selectable at runtime so the user can A/B different
+/// approaches under live MIDI without rebuilding (issue #4 polyphony
+/// headroom & impact preservation). Each mode trades off differently
+/// against the fundamental constraint that the DAC range is ±1.0 while
+/// per-voice peaks may sum well past that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixMode {
+    /// `tanh(master * sample)` only. Honest physical model: no
+    /// dynamics, no compression. Single voice clean, chords saturate
+    /// hard against the tanh ceiling and per-preset spectral details
+    /// get crushed. Reference baseline for what every other mode is
+    /// trying to improve on.
+    Plain,
+    /// Polyphony-aware peak limiter: one-pole envelope follower of
+    /// |sample|, attenuate the bus by 1/peak_env when peak_env > 1.0
+    /// so the value entering tanh sits at ±1.0. Prevents tanh
+    /// saturation under chord summation but flattens dynamics — the
+    /// listener noted it as "圧縮は本来の自然音では絶対ない挙動". Useful
+    /// as a conservative comparison baseline.
+    Limiter,
+    /// Parallel compression (NY trick). The bus splits into two paths:
+    /// (A) clean — preserves attack transient punch with no dynamics
+    /// processing, and (B) compressed — heavily limited so the
+    /// sustained portion of chords stays present. Final out = α·A +
+    /// β·B, with α + β > 1.0 so the compressed path actively LIFTS the
+    /// sustain rather than just clamping it. Aim: full attack impact
+    /// (single-voice "ドン") plus audible chord sustain that doesn't
+    /// crush the per-preset spectral character.
+    ParallelComp,
+}
+
+impl MixMode {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            MixMode::Plain => "plain",
+            MixMode::Limiter => "limiter",
+            MixMode::ParallelComp => "parallel-comp",
+        }
+    }
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "plain" => Some(MixMode::Plain),
+            "limiter" => Some(MixMode::Limiter),
+            "parallel-comp" | "parallel" | "nytrick" => Some(MixMode::ParallelComp),
+            _ => None,
+        }
+    }
+    pub const ALL: &'static [MixMode] = &[MixMode::Plain, MixMode::Limiter, MixMode::ParallelComp];
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +319,9 @@ pub struct LiveParams {
     /// for GeneralUser GS / many GM2/GS soundfonts. Other values are
     /// SF2-specific variation banks. Diffed alongside `sf_program`.
     pub sf_bank: u8,
+    /// Final-stage bus mixing strategy. Live-switchable from GUI / CLI;
+    /// see `MixMode` for the available modes (issue #4).
+    pub mix_mode: MixMode,
 }
 
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,
@@ -788,6 +855,7 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
             freq,
             velocity,
         )),
+        Engine::Piano5AM => Box::new(Piano5AMVoice::new(sr, freq, velocity)),
     }
 }
 
