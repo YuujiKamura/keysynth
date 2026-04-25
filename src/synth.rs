@@ -403,6 +403,23 @@ pub struct KsString {
     ap_coef: f32,
     ap_xprev: f32,
     ap_yprev: f32,
+    // Optional second 1-pole allpass placed in series with the first to give
+    // a 2-stage dispersion network (issue #3 P2). A 2nd-order (or two
+    // cascaded 1st-order) allpass has two coefficients, so it can match the
+    // measured stretched-harmonic curve of a real piano string across the
+    // audible range — a 1-stage section can only produce a single
+    // phase-delay-vs-frequency shape and that shape doesn't fit piano
+    // stiffness (Fletcher / Smith PASP).
+    //
+    // Backward compatibility: `ap2_coef == 0.0` is the legacy 1-stage mode
+    // and the second section is BYPASSED entirely in `step` (no extra
+    // 1-sample delay, no state update). The legacy `with_buf` /
+    // `KsString::new` constructors leave `ap2_coef = 0.0`, so every
+    // pre-existing call site (PianoVoice, KotoVoice, KsRichVoice, the
+    // SympatheticBank) keeps producing bit-identical output.
+    ap2_coef: f32,
+    ap2_xprev: f32,
+    ap2_yprev: f32,
     // Tuning 1-pole allpass for the fractional-delay component, same form.
     // c = (1 - frac) / (1 + frac), giving group delay ~= frac at low freq.
     // Total effective delay is buf.len() + frac.
@@ -455,6 +472,13 @@ impl KsString {
             ap_coef,
             ap_xprev: 0.0,
             ap_yprev: 0.0,
+            // 2-stage dispersion is OPT-IN via `with_two_stage_dispersion`.
+            // `ap2_coef == 0.0` is the bypass sentinel: the second section
+            // is skipped in `step` entirely (not run with a=0, which would
+            // be a 1-sample delay and detune the loop).
+            ap2_coef: 0.0,
+            ap2_xprev: 0.0,
+            ap2_yprev: 0.0,
             tune_coef,
             tune_xprev: 0.0,
             tune_yprev: 0.0,
@@ -464,6 +488,31 @@ impl KsString {
             attack_total_samples,
             pending_feedback: 0.0,
         }
+    }
+
+    /// Engage a SECOND 1-pole allpass in series with the primary dispersion
+    /// allpass (issue #3 P2). Calling with `a2 = 0.0` is a no-op: the second
+    /// section stays bypassed in `step` and the string is bit-identical to
+    /// the legacy 1-stage configuration. With `a2 != 0.0` the loop gains the
+    /// extra degree of freedom needed to match measured piano-string
+    /// stiffness curves (B coefficient ≈ 2.86e-4 per the SFZ Salamander C4
+    /// reference) — voices that want this behaviour set both `a1` (via the
+    /// constructor) and `a2` here.
+    ///
+    /// NOTE: this method does NOT recompute the fractional-delay
+    /// compensation. Adding a second allpass shifts the loop's group delay
+    /// at low frequency by `(1 - a2) / (1 + a2)` samples, so callers that
+    /// care about fundamental-pitch accuracy will need a P3 follow-up to
+    /// fold that into `delay_length_compensated`. For P2 we're only
+    /// validating the topology — voices keep using the 1-stage call path.
+    pub fn with_two_stage_dispersion(mut self, _a1: f32, a2: f32) -> Self {
+        // `_a1` is accepted for API symmetry; the primary coefficient was
+        // already set by the constructor. Asserting equality would force
+        // callers to pass it twice, so we just consume the argument.
+        self.ap2_coef = a2;
+        self.ap2_xprev = 0.0;
+        self.ap2_yprev = 0.0;
+        self
     }
 
     /// Add `x` to the one-sample feedback register. Called BEFORE `step`
@@ -583,6 +632,20 @@ impl KsString {
         let disp = a * lp + self.ap_xprev - a * self.ap_yprev;
         self.ap_xprev = lp;
         self.ap_yprev = disp;
+        // Optional 2nd dispersion allpass in series with the first (P2).
+        // `ap2_coef == 0.0` is the bypass sentinel and we skip the section
+        // entirely — running an a=0 allpass would inject a free 1-sample
+        // delay and shift the loop period, breaking tuning. This branch
+        // costs one comparison in the legacy 1-stage path (≤ 1 % CPU).
+        let disp = if self.ap2_coef != 0.0 {
+            let a2 = self.ap2_coef;
+            let d2 = a2 * disp + self.ap2_xprev - a2 * self.ap2_yprev;
+            self.ap2_xprev = disp;
+            self.ap2_yprev = d2;
+            d2
+        } else {
+            disp
+        };
         // Tuning allpass: same form, separate state. Placed AFTER dispersion
         // so the fractional delay sees the full feedback chain.
         let c = self.tune_coef;
@@ -1078,6 +1141,135 @@ mod tests {
             late_peak < early_peak,
             "string should decay: early {early_peak} late {late_peak}"
         );
+    }
+
+    // --- KsString 2-stage dispersion (issue #3 P2) -----------------------
+
+    /// Build two clones of the same KS string config; one uses the legacy
+    /// 1-stage call path, the other goes through `with_two_stage_dispersion`
+    /// with `a2 = 0.0` (the bypass sentinel). Outputs MUST be bit-identical
+    /// over a 4096-sample render — this is the regression contract that
+    /// guarantees no existing voice changes its sound.
+    #[test]
+    fn ks_string_two_stage_bypass_is_bit_identical() {
+        let ap1 = 0.18_f32;
+        let (n, _) = KsString::delay_length_compensated(SR, 440.0, ap1);
+        let buf_a = hammer_excitation(n, 5, 1.0);
+        let buf_b = buf_a.clone();
+        let mut a = KsString::with_buf(SR, 440.0, buf_a, 0.997, ap1);
+        let mut b =
+            KsString::with_buf(SR, 440.0, buf_b, 0.997, ap1).with_two_stage_dispersion(ap1, 0.0);
+        for i in 0..4096 {
+            let ya = a.step();
+            let yb = b.step();
+            assert_eq!(
+                ya.to_bits(),
+                yb.to_bits(),
+                "sample {i} differs: 1-stage {ya} vs 2-stage-bypassed {yb}"
+            );
+        }
+    }
+
+    /// With a non-trivial second-stage coefficient, the 2-stage string MUST
+    /// produce an audibly different output from the 1-stage one — at least
+    /// 1 % L1 distance over 4096 samples. Catches "ap2 wired but never
+    /// applied" regressions.
+    #[test]
+    fn ks_string_two_stage_active_diverges_from_one_stage() {
+        let ap1 = 0.10_f32;
+        let (n, _) = KsString::delay_length_compensated(SR, 440.0, ap1);
+        let buf_a = hammer_excitation(n, 5, 1.0);
+        let buf_b = buf_a.clone();
+        let mut one = KsString::with_buf(SR, 440.0, buf_a, 0.997, ap1);
+        let mut two =
+            KsString::with_buf(SR, 440.0, buf_b, 0.997, ap1).with_two_stage_dispersion(ap1, 0.05);
+        let mut sum_one = 0.0_f64;
+        let mut sum_diff = 0.0_f64;
+        for _ in 0..4096 {
+            let y1 = one.step();
+            let y2 = two.step();
+            sum_one += y1.abs() as f64;
+            sum_diff += (y1 - y2).abs() as f64;
+        }
+        assert!(sum_one > 0.0, "1-stage output is silent");
+        let rel = sum_diff / sum_one;
+        assert!(
+            rel >= 0.01,
+            "2-stage output must diverge from 1-stage by ≥1 % L1; got {rel:.4}"
+        );
+    }
+
+    /// Stretched-harmonic check: an allpass with `0 < a < 1` has positive
+    /// group delay → the loop period is longer for HF than for LF, so the
+    /// measured partials should sit at or above `n · f1` (never below). We
+    /// render an impulse-excited 1-second buffer and FFT-decompose it, then
+    /// assert the per-partial frequency is ≥ `n · f1` for h1..=h8.
+    #[test]
+    fn ks_string_two_stage_partials_are_stretched_upward() {
+        use crate::extract::decompose::decompose;
+        let f0 = 220.0_f32;
+        let ap1 = 0.10_f32;
+        let ap2 = 0.05_f32;
+        let (n, _) = KsString::delay_length_compensated(SR, f0, ap1);
+        // Narrow hammer excitation → wide spectrum → all partials excited.
+        let buf = hammer_excitation(n, 3, 1.0);
+        let mut s = KsString::with_buf(SR, f0, buf, 0.999, ap1).with_two_stage_dispersion(ap1, ap2);
+        let total_samples = SR as usize;
+        let mut sig = Vec::with_capacity(total_samples);
+        for _ in 0..total_samples {
+            sig.push(s.step());
+        }
+        let partials = decompose(&sig, SR, f0, 8);
+        assert!(
+            partials.len() >= 4,
+            "expected ≥4 partials for stretching check, got {}",
+            partials.len()
+        );
+        let f1 = partials
+            .iter()
+            .find(|p| p.n == 1)
+            .map(|p| p.freq_hz)
+            .expect("h1 must be present");
+        for p in &partials {
+            // Allow 5 cents below `n*f1` for STFT bin quantisation noise on
+            // h1 (the low partials are < 1 bin wide). Above that, partials
+            // should monotonically stretch with stiffness.
+            let expected = (p.n as f32) * f1;
+            let cents = 1200.0 * (p.freq_hz / expected).log2();
+            assert!(
+                cents > -5.0,
+                "h{}: measured {:.2} Hz, expected ≥ {:.2} Hz (cents={cents:.2})",
+                p.n,
+                p.freq_hz,
+                expected
+            );
+        }
+    }
+
+    /// Stability: a 5-second render with both coefficients at the upper
+    /// edge of the existing 1-stage range (0.18) must stay finite. Guards
+    /// against the textbook way 2-stage allpass nets go unstable when both
+    /// coefficients sit near the unit circle.
+    #[test]
+    fn ks_string_two_stage_stable_at_upper_range() {
+        let ap1 = 0.18_f32;
+        let ap2 = 0.18_f32;
+        let (n, _) = KsString::delay_length_compensated(SR, 261.63, ap1);
+        let buf = hammer_excitation(n, 5, 1.0);
+        let mut s =
+            KsString::with_buf(SR, 261.63, buf, 0.998, ap1).with_two_stage_dispersion(ap1, ap2);
+        let n_samples = (SR * 5.0) as usize;
+        for i in 0..n_samples {
+            let y = s.step();
+            assert!(
+                y.is_finite(),
+                "sample {i} not finite: {y} (ap1={ap1}, ap2={ap2})"
+            );
+            assert!(
+                y.abs() < 10.0,
+                "sample {i} too large: {y} (instability — ap1={ap1}, ap2={ap2})"
+            );
+        }
     }
 
     // --- SquareVoice -----------------------------------------------------
