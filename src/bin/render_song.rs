@@ -181,21 +181,35 @@ fn piece_bach_invention() -> Vec<NoteEvent> {
 }
 
 fn piece_bach_prelude_c() -> Vec<NoteEvent> {
-    // Bach Prelude in C, BWV 846 (Well-Tempered Clavier I). Opening 4
-    // measures, sixteenth-note arpeggio pattern at ~80 BPM. Each
-    // measure repeats an 8-note bass+chord-arpeggio figure twice.
-    // Public domain (J.S. Bach, d. 1750).
+    // Bach Prelude in C, BWV 846 (Well-Tempered Clavier I). First 12
+    // measures, sixteenth-note arpeggio pattern at ~75 BPM. Each
+    // measure repeats an 8-note bass+chord-arpeggio figure twice
+    // (16 sixteenths total per measure). Public domain (Bach d. 1750).
+    //
+    // Harmonic outline of the opening 12 bars:
+    //   m1  C maj           m7  G7 / B
+    //   m2  D min7 / C      m8  C maj
+    //   m3  G7 / B          m9  A min / C
+    //   m4  C maj           m10 D / A   (secondary V of V)
+    //   m5  A min / C       m11 D7 / A
+    //   m6  D7 / C          m12 G maj   (half cadence)
     let step = 0.20; // sixteenth at ~75 BPM
     let dur = 0.8;
     let mut v = Vec::new();
-    // Pattern: bass · then 4-note arpeggio · repeat (8 notes per measure).
-    // bass is held for the full measure (sixteen 16ths = 16·step).
     let measures: &[(u8, u8, [u8; 4])] = &[
         // (bass1, bass2, [arpeggio_4_notes])
-        (36, 48, [60, 64, 67, 72]), // m1: C2 C3 | C4 E4 G4 C5  (Cmaj)
-        (36, 50, [62, 65, 69, 74]), // m2: C2 D3 | D4 F4 A4 D5  (Dm7/C)
-        (35, 47, [62, 65, 67, 71]), // m3: B1 B2 | D4 F4 G4 B4  (G7/B)
-        (36, 48, [60, 64, 67, 72]), // m4: back to Cmaj
+        (36, 52, [55, 60, 64, 67]), // m1: C2 E3 | G3 C4 E4 G4  Cmaj
+        (36, 50, [57, 62, 65, 69]), // m2: C2 D3 | A3 D4 F4 A4  Dm7/C
+        (35, 50, [55, 62, 65, 67]), // m3: B1 D3 | G3 D4 F4 G4  G7/B
+        (36, 52, [55, 60, 64, 67]), // m4: C2 E3 | G3 C4 E4 G4  Cmaj
+        (36, 52, [57, 60, 64, 69]), // m5: C2 E3 | A3 C4 E4 A4  Am/C
+        (36, 50, [54, 57, 60, 62]), // m6: C2 D3 | F#3 A3 C4 D4 D7/C
+        (35, 50, [55, 59, 62, 67]), // m7: B1 D3 | G3 B3 D4 G4  G7/B
+        (36, 52, [55, 60, 64, 67]), // m8: C2 E3 | G3 C4 E4 G4  Cmaj
+        (33, 48, [55, 60, 64, 69]), // m9: A1 C3 | G3 C4 E4 A4  Am/C variant
+        (33, 49, [54, 57, 62, 69]), // m10: A1 C#3| F#3 A3 D4 A4 D/A
+        (33, 48, [55, 57, 60, 65]), // m11: A1 C3 | G3 A3 C4 F4 D7/A
+        (31, 50, [55, 59, 62, 67]), // m12: G1 D3 | G3 B3 D4 G4 G major
     ];
     for (mi, (b1, b2, arp)) in measures.iter().enumerate() {
         let m_start = mi as f32 * 16.0 * step;
@@ -346,6 +360,102 @@ fn piece_gymnopedie() -> Vec<NoteEvent> {
     v
 }
 
+fn piece_canon_d() -> Vec<NoteEvent> {
+    // Pachelbel, Canon in D (~1680). The 8-bar ground-bass progression
+    // repeated, with one canonic upper voice playing the most
+    // recognisable counterpoint figure. Public domain (Pachelbel
+    // d. 1706). 8 bars, ~32 s at quarter = 1.0 s.
+    let q = 1.0_f32; // quarter note
+    let mut v = Vec::new();
+    // Bass line (whole notes, 4 q each), 2 cycles of 8 bars = 16 bars
+    // total ≈ 64 s. Trim to 12 bars for the test (still long enough
+    // to show the modal/SFZ contrast over a sustained progression).
+    let bass_pattern = [
+        38, // D2
+        33, // A1
+        35, // B1
+        30, // F#1
+        31, // G1
+        38, // D2  (octave A1 below would be too low for most synths)
+        31, // G1
+        33, // A1
+    ];
+    // Triadic chord on each bar (3 notes, half-note pulses on beats 1 and 3).
+    let chord_pattern: [[u8; 3]; 8] = [
+        [50, 54, 57], // D maj    (D3 F#3 A3)
+        [45, 49, 52], // A maj    (A2 C#3 E3)
+        [47, 50, 54], // B min    (B2 D3 F#3)
+        [42, 45, 49], // F# min   (F#2 A2 C#3)
+        [43, 47, 50], // G maj    (G2 B2 D3)
+        [50, 54, 57], // D maj
+        [43, 47, 50], // G maj
+        [45, 49, 52], // A maj
+    ];
+    // First-voice canon melody (the famous descending one), simplified.
+    let melody_pattern: &[(u8, f32)] = &[
+        (74, 2.0 * q), // D5  (held)
+        (73, 2.0 * q), // C#5
+        (74, 1.0 * q), // D5
+        (76, 1.0 * q), // E5
+        (78, 1.0 * q), // F#5
+        (76, 1.0 * q), // E5
+        (74, 1.0 * q), // D5
+        (73, 1.0 * q), // C#5
+        (71, 1.0 * q), // B4
+        (74, 1.0 * q), // D5
+        (73, 1.0 * q), // C#5
+        (76, 1.0 * q), // E5
+        (74, 1.0 * q), // D5
+        (73, 1.0 * q), // C#5
+        (71, 1.0 * q), // B4
+        (69, 1.0 * q), // A4
+        (66, 1.0 * q), // F#4
+        (69, 1.0 * q), // A4
+        (71, 1.0 * q), // B4
+        (74, 1.0 * q), // D5
+        (73, 1.0 * q), // C#5
+        (71, 1.0 * q), // B4
+        (74, 1.0 * q), // D5  (resolution)
+        (76, 2.0 * q), // E5
+    ];
+    // Lay out 8 bars (4 beats each = 4q per bar = 32 q total).
+    for bar in 0..bass_pattern.len() {
+        let bar_start = bar as f32 * 4.0 * q;
+        // bass note held for full bar
+        v.push(NoteEvent {
+            start_sec: bar_start,
+            midi_note: bass_pattern[bar],
+            duration_sec: 4.0 * q * 0.95,
+            velocity: 75,
+        });
+        // chord on beats 1 and 3 (half notes)
+        for beat in [0.0, 2.0] {
+            for &n in &chord_pattern[bar] {
+                v.push(NoteEvent {
+                    start_sec: bar_start + beat * q,
+                    midi_note: n,
+                    duration_sec: 2.0 * q * 0.95,
+                    velocity: 65,
+                });
+            }
+        }
+    }
+    // Melody starts at bar 3 (after 2 bars of bass+chord intro), runs
+    // through bar 8.
+    let melody_start = 2.0 * 4.0 * q;
+    let mut t = melody_start;
+    for &(n, d) in melody_pattern {
+        v.push(NoteEvent {
+            start_sec: t,
+            midi_note: n,
+            duration_sec: d * 0.92,
+            velocity: 92,
+        });
+        t += d;
+    }
+    v
+}
+
 fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
     match name {
         "c_progression" => Ok(piece_c_progression()),
@@ -356,10 +466,11 @@ fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
         "bach_prelude_c" => Ok(piece_bach_prelude_c()),
         "fur_elise" => Ok(piece_fur_elise()),
         "gymnopedie" => Ok(piece_gymnopedie()),
+        "canon_d" => Ok(piece_canon_d()),
         other => Err(format!(
             "unknown piece: {other} \
              (c_progression|minor_cadence|arpeggio|twinkle|bach_invention|\
-              bach_prelude_c|fur_elise|gymnopedie)"
+              bach_prelude_c|fur_elise|gymnopedie|canon_d)"
         )),
     }
 }
@@ -600,6 +711,20 @@ fn peak_normalise_stereo(left: &mut [f32], right: &mut [f32], target_dbfs: f32) 
 }
 
 fn main() {
+    // Flush-to-zero / denormals-as-zero on the offline render path.
+    // Without it, the modal voice's high-Q biquad bank generates state
+    // values around 1e-30 to 1e-38 during long sustains; x86 SSE
+    // denormal arithmetic is 100-1000× slower per op, which made
+    // longer pieces (bach_prelude_c at 120 events × 144 sub-modes)
+    // appear to hang. main.rs::audio_callback already sets these on
+    // the live audio thread; this mirrors that for offline renders.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::{_mm_getcsr, _mm_setcsr};
+        let csr = _mm_getcsr();
+        _mm_setcsr(csr | 0x8040);
+    }
+
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
