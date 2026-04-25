@@ -23,6 +23,7 @@ use std::path::PathBuf;
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 
+use keysynth::drums::{parse_drum_pattern, DrumEvent};
 use keysynth::sfz::SfzPlayer;
 use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
 
@@ -1585,6 +1586,133 @@ fn piece_codex_railspike() -> Vec<NoteEvent> {
     v
 }
 
+fn piece_groove() -> Vec<NoteEvent> {
+    // C major groove with rhythm box. 120 BPM, 16 bars (~32 s).
+    // Chord cycle: Cmaj7 - Am7 - Fmaj7 - G7 (×2 with ii-V variant
+    // in second half). Drums sit underneath; bass is dotted quarters
+    // and 8th-pickups; chord stabs hit off-beats; treble is a
+    // syncopated 5-note hook that develops.
+    //
+    // Drums are returned by `pick_drums("groove")` — render pipeline
+    // mixes them in after the note pass.
+    let q = 60.0 / 120.0;
+    let mut v: Vec<NoteEvent> = Vec::new();
+
+    let push_note = |v: &mut Vec<NoteEvent>, beat: f32, n: u8, dur: f32, vel: u8| {
+        v.push(NoteEvent {
+            start_sec: beat * q,
+            midi_note: n,
+            duration_sec: dur * q * 0.85,
+            velocity: vel,
+        });
+    };
+
+    // Chord voicings (3-4 notes, mid-register so they don't fight melody)
+    const CMAJ7: &[u8] = &[60, 64, 67, 71]; // C E G B
+    const AM7: &[u8] = &[57, 60, 64, 67];   // A C E G
+    const FMAJ7: &[u8] = &[57, 60, 65, 69]; // A C F A (rootless-ish)
+    const G7: &[u8] = &[59, 62, 65, 67];    // B D F G
+    const DM7: &[u8] = &[57, 60, 65, 69];   // A C F A → use [60, 62, 65, 69] for D F A C
+    let dm7: &[u8] = &[60, 62, 65, 69];
+
+    // 8-bar pattern (each bar 4 beats):
+    // Cmaj7 | Am7 | Fmaj7 | G7 | Cmaj7 | Am7 | Dm7 | G7
+    let chord_plan: &[(&[u8], u8)] = &[
+        (CMAJ7, 0), (AM7, 1), (FMAJ7, 2), (G7, 3),
+        (CMAJ7, 4), (AM7, 5), (dm7, 6), (G7, 7),
+    ];
+
+    // Bass roots per bar (octave 2)
+    let bass_roots: &[u8] = &[36, 33, 29, 31, 36, 33, 38, 31]; // C2 A1 F1 G1 C2 A1 D2 G1
+    // Adjust to a more usable bass octave (C2=36 is fine, but A1=33 is low — bump up)
+    let bass_roots: &[u8] = &[36, 45, 41, 43, 36, 45, 38, 43]; // C2 A2 F2 G2 C2 A2 D2 G2
+
+    // Loop the 8-bar pattern twice (16 bars total).
+    for cycle in 0..2 {
+        let cycle_off = (cycle as f32) * 32.0;
+        for bar_idx in 0..8 {
+            let bar = cycle_off + (bar_idx as f32) * 4.0;
+            // Bass: quarter on beat 1, dotted-eighth+sixteenth pickup on beat 4
+            // (jazz-funk feel). Plus a 5th on beat 3 for movement.
+            let root = bass_roots[bar_idx];
+            let fifth = root + 7;
+            push_note(&mut v, bar + 0.0, root, 0.95, 88);
+            push_note(&mut v, bar + 2.0, fifth, 0.5, 80);
+            push_note(&mut v, bar + 2.5, root + 12, 0.5, 78);
+            push_note(&mut v, bar + 3.5, root + 5, 0.5, 76); // pickup to next bar
+
+            // Chord stabs: short, off the beat (back-beat aligned)
+            let chord = chord_plan[bar_idx].0;
+            for &n in chord {
+                push_note(&mut v, bar + 1.0, n, 0.4, 70);  // beat 2 stab
+                push_note(&mut v, bar + 3.0, n, 0.4, 70);  // beat 4 stab
+            }
+        }
+
+        // Treble hook (syncopated, 8 bars). Repeats with octave bump in second cycle.
+        let oct = if cycle == 0 { 0 } else { 12 };
+        let hook: &[(f32, u8, f32)] = &[
+            // Bar 1 — call
+            (0.5, 72, 0.5), (1.0, 76, 0.5), (1.5, 79, 1.0),
+            // Bar 2 — answer Am7
+            (4.5, 76, 0.5), (5.0, 72, 0.5), (5.5, 69, 1.5),
+            // Bar 3 — Fmaj7 lift
+            (8.5, 77, 0.5), (9.0, 81, 0.5), (9.5, 77, 1.0),
+            // Bar 4 — G7 build
+            (12.0, 74, 0.5), (12.5, 77, 0.5), (13.0, 79, 1.0),
+            // Bar 5 — restate
+            (16.5, 72, 0.5), (17.0, 76, 0.5), (17.5, 79, 1.0),
+            // Bar 6 — Am7
+            (20.5, 76, 0.5), (21.0, 72, 0.5), (21.5, 69, 1.0),
+            // Bar 7 — Dm7
+            (24.0, 74, 0.5), (24.5, 77, 0.5), (25.0, 81, 1.0),
+            (26.0, 79, 0.5), (26.5, 77, 0.5),
+            // Bar 8 — G7 turnaround
+            (28.0, 79, 0.5), (28.5, 77, 0.5), (29.0, 74, 0.5), (29.5, 72, 0.5),
+            (30.0, 71, 1.0),
+        ];
+        for &(b, n, d) in hook {
+            push_note(&mut v, cycle_off + b, n + oct, d, 95);
+        }
+    }
+    v
+}
+
+fn pick_drums(name: &str) -> Vec<DrumEvent> {
+    // Step grid: 16 steps per bar at 4/4. 120 BPM → step = 0.125 s.
+    // Bar 1 backbeat with busy hi-hat, fill on the 8th and 16th bar.
+    fn drums_groove() -> Vec<DrumEvent> {
+        let q = 60.0_f32 / 120.0;          // quarter
+        let step = q / 4.0;                // sixteenth
+        let bar = 16.0 * step;
+        let mut out = Vec::new();
+        // Pattern: 16 steps. K=kick, S=snare, H=hi-hat, .=rest.
+        const NORMAL: &str = "K.HHS.HHK.HHS.HH";
+        const FILL_8: &str = "K.HHS.HHK.HSHKHSS"; // last 4 steps fill (note: 17 chars; trim to 16)
+        const FILL_16: &str = "K.HHS.HHK.SSHKSSS"; // even bigger fill for end of cycle
+        for bar_idx in 0..16 {
+            let bar_start = (bar_idx as f32) * bar;
+            let pattern = if bar_idx == 7 {
+                // Trim FILL_8 to 16 chars if longer
+                let s = &FILL_8[..16.min(FILL_8.len())];
+                s
+            } else if bar_idx == 15 {
+                let s = &FILL_16[..16.min(FILL_16.len())];
+                s
+            } else {
+                NORMAL
+            };
+            out.extend(parse_drum_pattern(pattern, bar_start, step, 100));
+        }
+        out
+    }
+
+    match name {
+        "groove" => drums_groove(),
+        _ => Vec::new(),
+    }
+}
+
 fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
     match name {
         "c_progression" => Ok(piece_c_progression()),
@@ -1607,13 +1735,14 @@ fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
         "codex_punchout" => Ok(piece_assistant_uptempo()),
         "codex_railspike" => Ok(piece_codex_railspike()),
         "gemini_nocturne" => Ok(piece_gemini_nocturne()),
+        "groove" => Ok(piece_groove()),
         "gemini_boogie" => Ok(piece_gemini_boogie()),
         other => Err(format!(
             "unknown piece: {other} \
              (c_progression|minor_cadence|arpeggio|twinkle|bach_invention|\
               bach_prelude_c|fur_elise|gymnopedie|canon_d|blues_in_c|\
               maple_leaf_rag|entertainer|twelfth_street_rag|st_louis_blues|king_porter_stomp|\
-              assistant_internal|assistant_uptempo|codex_punchout|codex_railspike|gemini_nocturne|gemini_boogie)"
+              assistant_internal|assistant_uptempo|codex_punchout|codex_railspike|gemini_nocturne|gemini_boogie|groove)"
         )),
     }
 }
@@ -1731,6 +1860,34 @@ fn pan_for_note(midi_note: u8) -> f32 {
     const CENTRE: f32 = 60.0;
     const SPAN: f32 = 36.0;
     ((midi_note as f32 - CENTRE) / SPAN).clamp(-1.0, 1.0)
+}
+
+/// Mix drum events into a stereo bus (center pan, equal L/R).
+fn mix_drums(left: &mut [f32], right: &mut [f32], drums: &[DrumEvent]) {
+    let mut scratch: Vec<f32> = Vec::new();
+    let total = left.len();
+    for ev in drums {
+        let start = (ev.start_sec * SR as f32) as usize;
+        if start >= total {
+            continue;
+        }
+        let n = (ev.duration_sec() * SR as f32) as usize;
+        let n = n.min(total - start);
+        if n == 0 {
+            continue;
+        }
+        if scratch.len() < n {
+            scratch.resize(n, 0.0);
+        }
+        for s in scratch[..n].iter_mut() {
+            *s = 0.0;
+        }
+        ev.render(SR as f32, &mut scratch[..n], 0);
+        for i in 0..n {
+            left[start + i] += scratch[i];
+            right[start + i] += scratch[i];
+        }
+    }
 }
 
 fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<f32>), String> {
@@ -1901,6 +2058,11 @@ fn main() {
         events.len()
     );
 
+    let drums = pick_drums(&args.piece);
+    if !drums.is_empty() {
+        eprintln!("render_song: drum events = {}", drums.len());
+    }
+
     let (mut left, mut right) = match args.engine {
         Engine::SfzPiano => render_sfz_piece(&args, &events),
         _ => render_keysynth_piece(&args, &events),
@@ -1909,6 +2071,10 @@ fn main() {
         eprintln!("render_song: {e}");
         std::process::exit(2);
     });
+
+    if !drums.is_empty() {
+        mix_drums(&mut left, &mut right, &drums);
+    }
 
     let raw_peak_l = left.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
     let raw_peak_r = right.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
