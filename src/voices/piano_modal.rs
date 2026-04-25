@@ -845,6 +845,17 @@ impl VoiceImpl for ModalPianoVoice {
         }
     }
     fn trigger_release(&mut self) {
+        // Iter T: cut off any remaining hammer-noise excitation when
+        // the key is released. The Stage B noise tail is 250 ms long;
+        // on a quick keypress (chon-press, ~50 ms hold) that meant
+        // 200+ ms of noise still feeding the biquads AFTER the
+        // damper had engaged, producing extra envelope peaks at
+        // ~60/90/180 ms that the new attack-event diagnostic
+        // detected as 3 attacks vs SFZ's 1. Stopping the
+        // excitation playback at note_off lets the damped
+        // resonators actually decay cleanly instead of being
+        // re-excited mid-release.
+        self.excitation_idx = self.excitation.len();
         // Default behaviour: fade the output via ReleaseEnvelope (~0.3 s
         // multiplicative) AND engage the damper on the next render pass
         // so the resonators themselves stop ringing rather than just
