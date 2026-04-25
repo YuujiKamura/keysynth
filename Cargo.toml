@@ -24,8 +24,9 @@ serde_json = "1"
 # render_midi binary: parse SMF (Standard MIDI File) and play through any engine.
 midly = "0.5"
 
-# jukebox binary: simple egui WAV browser for A/B listening.
-rodio = { version = "0.20", default-features = false, features = ["wav"] }
+# jukebox binary: hand-rolled cpal mixer for sample-accurate A/B listening
+# (issue #7 Stage 1). rodio dropped in favour of a direct cpal::Stream
+# that sums N tracks per audio callback.
 
 [profile.release]
 opt-level = 3
