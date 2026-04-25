@@ -180,6 +180,172 @@ fn piece_bach_invention() -> Vec<NoteEvent> {
     v
 }
 
+fn piece_bach_prelude_c() -> Vec<NoteEvent> {
+    // Bach Prelude in C, BWV 846 (Well-Tempered Clavier I). Opening 4
+    // measures, sixteenth-note arpeggio pattern at ~80 BPM. Each
+    // measure repeats an 8-note bass+chord-arpeggio figure twice.
+    // Public domain (J.S. Bach, d. 1750).
+    let step = 0.20; // sixteenth at ~75 BPM
+    let dur = 0.8;
+    let mut v = Vec::new();
+    // Pattern: bass · then 4-note arpeggio · repeat (8 notes per measure).
+    // bass is held for the full measure (sixteen 16ths = 16·step).
+    let measures: &[(u8, u8, [u8; 4])] = &[
+        // (bass1, bass2, [arpeggio_4_notes])
+        (36, 48, [60, 64, 67, 72]), // m1: C2 C3 | C4 E4 G4 C5  (Cmaj)
+        (36, 50, [62, 65, 69, 74]), // m2: C2 D3 | D4 F4 A4 D5  (Dm7/C)
+        (35, 47, [62, 65, 67, 71]), // m3: B1 B2 | D4 F4 G4 B4  (G7/B)
+        (36, 48, [60, 64, 67, 72]), // m4: back to Cmaj
+    ];
+    for (mi, (b1, b2, arp)) in measures.iter().enumerate() {
+        let m_start = mi as f32 * 16.0 * step;
+        // Bass held for whole measure (slightly under so adjacent
+        // measures don't blur into each other through the modal damper).
+        v.push(NoteEvent {
+            start_sec: m_start,
+            midi_note: *b1,
+            duration_sec: 16.0 * step * 0.95,
+            velocity: 75,
+        });
+        v.push(NoteEvent {
+            start_sec: m_start,
+            midi_note: *b2,
+            duration_sec: 16.0 * step * 0.95,
+            velocity: 75,
+        });
+        // Two repeats of the 4-note arpeggio per measure.
+        for rep in 0..2 {
+            let r_start = m_start + rep as f32 * 4.0 * step;
+            for (i, &n) in arp.iter().enumerate() {
+                v.push(NoteEvent {
+                    start_sec: r_start + (i as f32 + 1.0) * step,
+                    midi_note: n,
+                    duration_sec: dur,
+                    velocity: 90,
+                });
+            }
+        }
+    }
+    v
+}
+
+fn piece_fur_elise() -> Vec<NoteEvent> {
+    // Beethoven, Bagatelle No. 25 in A minor "Für Elise", WoO 59.
+    // Opening 4-bar theme. Public domain (Beethoven d. 1827).
+    // 3/8 time, ~75 BPM → eighth = 0.27 s. Triplets = 0.135 s.
+    let dt = 0.27_f32;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0 * dt, 76, dt),       // E5
+        (1.0 * dt, 75, dt),       // D#5
+        (2.0 * dt, 76, dt),       // E5
+        (3.0 * dt, 75, dt),       // D#5
+        (4.0 * dt, 76, dt),       // E5
+        (5.0 * dt, 71, dt),       // B4
+        (6.0 * dt, 74, dt),       // D5
+        (7.0 * dt, 72, dt),       // C5
+        (8.0 * dt, 69, 2.0 * dt), // A4 (longer)
+        (10.5 * dt, 60, dt),      // C4
+        (11.5 * dt, 64, dt),      // E4
+        (12.5 * dt, 69, dt),      // A4
+        (13.5 * dt, 71, 2.0 * dt),// B4
+        (16.0 * dt, 64, dt),      // E4
+        (17.0 * dt, 68, dt),      // G#4
+        (18.0 * dt, 71, dt),      // B4
+        (19.0 * dt, 72, 2.0 * dt),// C5
+        (21.5 * dt, 64, dt),      // E4 lead-in
+        (22.5 * dt, 76, dt),      // E5 (theme repeat anchor)
+        (23.5 * dt, 75, dt),      // D#5
+    ];
+    let mut v: Vec<NoteEvent> = melody
+        .iter()
+        .map(|&(t, n, d)| NoteEvent {
+            start_sec: t,
+            midi_note: n,
+            duration_sec: d * 0.92,
+            velocity: 95,
+        })
+        .collect();
+    // Sparse left-hand: A2 octave on first beat of each pair of measures.
+    let bass: &[(f32, u8)] = &[
+        (8.0 * dt, 33),  // A2 under "A4" landing
+        (16.0 * dt, 28), // E2 under "E4 G#4 B4" run
+        (22.0 * dt, 33), // A2 reprise
+    ];
+    v.extend(bass.iter().map(|&(t, n)| NoteEvent {
+        start_sec: t,
+        midi_note: n,
+        duration_sec: 8.0 * dt * 0.95,
+        velocity: 70,
+    }));
+    v
+}
+
+fn piece_gymnopedie() -> Vec<NoteEvent> {
+    // Erik Satie, Gymnopédie No. 1 (1888). Opening 4 measures.
+    // 3/4 time at ~70 BPM → quarter = 0.857 s. Public domain
+    // (Satie d. 1925, work first published 1888 — well past
+    // any rights term in any jurisdiction).
+    let q = 0.857_f32;
+    let mut v = Vec::new();
+    // Left hand: bar 1 = D2 (beat 1), F#3+A3+C#4 (beat 2 chord),
+    // Pattern alternates between G2 and D2 bass with chord on beat 2/3.
+    // Simplified for the opening 4-bar phrase:
+    let bass: &[(f32, u8)] = &[
+        (0.0 * q, 38), // D2
+        (3.0 * q, 43), // G2
+        (6.0 * q, 38), // D2
+        (9.0 * q, 43), // G2
+    ];
+    let chords: &[(f32, [u8; 3])] = &[
+        (1.0 * q, [54, 57, 61]), // F#3 A3 C#4 (Dmaj7)
+        (2.0 * q, [54, 57, 61]),
+        (4.0 * q, [55, 59, 62]), // G3 B3 D4 (Gmaj triad)
+        (5.0 * q, [55, 59, 62]),
+        (7.0 * q, [54, 57, 61]),
+        (8.0 * q, [54, 57, 61]),
+        (10.0 * q, [55, 59, 62]),
+        (11.0 * q, [55, 59, 62]),
+    ];
+    // Melody: slow, sparse, mostly stepwise.
+    let melody: &[(f32, u8, f32)] = &[
+        (1.0 * q, 78, 2.0 * q),  // F#5
+        (3.0 * q, 79, q),        // G5
+        (4.0 * q, 78, q),        // F#5
+        (5.0 * q, 76, q),        // E5
+        (6.0 * q, 73, 2.0 * q),  // C#5
+        (8.0 * q, 75, q),        // D#5/Eb5
+        (9.0 * q, 73, q),        // C#5
+        (10.0 * q, 72, 2.0 * q), // C5 -> resolution
+    ];
+    for &(t, n) in bass {
+        v.push(NoteEvent {
+            start_sec: t,
+            midi_note: n,
+            duration_sec: q * 0.95,
+            velocity: 70,
+        });
+    }
+    for &(t, ns) in chords {
+        for &n in &ns {
+            v.push(NoteEvent {
+                start_sec: t,
+                midi_note: n,
+                duration_sec: q * 0.95,
+                velocity: 65,
+            });
+        }
+    }
+    for &(t, n, d) in melody {
+        v.push(NoteEvent {
+            start_sec: t,
+            midi_note: n,
+            duration_sec: d * 0.92,
+            velocity: 90,
+        });
+    }
+    v
+}
+
 fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
     match name {
         "c_progression" => Ok(piece_c_progression()),
@@ -187,9 +353,13 @@ fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
         "arpeggio" => Ok(piece_arpeggio()),
         "twinkle" => Ok(piece_twinkle()),
         "bach_invention" => Ok(piece_bach_invention()),
+        "bach_prelude_c" => Ok(piece_bach_prelude_c()),
+        "fur_elise" => Ok(piece_fur_elise()),
+        "gymnopedie" => Ok(piece_gymnopedie()),
         other => Err(format!(
             "unknown piece: {other} \
-             (c_progression|minor_cadence|arpeggio|twinkle|bach_invention)"
+             (c_progression|minor_cadence|arpeggio|twinkle|bach_invention|\
+              bach_prelude_c|fur_elise|gymnopedie)"
         )),
     }
 }
