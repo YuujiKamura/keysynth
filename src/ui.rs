@@ -425,6 +425,7 @@ const ENGINE_CHOICES: &[(&str, Engine)] = &[
     ("piano-thick", Engine::PianoThick),
     ("piano-lite", Engine::PianoLite),
     ("piano-5am", Engine::Piano5AM),
+    ("piano-modal", Engine::PianoModal),
     ("koto", Engine::Koto),
     ("sub", Engine::Sub),
     ("fm", Engine::Fm),

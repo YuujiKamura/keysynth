@@ -31,6 +31,7 @@ pub use crate::voices::ks::KsVoice;
 pub use crate::voices::ks_rich::KsRichVoice;
 pub use crate::voices::piano::{PianoPreset, PianoVoice, SoundboardKind};
 pub use crate::voices::piano_5am::Piano5AMVoice;
+pub use crate::voices::piano_modal::{ModalLut, ModalLutEntry, ModalPianoVoice, MODAL_LUT};
 pub use crate::voices::placeholder::SfPianoPlaceholder;
 pub use crate::voices::square::SquareVoice;
 pub use crate::voices::sub::SubVoice;
@@ -97,6 +98,16 @@ pub enum Engine {
     /// difference and the fix for the "音が出なくなる on rapid repeated
     /// keypresses" eviction bug that has been latent since pre-session.
     Piano5AM,
+    /// Modal-resonator-bank piano voice driven by a per-note LUT
+    /// extracted from SFZ Salamander references (issue #3 supervised
+    /// piano-realism path). Each MIDI note picks up its own
+    /// `(freq, T60, init_amp)` per partial from the LUT, falling back to
+    /// nearest-octave scaling for notes not in the LUT. The LUT is loaded
+    /// at startup from `--modal-lut PATH` or auto-discovered at
+    /// `bench-out/REF/sfz_salamander_multi/modal_lut.json`; if neither is
+    /// available the hardcoded C4 fallback (`ModalLut::fallback_c4`)
+    /// keeps the voice audible at MIDI 60.
+    PianoModal,
 }
 
 impl Engine {
@@ -106,7 +117,11 @@ impl Engine {
     /// (which was added at d0ad787 / 06:14, after 8f0df23 / 05:38), so
     /// running the bank under it would not be faithful to the captured
     /// tone. Sample-based engines (`SfPiano`, `SfzPiano`) and
-    /// non-piano engines also return false.
+    /// non-piano engines also return false. `PianoModal` is also
+    /// excluded: its tone is sample-derived (modes extracted directly
+    /// from the SFZ Salamander reference), so feeding it through the
+    /// shared sympathetic bank would double-resonate just like the SFZ
+    /// engine itself.
     pub fn is_piano_family(self) -> bool {
         matches!(self, Engine::Piano | Engine::PianoThick | Engine::PianoLite)
     }
@@ -856,6 +871,29 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
             velocity,
         )),
         Engine::Piano5AM => Box::new(Piano5AMVoice::new(sr, freq, velocity)),
+        Engine::PianoModal => {
+            // Recover MIDI note from frequency: midi = 12·log2(f/440) + 69.
+            // `make_voice` doesn't carry the note number directly, but
+            // round-trip is lossless for equal-tempered inputs (which is
+            // what `midi_to_freq(note)` upstream produces). For pitch-bent
+            // / micro-tuned inputs this rounds to the nearest semitone,
+            // which is the right behaviour for nearest-LUT-entry lookup.
+            let midi_note = (((freq.max(1.0) / 440.0).log2() * 12.0) + 69.0)
+                .round()
+                .clamp(0.0, 127.0) as u8;
+            // Use the process-wide LUT if it's been initialised by the
+            // host binary; otherwise fall back to the hardcoded C4 entry
+            // so even unit tests / harnesses that don't call
+            // `MODAL_LUT.set(...)` produce sound.
+            if let Some(lut) = MODAL_LUT.get() {
+                Box::new(ModalPianoVoice::from_lut(lut, sr, midi_note, velocity))
+            } else {
+                let fallback = ModalLut::fallback_c4();
+                Box::new(ModalPianoVoice::from_lut(
+                    &fallback, sr, midi_note, velocity,
+                ))
+            }
+        }
     }
 }
 
@@ -1670,6 +1708,20 @@ mod tests {
         assert!(nonzero_peak(&buf) > 0.0);
     }
 
+    #[test]
+    fn make_voice_piano_modal_renders() {
+        // No MODAL_LUT.set() call here — `make_voice` must fall back to
+        // the hardcoded C4 LUT and still produce audible output for note
+        // 60. Even a single-sample delta excitation × b0 ≈ 1e-4 should
+        // give a peak above 0.
+        let mut v = make_voice(Engine::PianoModal, SR, 261.63, 100);
+        let buf = render_n(v.as_mut(), 4096);
+        assert!(
+            nonzero_peak(&buf) > 0.0,
+            "PianoModal produced silent output even with C4 fallback"
+        );
+    }
+
     // --- Eviction-policy regression --------------------------------------
     //
     // Pre-refactor bug: most voice impls forgot to override `is_releasing`,
@@ -1692,6 +1744,7 @@ mod tests {
             Engine::SfPiano,
             Engine::SfzPiano,
             Engine::PianoThick,
+            Engine::PianoModal,
         ];
         for engine in engines.iter().copied() {
             let mut v = make_voice(engine, SR, 440.0, 100);

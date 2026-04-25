@@ -32,7 +32,8 @@ use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
 use keysynth::sympathetic::SympatheticBank;
 use keysynth::synth::{
-    make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, Voice, VoiceImpl,
+    make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, ModalLut, Voice, VoiceImpl,
+    MODAL_LUT,
 };
 use keysynth::ui;
 
@@ -60,6 +61,11 @@ struct Args {
     ir_path: Option<PathBuf>,
     reverb_wet: f32,
     mix_mode: MixMode,
+    /// Optional path to the per-note modal LUT JSON consumed by
+    /// `Engine::PianoModal`. When `None`, auto-discovery looks at
+    /// `bench-out/REF/sfz_salamander_multi/modal_lut.json` and falls back
+    /// to the hardcoded C4 entry if that path doesn't exist.
+    modal_lut: Option<PathBuf>,
 }
 
 impl Default for Args {
@@ -91,6 +97,7 @@ impl Default for Args {
             // ParallelComp via GUI dropdown / `--mix-mode <label>`.
             // Issue #4 phase 1.
             mix_mode: MixMode::Plain,
+            modal_lut: None,
         }
     }
 }
@@ -116,8 +123,9 @@ fn parse_args() -> Result<Args, String> {
                     "piano-thick" => Engine::PianoThick,
                     "piano-lite" => Engine::PianoLite,
                     "piano-5am" => Engine::Piano5AM,
+                    "piano-modal" => Engine::PianoModal,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick|piano-lite|piano-5am)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick|piano-lite|piano-5am|piano-modal)"
                     )),
                 };
             }
@@ -158,6 +166,11 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("bad --reverb: {e}"))?
                     .clamp(0.0, 1.0);
             }
+            "--modal-lut" => {
+                out.modal_lut = Some(PathBuf::from(
+                    iter.next().ok_or("--modal-lut needs a path")?,
+                ));
+            }
             "--mix-mode" => {
                 let v = iter.next().ok_or("--mix-mode needs a label")?;
                 out.mix_mode = MixMode::from_label(&v)
@@ -197,6 +210,9 @@ fn print_help() {
             --ir PATH         WAV impulse response for body reverb\n  \
                               (default: built-in synthetic piano body IR)\n  \
             --reverb FLOAT    Reverb wet 0..1 (default: 0 = dry)\n  \
+            --modal-lut PATH  JSON LUT for --engine piano-modal\n  \
+                              (default: bench-out/REF/sfz_salamander_multi/modal_lut.json,\n  \
+                               with hardcoded C4 fallback if missing)\n  \
             --list            List MIDI input ports and exit\n  \
             -h, --help        Show this help"
     );
@@ -262,6 +278,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+    }
+
+    // -- Modal LUT (piano-modal engine) --
+    //
+    // Loaded once at startup and stashed in the process-wide `MODAL_LUT`
+    // OnceLock so `make_voice(Engine::PianoModal, ...)` can read it
+    // without locking. Always populated (even when piano-modal isn't the
+    // initial engine) because the GUI lets the user switch engines at
+    // runtime — pre-loading avoids a stutter on first piano-modal note.
+    {
+        let (lut, source) = ModalLut::auto_load(args.modal_lut.as_deref());
+        eprintln!("keysynth: modal LUT source = {source}");
+        // OnceLock::set returns Err(value) if already set; harmless here
+        // because we control the only call site, but we still want to
+        // tolerate accidental double-init in tests / future refactors.
+        let _ = MODAL_LUT.set(lut);
     }
 
     let mut midi_in = MidiInput::new("keysynth")?;
