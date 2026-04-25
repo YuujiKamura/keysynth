@@ -40,7 +40,7 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
-use keysynth::synth::{make_voice, midi_to_freq, Engine};
+use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
 
 const SR: u32 = 44100;
 
@@ -58,6 +58,11 @@ struct BenchArgs {
     reverb_wet: f32,
     ir_path: Option<PathBuf>,
     sfz_path: Option<PathBuf>,
+    /// Optional explicit path to the modal LUT JSON used by
+    /// `Engine::PianoModal`. When `None`, the auto-discovery path
+    /// `bench-out/REF/sfz_salamander_multi/modal_lut.json` is tried; if
+    /// that fails the hardcoded C4 fallback fires.
+    modal_lut_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +85,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&args.out_dir)?;
     let total_samples = (args.duration_sec * SR as f32) as usize;
     let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);
+
+    // Initialise the process-wide modal LUT only when piano-modal is the
+    // engine under test; for every other engine the LUT load is wasted
+    // I/O. `OnceLock::set` is idempotent within a single bench run (no
+    // unwrap — silently ignore the "already set" Err so repeat runs in
+    // the same process don't panic).
+    if args.engine == Engine::PianoModal {
+        let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
+        eprintln!("bench: modal LUT source = {source}");
+        let _ = MODAL_LUT.set(lut);
+    }
 
     eprintln!(
         "bench: note={} ({:.2} Hz) vel={} hold={:.2}s total={:.2}s sr={} \
@@ -293,6 +309,7 @@ fn engine_slug(e: Engine) -> &'static str {
         Engine::PianoThick => "piano-thick",
         Engine::PianoLite => "piano-lite",
         Engine::Piano5AM => "piano-5am",
+        Engine::PianoModal => "piano-modal",
     }
 }
 
@@ -310,6 +327,7 @@ fn parse_args() -> Result<BenchArgs, String> {
     let mut reverb_wet: f32 = 0.0;
     let mut ir_path: Option<PathBuf> = None;
     let mut sfz_path: Option<PathBuf> = None;
+    let mut modal_lut_path: Option<PathBuf> = None;
 
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -360,6 +378,7 @@ fn parse_args() -> Result<BenchArgs, String> {
                     "piano-thick" => Engine::PianoThick,
                     "piano-lite" => Engine::PianoLite,
                     "piano-5am" => Engine::Piano5AM,
+                    "piano-modal" => Engine::PianoModal,
                     other => return Err(format!("unknown engine: {other}")),
                 };
             }
@@ -407,6 +426,11 @@ fn parse_args() -> Result<BenchArgs, String> {
             "--sfz" => {
                 sfz_path = Some(PathBuf::from(iter.next().ok_or("--sfz needs a path")?));
             }
+            "--modal-lut" => {
+                modal_lut_path = Some(PathBuf::from(
+                    iter.next().ok_or("--modal-lut needs a path")?,
+                ));
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -451,6 +475,7 @@ fn parse_args() -> Result<BenchArgs, String> {
         reverb_wet,
         ir_path,
         sfz_path,
+        modal_lut_path,
     })
 }
 

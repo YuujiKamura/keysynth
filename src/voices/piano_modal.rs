@@ -29,6 +29,11 @@
 //! release envelope multiplies the summed output, identical to the
 //! existing physical voices.
 
+use std::path::Path;
+use std::sync::OnceLock;
+
+use serde::{Deserialize, Serialize};
+
 use crate::synth::{ReleaseEnvelope, VoiceImpl};
 
 /// One modal resonance: (f, T60, gain). `init_amp` is the LINEAR
@@ -225,6 +230,286 @@ impl ModalPianoVoice {
         let excitation = vec![1.0_f32];
         Self::with_modes(sr, modes, excitation, velocity_amp)
     }
+
+    /// Construct a voice for `midi_note` from a runtime-loaded `ModalLut`
+    /// (per-note partial / T60 / init_db table; issue #3 A3).
+    ///
+    /// Pick strategy: nearest-neighbour by `|entry.midi_note - midi_note|`.
+    /// The chosen entry's modes are then frequency-scaled by the ratio
+    /// `target_f0 / nearest.f0_hz`, where `target_f0` is the equal-tempered
+    /// pitch for `midi_note` (A4 = 440 Hz). T60 and init_db are kept as-is
+    /// (we don't have a model for how T60 should scale across notes; the
+    /// nearest entry's measured T60 is the best estimate available).
+    ///
+    /// T60 sentinel handling: any mode with `t60_sec <= 0` is treated as
+    /// "extractor failed" and substituted with `12.0` s, the same default
+    /// as `bin/render_modal --default-t60`.
+    ///
+    /// Empty LUT panics: callers must guarantee `lut.entries` is non-empty
+    /// (the auto-load path enforces this — fallback C4 LUT is always at
+    /// least 1 entry).
+    pub fn from_lut(lut: &ModalLut, sr: f32, midi_note: u8, velocity: u8) -> Self {
+        let entry = lut.nearest_entry(midi_note);
+        let target_f0 = 440.0_f32 * 2.0_f32.powf((midi_note as f32 - 69.0) / 12.0);
+        let ratio = if entry.f0_hz > 0.0 {
+            target_f0 / entry.f0_hz
+        } else {
+            1.0
+        };
+        const FALLBACK_T60: f32 = 12.0;
+        let modes: Vec<Mode> = entry
+            .modes
+            .iter()
+            .map(|m| Mode {
+                freq_hz: m.freq_hz * ratio,
+                t60_sec: if m.t60_sec > 0.0 {
+                    m.t60_sec
+                } else {
+                    FALLBACK_T60
+                },
+                init_amp: m.init_amp,
+            })
+            .collect();
+        let velocity_amp = (velocity.max(1) as f32) / 127.0;
+        let excitation = vec![1.0_f32];
+        Self::with_modes(sr, &modes, excitation, velocity_amp)
+    }
+}
+
+// ===========================================================================
+// Modal LUT (per-note partial / T60 / init_db table)
+// ===========================================================================
+
+/// On-disk JSON representation of one mode within a per-note entry. Uses
+/// `init_db` (decibels) on disk because the upstream extractor reports
+/// dB; we convert to linear `init_amp` at parse time so the runtime
+/// `Mode` shape stays uniform.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct ModalLutModeJson {
+    pub freq_hz: f32,
+    pub t60_sec: f32,
+    pub init_db: f32,
+}
+
+/// On-disk attack envelope summary (informational; not yet used to shape
+/// the hammer impulse, but parsed so the schema round-trips losslessly).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct ModalLutAttackJson {
+    #[serde(default)]
+    pub time_to_peak_s: f32,
+    #[serde(default)]
+    pub peak_db: f32,
+    #[serde(default)]
+    pub post_peak_slope_db_s: f32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModalLutEntryJson {
+    pub midi_note: u8,
+    pub f0_hz: f32,
+    pub modes: Vec<ModalLutModeJson>,
+    #[serde(default)]
+    pub attack: Option<ModalLutAttackJson>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModalLutJson {
+    pub schema_version: u32,
+    pub lut: Vec<ModalLutEntryJson>,
+}
+
+/// One per-note entry in the modal LUT. Holds the linear-amplitude
+/// `Mode` triples already converted from the on-disk dB representation,
+/// plus the source MIDI note and measured fundamental for nearest-neighbour
+/// scaling in `ModalPianoVoice::from_lut`.
+#[derive(Clone, Debug)]
+pub struct ModalLutEntry {
+    pub midi_note: u8,
+    pub f0_hz: f32,
+    pub modes: Vec<Mode>,
+    pub time_to_peak_s: f32,
+    pub peak_db: f32,
+    pub post_peak_slope_db_s: f32,
+}
+
+/// Per-note modal partials / T60 / init_amp table. Built from a JSON file
+/// (produced by `bin/build_modal_lut`) or from the hardcoded C4 fallback
+/// when the JSON isn't available.
+#[derive(Clone, Debug)]
+pub struct ModalLut {
+    pub entries: Vec<ModalLutEntry>,
+}
+
+/// Process-wide modal LUT, set once at startup by `main`. Read by
+/// `synth::make_voice` when `Engine::PianoModal` is selected. Using a
+/// `OnceLock` keeps the audio thread lock-free after startup; the LUT
+/// itself is `Clone` but every voice needs only a borrowed view, so we
+/// just keep one instance.
+pub static MODAL_LUT: OnceLock<ModalLut> = OnceLock::new();
+
+/// Errors produced by `ModalLut::from_json_path`.
+#[derive(Debug)]
+pub enum ModalLutError {
+    Io(std::io::Error),
+    Parse(serde_json::Error),
+    SchemaVersion(u32),
+    Empty,
+}
+
+impl std::fmt::Display for ModalLutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "modal LUT I/O error: {e}"),
+            Self::Parse(e) => write!(f, "modal LUT parse error: {e}"),
+            Self::SchemaVersion(v) => write!(f, "modal LUT unsupported schema_version: {v}"),
+            Self::Empty => write!(f, "modal LUT is empty (no per-note entries)"),
+        }
+    }
+}
+
+impl std::error::Error for ModalLutError {}
+
+impl From<std::io::Error> for ModalLutError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for ModalLutError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Parse(e)
+    }
+}
+
+impl ModalLut {
+    /// Load a modal LUT from a JSON file produced by `bin/build_modal_lut`.
+    /// On-disk schema:
+    /// ```json
+    /// {
+    ///   "schema_version": 1,
+    ///   "lut": [
+    ///     {
+    ///       "midi_note": 60,
+    ///       "f0_hz": 261.63,
+    ///       "modes": [{ "freq_hz": 261.6, "t60_sec": 18.14, "init_db": -2.7 }, ...],
+    ///       "attack": { "time_to_peak_s": 0.039, "peak_db": -7.62, "post_peak_slope_db_s": -10.37 }
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    /// `init_db` is converted to linear `init_amp = 10^(init_db/20)` here
+    /// so the runtime `Mode` shape stays unified with the rest of the
+    /// modal pipeline (`Mode::init_amp` is always linear).
+    pub fn from_json_path(path: &Path) -> Result<Self, ModalLutError> {
+        let raw = std::fs::read(path)?;
+        let json: ModalLutJson = serde_json::from_slice(&raw)?;
+        if json.schema_version != 1 {
+            return Err(ModalLutError::SchemaVersion(json.schema_version));
+        }
+        if json.lut.is_empty() {
+            return Err(ModalLutError::Empty);
+        }
+        let entries: Vec<ModalLutEntry> = json
+            .lut
+            .into_iter()
+            .map(|e| {
+                let modes: Vec<Mode> = e
+                    .modes
+                    .iter()
+                    .map(|m| Mode {
+                        freq_hz: m.freq_hz,
+                        t60_sec: m.t60_sec,
+                        init_amp: 10f32.powf(m.init_db / 20.0),
+                    })
+                    .collect();
+                let attack = e.attack.unwrap_or_default();
+                ModalLutEntry {
+                    midi_note: e.midi_note,
+                    f0_hz: e.f0_hz,
+                    modes,
+                    time_to_peak_s: attack.time_to_peak_s,
+                    peak_db: attack.peak_db,
+                    post_peak_slope_db_s: attack.post_peak_slope_db_s,
+                }
+            })
+            .collect();
+        Ok(Self { entries })
+    }
+
+    /// Hardcoded C4 fallback LUT used when no JSON file is available.
+    /// Mirrors `ANALYSE_LUT_C4` from `bin/render_modal.rs`: the SFZ
+    /// Salamander Grand V3 C4 reference's first 8 partials as measured
+    /// by the existing `analyse` binary. Sufficient to keep
+    /// `Engine::PianoModal` audible at MIDI 60 in dev/test runs that
+    /// haven't built the per-note LUT yet.
+    pub fn fallback_c4() -> Self {
+        const ANALYSE_LUT_C4: [(f32, f32, f32); 8] = [
+            (261.6, 18.14, -2.7),
+            (523.1, 11.21, 0.0),
+            (785.6, 9.58, -18.5),
+            (1048.8, 7.38, -18.4),
+            (1311.7, 6.98, -14.3),
+            (1577.3, 7.93, -26.1),
+            (1843.7, 8.98, -17.4),
+            (2111.5, 8.66, -32.9),
+        ];
+        let modes: Vec<Mode> = ANALYSE_LUT_C4
+            .iter()
+            .map(|&(f, t60, db)| Mode {
+                freq_hz: f,
+                t60_sec: t60,
+                init_amp: 10f32.powf(db / 20.0),
+            })
+            .collect();
+        Self {
+            entries: vec![ModalLutEntry {
+                midi_note: 60,
+                f0_hz: 261.63,
+                modes,
+                time_to_peak_s: 0.039,
+                peak_db: -7.62,
+                post_peak_slope_db_s: -10.37,
+            }],
+        }
+    }
+
+    /// Auto-load helper used by `main` and `bin/bench`. Tries
+    /// `--modal-lut PATH` (if `Some`); otherwise tries the conventional
+    /// `bench-out/REF/sfz_salamander_multi/modal_lut.json`. If neither
+    /// loads cleanly, falls back to the hardcoded C4 entry so
+    /// `Engine::PianoModal` still produces sound at MIDI 60.
+    ///
+    /// Returns the source description as the second tuple element so the
+    /// caller can log which path was actually used (real JSON vs C4
+    /// fallback).
+    pub fn auto_load(explicit: Option<&Path>) -> (Self, String) {
+        let default_path = Path::new("bench-out/REF/sfz_salamander_multi/modal_lut.json");
+        let candidate = explicit.unwrap_or(default_path);
+        match Self::from_json_path(candidate) {
+            Ok(lut) => {
+                let n = lut.entries.len();
+                (lut, format!("{} ({n} entries)", candidate.display()))
+            }
+            Err(e) => (
+                Self::fallback_c4(),
+                format!(
+                    "hardcoded C4 fallback (loading {} failed: {e})",
+                    candidate.display()
+                ),
+            ),
+        }
+    }
+
+    /// Find the entry whose `midi_note` is closest to `midi_note`.
+    /// Ties broken by lower midi_note (stable: the iterator returns the
+    /// first minimum). Panics if `entries` is empty — the auto-load path
+    /// guarantees at least the hardcoded C4 entry is present.
+    pub fn nearest_entry(&self, midi_note: u8) -> &ModalLutEntry {
+        self.entries
+            .iter()
+            .min_by_key(|e| (e.midi_note as i32 - midi_note as i32).unsigned_abs())
+            .expect("ModalLut::nearest_entry called on empty LUT")
+    }
 }
 
 impl VoiceImpl for ModalPianoVoice {
@@ -385,6 +670,157 @@ mod tests {
         for &s in &buf {
             assert_eq!(s, 0.0, "empty modal bank produced non-zero sample");
         }
+    }
+
+    // -- ModalLut / from_lut path -----------------------------------------
+
+    fn one_entry_lut(midi_note: u8, f0_hz: f32, modes: Vec<Mode>) -> ModalLut {
+        ModalLut {
+            entries: vec![ModalLutEntry {
+                midi_note,
+                f0_hz,
+                modes,
+                time_to_peak_s: 0.0,
+                peak_db: 0.0,
+                post_peak_slope_db_s: 0.0,
+            }],
+        }
+    }
+
+    /// Exact-note hit: `from_lut` for the LUT's own `midi_note` should
+    /// keep mode frequencies on-pitch (modulo the ±0.7 cents 3-string
+    /// detune `with_modes` injects). Each LUT mode expands into 3
+    /// resonators whose centre frequencies bracket the original.
+    #[test]
+    fn from_lut_exact_match_uses_lut_directly() {
+        let lut = one_entry_lut(
+            60,
+            261.63,
+            vec![
+                Mode {
+                    freq_hz: 261.6,
+                    t60_sec: 1.0,
+                    init_amp: 1.0,
+                },
+                Mode {
+                    freq_hz: 523.1,
+                    t60_sec: 0.8,
+                    init_amp: 0.5,
+                },
+            ],
+        );
+        let v = ModalPianoVoice::from_lut(&lut, SR, 60, 100);
+        // 2 modes × 3 detune sub-modes = 6 resonators, frequency-ordered
+        // around their centres. Recover each centre frequency from the
+        // resonator's `cos_omega` and compare against the LUT.
+        assert_eq!(v.resonators.len(), 6);
+        let recovered: Vec<f32> = v
+            .resonators
+            .iter()
+            .map(|r| r.cos_omega.acos() * SR / (2.0 * std::f32::consts::PI))
+            .collect();
+        // Sub-modes for f1 = 261.6: centre and ±0.7 cents.
+        // Centre band straddles 261.6.
+        let f1_band = &recovered[0..3];
+        let f1_min = f1_band.iter().copied().fold(f32::MAX, f32::min);
+        let f1_max = f1_band.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            f1_min < 261.6 && f1_max > 261.6,
+            "f1 sub-modes don't bracket: {f1_band:?}"
+        );
+        // ±0.7 cents at 261.6 Hz is ±0.106 Hz; allow generous slack.
+        assert!(
+            (f1_min - 261.6).abs() < 0.5,
+            "f1 lower flank far off: {f1_min}"
+        );
+        let f2_band = &recovered[3..6];
+        let f2_min = f2_band.iter().copied().fold(f32::MAX, f32::min);
+        let f2_max = f2_band.iter().copied().fold(f32::MIN, f32::max);
+        assert!(
+            f2_min < 523.1 && f2_max > 523.1,
+            "f2 sub-modes don't bracket: {f2_band:?}"
+        );
+    }
+
+    /// LUT only has note 60 (C4). Calling `from_lut` for note 72 (C5)
+    /// should scale every mode frequency by 2.0 (one octave up).
+    #[test]
+    fn from_lut_nearest_octave_scales_correctly() {
+        let lut = one_entry_lut(
+            60,
+            261.63,
+            vec![
+                Mode {
+                    freq_hz: 261.63,
+                    t60_sec: 1.0,
+                    init_amp: 1.0,
+                },
+                Mode {
+                    freq_hz: 523.25,
+                    t60_sec: 0.8,
+                    init_amp: 0.5,
+                },
+            ],
+        );
+        let v = ModalPianoVoice::from_lut(&lut, SR, 72, 100);
+        assert_eq!(v.resonators.len(), 6);
+        // Recover sub-mode centres and check they scale by 2.0 (with
+        // ratio = 440·2^((72-69)/12) / 261.63 = 523.25 / 261.63 ≈ 2.0).
+        let recovered: Vec<f32> = v
+            .resonators
+            .iter()
+            .map(|r| r.cos_omega.acos() * SR / (2.0 * std::f32::consts::PI))
+            .collect();
+        // f1 centre band should sit around 523.25 Hz (261.63 × 2).
+        let f1_centre = recovered[1];
+        assert!(
+            (f1_centre - 523.25).abs() < 1.0,
+            "f1 octave scale wrong: got {f1_centre}, expected ~523.25"
+        );
+        // f2 centre band should sit around 1046.5 Hz (523.25 × 2).
+        let f2_centre = recovered[4];
+        assert!(
+            (f2_centre - 1046.5).abs() < 2.0,
+            "f2 octave scale wrong: got {f2_centre}, expected ~1046.5"
+        );
+    }
+
+    /// Sentinel T60 = -1 (extractor failure marker) → resonator should
+    /// be built with the 12 s fallback, not blow up with a tiny pole
+    /// radius and produce silence / NaN.
+    #[test]
+    fn from_lut_handles_t60_sentinel() {
+        let lut = one_entry_lut(
+            60,
+            261.63,
+            vec![Mode {
+                freq_hz: 261.63,
+                t60_sec: -1.0,
+                init_amp: 1.0,
+            }],
+        );
+        let v = ModalPianoVoice::from_lut(&lut, SR, 60, 100);
+        assert_eq!(v.resonators.len(), 3);
+        // Pole radius for 12 s T60 at 44100 Hz: r ≈ 0.99987.
+        // r² should be > 0.999.
+        for r in &v.resonators {
+            assert!(
+                r.a2 > 0.999,
+                "sentinel T60 not substituted with 12 s fallback: a2={}",
+                r.a2
+            );
+        }
+    }
+
+    /// Auto-load with no real JSON path falls back to the hardcoded C4
+    /// entry; the resulting LUT must be non-empty so `nearest_entry`
+    /// can't panic.
+    #[test]
+    fn modal_lut_fallback_c4_has_one_entry() {
+        let lut = ModalLut::fallback_c4();
+        assert_eq!(lut.entries.len(), 1);
+        assert_eq!(lut.entries[0].midi_note, 60);
+        assert_eq!(lut.entries[0].modes.len(), 8);
     }
 
     #[test]
