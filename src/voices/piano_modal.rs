@@ -202,13 +202,19 @@ impl ModalPianoVoice {
             resonators,
             excitation: scaled_excitation,
             excitation_idx: 0,
-            damper_t60_sec: 0.12,
+            // Damper T60 raised 0.12 → 0.8 s after live A/B against SFZ
+            // ("音圧が足りない" feedback): 0.12 s killed modes within
+            // ~0.4 s of note_off while SFZ samples sustain ~1.5-3 s.
+            // 0.8 s effective T60 gives ~2.6 s audible tail (-20 dB at
+            // T60/3, well above floor) — closer to the recorded
+            // release envelope.
+            damper_t60_sec: 0.8,
             damper_pending: false,
-            release: ReleaseEnvelope::new(0.300, sr),
+            release: ReleaseEnvelope::new(0.800, sr),
         }
     }
 
-    /// Override the damper T60 (default 0.12 s). Useful for the una-corda
+    /// Override the damper T60 (default 0.8 s). Useful for the una-corda
     /// (slower damper) or for the SF2 placeholder pattern where dampers
     /// are emulated by silence (set very small).
     pub fn set_damper_t60_sec(&mut self, t60_sec: f32) {
@@ -257,17 +263,52 @@ impl ModalPianoVoice {
             1.0
         };
         const FALLBACK_T60: f32 = 12.0;
+
+        // Per-partial T60 floor. The `extract::t60` extractor systematically
+        // under-reports T60 on some partials (h2 ≈ 2 s vs analyse's 11 s
+        // because near-equal-amplitude detuned-string beating defeats the
+        // R²/slope gate). For perceptual realism we floor each T60 to a
+        // partial-index-aware minimum that mirrors the empirical decay
+        // curve of a real grand piano (h1 longest, monotone descent).
+        // Visualised diff vs SFZ ("音圧が足りない") showed the modal voice
+        // was crashing to silence ~30 dB below the SFZ sustain floor;
+        // the LUT-reported T60s were the dominant reason.
+        fn t60_floor_for_partial(n: usize) -> f32 {
+            // Matches analyse's reference values for SFZ Salamander C4
+            // (h1=18, h2=11, h3=10, h4=7, h5=7, h6=8, h7=9, h8=9...);
+            // beyond h8 we extrapolate downward on a gentle slope.
+            match n {
+                0 | 1 => 18.0,
+                2 => 10.0,
+                3 => 9.0,
+                4 => 7.0,
+                5 => 7.0,
+                6 => 7.5,
+                7 => 8.0,
+                8 => 8.0,
+                _ => (8.0_f32 - (n as f32 - 8.0) * 0.4).max(3.0),
+            }
+        }
+
         let modes: Vec<Mode> = entry
             .modes
             .iter()
-            .map(|m| Mode {
-                freq_hz: m.freq_hz * ratio,
-                t60_sec: if m.t60_sec > 0.0 {
+            .enumerate()
+            .map(|(i, m)| {
+                // i+1 = partial index 1..N, matching the n=1 .. fundamental
+                // numbering used in the extract crate.
+                let n = i + 1;
+                let raw = if m.t60_sec > 0.0 {
                     m.t60_sec
                 } else {
                     FALLBACK_T60
-                },
-                init_amp: m.init_amp,
+                };
+                let t60 = raw.max(t60_floor_for_partial(n));
+                Mode {
+                    freq_hz: m.freq_hz * ratio,
+                    t60_sec: t60,
+                    init_amp: m.init_amp,
+                }
             })
             .collect();
         let velocity_amp = (velocity.max(1) as f32) / 127.0;

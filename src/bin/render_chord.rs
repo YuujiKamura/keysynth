@@ -1,0 +1,347 @@
+//! Render a chord (3+ simultaneous MIDI notes) through any engine and
+//! write to a mono WAV. Used to build the SFZ Salamander chord-level
+//! ground-truth set and to render modal/keysynth candidates against
+//! that same chord configuration for A/B comparison.
+//!
+//! Why a separate bin: the existing `bench` binary renders one note
+//! at a time. Single-note evaluation hides the polyphony-stacking
+//! artifact that the listener flagged as "和音が不自然なハードル";
+//! GT and candidate renders both need to be at chord level to make
+//! the comparison meaningful.
+//!
+//! Usage:
+//!     render_chord --engine ENGINE --notes "60,64,67" \
+//!                  --duration 5 --hold 3 \
+//!                  [--sfz PATH] [--velocity V] \
+//!                  --out bench-out/path.wav
+//!
+//! For `sfz-piano` the `--sfz PATH` argument is required (or the
+//! Salamander SFZ is auto-discovered at the path used by the live
+//! synth). For keysynth engines (`square`/`ks`/`piano-modal`/etc.) the
+//! voices are constructed via `make_voice` for each note and summed
+//! into a shared mono buffer, then peak-normalised to -3 dBFS.
+
+use std::env;
+use std::path::PathBuf;
+
+use hound::{SampleFormat, WavSpec, WavWriter};
+
+use keysynth::sfz::SfzPlayer;
+use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
+
+const SR: u32 = 44100;
+
+struct Args {
+    engine: Engine,
+    notes: Vec<u8>,
+    velocity: u8,
+    duration_sec: f32,
+    hold_sec: f32,
+    sfz_path: Option<PathBuf>,
+    out_path: PathBuf,
+    modal_lut_path: Option<PathBuf>,
+    /// Stagger note onsets by N ms so simultaneous-key strikes don't
+    /// land on bit-identical sample 0 across voices. Real piano players
+    /// can't perfectly synchronise fingers; recorded chords always have
+    /// 1-5 ms inter-onset jitter. 0 = perfectly aligned (the current
+    /// modal voice's failure mode in chord context).
+    onset_jitter_ms: f32,
+}
+
+fn parse_args() -> Result<Args, String> {
+    let mut engine: Option<Engine> = None;
+    let mut notes: Vec<u8> = Vec::new();
+    let mut velocity: u8 = 100;
+    let mut duration_sec: f32 = 5.0;
+    let mut hold_sec: f32 = 3.0;
+    let mut sfz_path: Option<PathBuf> = None;
+    let mut out_path: Option<PathBuf> = None;
+    let mut modal_lut_path: Option<PathBuf> = None;
+    let mut onset_jitter_ms: f32 = 0.0;
+
+    let mut iter = env::args().skip(1);
+    while let Some(a) = iter.next() {
+        match a.as_str() {
+            "--engine" => {
+                let v = iter.next().ok_or("--engine needs a value")?;
+                engine = Some(match v.as_str() {
+                    "square" => Engine::Square,
+                    "ks" => Engine::Ks,
+                    "ks-rich" => Engine::KsRich,
+                    "sub" => Engine::Sub,
+                    "fm" => Engine::Fm,
+                    "piano" => Engine::Piano,
+                    "koto" => Engine::Koto,
+                    "sfz-piano" => Engine::SfzPiano,
+                    "piano-thick" => Engine::PianoThick,
+                    "piano-lite" => Engine::PianoLite,
+                    "piano-5am" => Engine::Piano5AM,
+                    "piano-modal" => Engine::PianoModal,
+                    other => return Err(format!("unknown engine: {other}")),
+                });
+            }
+            "--notes" => {
+                let v = iter.next().ok_or("--notes needs a value (e.g. 60,64,67)")?;
+                for tok in v.split(|c: char| c == ',' || c.is_whitespace()) {
+                    let t = tok.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    notes.push(t.parse().map_err(|e| format!("bad note '{t}': {e}"))?);
+                }
+            }
+            "--velocity" => {
+                velocity = iter
+                    .next()
+                    .ok_or("--velocity needs an integer")?
+                    .parse()
+                    .map_err(|e| format!("bad --velocity: {e}"))?;
+            }
+            "--duration" => {
+                duration_sec = iter
+                    .next()
+                    .ok_or("--duration needs a float")?
+                    .parse()
+                    .map_err(|e| format!("bad --duration: {e}"))?;
+            }
+            "--hold" => {
+                hold_sec = iter
+                    .next()
+                    .ok_or("--hold needs a float")?
+                    .parse()
+                    .map_err(|e| format!("bad --hold: {e}"))?;
+            }
+            "--sfz" => {
+                sfz_path = Some(PathBuf::from(iter.next().ok_or("--sfz needs a path")?));
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(iter.next().ok_or("--out needs a path")?));
+            }
+            "--modal-lut" => {
+                modal_lut_path = Some(PathBuf::from(
+                    iter.next().ok_or("--modal-lut needs a path")?,
+                ));
+            }
+            "--onset-jitter" => {
+                onset_jitter_ms = iter
+                    .next()
+                    .ok_or("--onset-jitter needs a float (ms)")?
+                    .parse()
+                    .map_err(|e| format!("bad --onset-jitter: {e}"))?;
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "render_chord — render a chord through any engine and write a mono WAV.\n\n\
+                     options:\n  \
+                     --engine ENGINE   square|ks|ks-rich|sub|fm|piano|piano-thick|piano-lite|piano-5am|\
+                                       piano-modal|sfz-piano|koto\n  \
+                     --notes \"N,N,N\"   comma- or space-separated MIDI notes\n  \
+                     --velocity V      MIDI velocity 1..127 (default 100)\n  \
+                     --duration SEC    total render length (default 5)\n  \
+                     --hold SEC        time before note_off (default 3)\n  \
+                     --sfz PATH        SFZ manifest (required for sfz-piano)\n  \
+                     --modal-lut PATH  modal LUT JSON (auto-discovered if omitted)\n  \
+                     --onset-jitter MS spread voice onsets across N ms (default 0)\n  \
+                     --out PATH        output WAV path (required)"
+                );
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown arg: {other}")),
+        }
+    }
+
+    let engine = engine.ok_or("--engine is required")?;
+    if notes.is_empty() {
+        return Err("--notes is required and must contain at least one MIDI note".into());
+    }
+    let out_path = out_path.ok_or("--out is required")?;
+
+    Ok(Args {
+        engine,
+        notes,
+        velocity,
+        duration_sec,
+        hold_sec,
+        sfz_path,
+        out_path,
+        modal_lut_path,
+        onset_jitter_ms,
+    })
+}
+
+fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<(), String> {
+    if let Some(p) = path.parent() {
+        std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
+    }
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: SR,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut w = WavWriter::create(path, spec).map_err(|e| format!("WavWriter::create: {e}"))?;
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let i = (clamped * i16::MAX as f32) as i16;
+        w.write_sample(i).map_err(|e| format!("write_sample: {e}"))?;
+    }
+    w.finalize().map_err(|e| format!("finalize: {e}"))?;
+    Ok(())
+}
+
+fn render_sfz(args: &Args) -> Result<Vec<f32>, String> {
+    let sfz_path = args
+        .sfz_path
+        .as_ref()
+        .ok_or("--sfz PATH required for engine sfz-piano")?;
+    let mut player = SfzPlayer::load(sfz_path, SR as f32)
+        .map_err(|e| format!("SfzPlayer::load: {e}"))?;
+    let total_samples = (args.duration_sec * SR as f32) as usize;
+    let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);
+    let jitter_samples = (args.onset_jitter_ms * SR as f32 / 1000.0) as usize;
+
+    let mut left = vec![0.0_f32; total_samples];
+    let mut right = vec![0.0_f32; total_samples];
+
+    // Stagger note_on across the jitter window so the SFZ player's
+    // internal voices don't all fire at sample 0. We render in chunks
+    // between successive note_ons.
+    let n = args.notes.len();
+    let mut cursor = 0usize;
+    for (idx, &note) in args.notes.iter().enumerate() {
+        let start = if jitter_samples == 0 || n <= 1 {
+            0
+        } else {
+            (idx * jitter_samples) / n.max(1)
+        };
+        if start > cursor {
+            let span = start.min(total_samples) - cursor;
+            if span > 0 {
+                player.render(
+                    &mut left[cursor..cursor + span],
+                    &mut right[cursor..cursor + span],
+                );
+                cursor += span;
+            }
+        }
+        player.note_on(0, note, args.velocity);
+    }
+    if cursor < release_at {
+        player.render(&mut left[cursor..release_at], &mut right[cursor..release_at]);
+    }
+    for &note in &args.notes {
+        player.note_off(0, note);
+    }
+    if release_at < total_samples {
+        player.render(
+            &mut left[release_at..total_samples],
+            &mut right[release_at..total_samples],
+        );
+    }
+    let mut mono = vec![0.0_f32; total_samples];
+    for i in 0..total_samples {
+        mono[i] = (left[i] + right[i]) * 0.5;
+    }
+    Ok(mono)
+}
+
+fn render_keysynth(args: &Args) -> Result<Vec<f32>, String> {
+    if args.engine == Engine::PianoModal {
+        let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
+        eprintln!("render_chord: modal LUT source = {source}");
+        let _ = MODAL_LUT.set(lut);
+    }
+    let total_samples = (args.duration_sec * SR as f32) as usize;
+    let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);
+    let jitter_samples = (args.onset_jitter_ms * SR as f32 / 1000.0) as usize;
+    let n = args.notes.len();
+
+    let mut mono = vec![0.0_f32; total_samples];
+    for (idx, &note) in args.notes.iter().enumerate() {
+        let freq = midi_to_freq(note);
+        let mut voice = make_voice(args.engine, SR as f32, freq, args.velocity);
+        // Per-voice onset offset within the jitter window. idx 0 → 0,
+        // idx N-1 → ~jitter_samples. Distributes evenly so no two
+        // voices share sample 0 (when jitter > 0).
+        let offset = if jitter_samples == 0 || n <= 1 {
+            0
+        } else {
+            (idx * jitter_samples) / n.max(1)
+        };
+        let voice_release_at = if release_at > offset {
+            release_at - offset
+        } else {
+            0
+        };
+        let voice_total = if total_samples > offset {
+            total_samples - offset
+        } else {
+            0
+        };
+        let mut voice_buf = vec![0.0_f32; voice_total];
+        if voice_release_at > 0 {
+            voice.render_add(&mut voice_buf[..voice_release_at]);
+        }
+        voice.trigger_release();
+        if voice_release_at < voice_total {
+            voice.render_add(&mut voice_buf[voice_release_at..voice_total]);
+        }
+        // Sum into the master buffer at the offset.
+        for (i, s) in voice_buf.iter().enumerate() {
+            let dst = offset + i;
+            if dst < total_samples {
+                mono[dst] += *s;
+            }
+        }
+    }
+    Ok(mono)
+}
+
+fn peak_normalise(samples: &mut [f32], target_dbfs: f32) {
+    let peak = samples.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    if peak > 1e-9 {
+        let target = 10f32.powf(target_dbfs / 20.0);
+        let scale = target / peak;
+        for s in samples.iter_mut() {
+            *s *= scale;
+        }
+    }
+}
+
+fn main() {
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("render_chord: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    let mut samples = match args.engine {
+        Engine::SfzPiano => render_sfz(&args),
+        _ => render_keysynth(&args),
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("render_chord: {e}");
+        std::process::exit(2);
+    });
+
+    let raw_peak = samples.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    peak_normalise(&mut samples, -3.0);
+    let final_peak = samples.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+
+    eprintln!(
+        "render_chord: engine={:?} notes={:?} duration={:.2}s hold={:.2}s",
+        args.engine, args.notes, args.duration_sec, args.hold_sec
+    );
+    eprintln!(
+        "render_chord: raw peak {:.3} → normalised {:.3} (-3 dBFS target)",
+        raw_peak, final_peak
+    );
+
+    if let Err(e) = write_wav(&args.out_path, &samples) {
+        eprintln!("render_chord: {e}");
+        std::process::exit(2);
+    }
+    eprintln!("render_chord: wrote {}", args.out_path.display());
+}

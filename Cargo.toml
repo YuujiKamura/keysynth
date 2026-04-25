@@ -69,3 +69,19 @@ path = "src/bin/score.rs"
 [[bin]]
 name = "build_modal_lut"
 path = "src/bin/build_modal_lut.rs"
+
+# render_chord binary: render N-note chord through any engine for
+# chord-level GT comparison. Single-note evaluation hides the polyphony
+# stacking artifact, so chord-level renders are needed for issue #3
+# realism evaluation.
+[[bin]]
+name = "render_chord"
+path = "src/bin/render_chord.rs"
+
+# render_song binary: render short multi-note phrases (chord
+# progressions, melody+bass, two-voice imitation) through any engine
+# for musical-context realism evaluation. Multi-event timeline
+# scheduling, per-event velocity/duration.
+[[bin]]
+name = "render_song"
+path = "src/bin/render_song.rs"
