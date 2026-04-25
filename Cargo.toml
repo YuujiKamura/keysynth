@@ -62,3 +62,10 @@ path = "src/bin/render_modal.rs"
 [[bin]]
 name = "score"
 path = "src/bin/score.rs"
+
+# build_modal_lut binary: extract per-note modal LUT (decompose + t60 +
+# attack) from SFZ Salamander reference WAVs. Output is consumed by
+# voices::piano_modal::ModalPianoVoice (issue #3 A2 supervised path).
+[[bin]]
+name = "build_modal_lut"
+path = "src/bin/build_modal_lut.rs"
