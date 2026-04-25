@@ -21,6 +21,9 @@ struct Track {
     /// separate column so the same piece across engines lines up).
     piece: String,
     engine: String,
+    /// Provenance / source repo of the underlying material:
+    /// "keysynth", "chiptune-demo", "listener-lab", "midi" etc.
+    source: String,
     size_kb: u64,
 }
 
@@ -28,6 +31,36 @@ const ENGINE_SUFFIXES: &[&str] = &[
     "sfz", "modal", "square", "ks", "ks-rich", "sub", "fm", "piano", "piano-thick",
     "piano-lite", "piano-5am", "koto",
 ];
+
+fn classify_source(path: &Path, piece: &str) -> &'static str {
+    // Path-driven first: which directory is this file in?
+    let path_str = path.to_string_lossy().to_lowercase();
+    if path_str.contains("/chiptune/") || path_str.contains("\\chiptune\\") {
+        // Filenames within bench-out/CHIPTUNE/ are derived from the
+        // input JSON's stem. Sub-classify by that stem prefix.
+        let p = piece.to_lowercase();
+        if p.starts_with("rec_")
+            || p.starts_with("manual_")
+            || p.starts_with("arp_demo")
+            || p.starts_with("arrange_")
+            || p.starts_with("compose_")
+            || p.starts_with("twincle")
+            || p.starts_with("twinclestar")
+        {
+            return "listener-lab";
+        }
+        // v0..v99 = ai-chiptune-demo competition naming
+        let bytes = p.as_bytes();
+        if bytes.len() >= 2 && bytes[0] == b'v' && bytes[1].is_ascii_digit() {
+            return "chiptune-demo";
+        }
+        return "chiptune";
+    }
+    if path_str.contains("midi_") || piece.starts_with("midi_") {
+        return "midi";
+    }
+    "keysynth"
+}
 
 fn parse_track(path: &Path) -> Option<Track> {
     let stem = path.file_stem()?.to_str()?.to_string();
@@ -40,11 +73,13 @@ fn parse_track(path: &Path) -> Option<Track> {
             stem.strip_suffix(&suf).map(|p| (p.to_string(), s.to_string()))
         })
         .unwrap_or_else(|| (stem.clone(), "—".to_string()));
+    let source = classify_source(path, &piece).to_string();
     Some(Track {
         path: path.to_path_buf(),
         label: stem.clone(),
         piece,
         engine,
+        source,
         size_kb,
     })
 }
@@ -74,6 +109,28 @@ fn scan_dirs(dirs: &[&Path]) -> Vec<Track> {
     out
 }
 
+/// One slot in the multi-track mixer. Holds a reference into the
+/// scanned `Track` catalogue plus its own volume / mute state and
+/// (when playing) its own rodio Sink so each track decodes in
+/// parallel against the shared OutputStream.
+struct MixSlot {
+    file_idx: Option<usize>,
+    volume: f32,
+    muted: bool,
+    sink: Option<Sink>,
+}
+
+impl Default for MixSlot {
+    fn default() -> Self {
+        Self {
+            file_idx: None,
+            volume: 1.0,
+            muted: false,
+            sink: None,
+        }
+    }
+}
+
 struct Jukebox {
     tracks: Vec<Track>,
     selected: Option<usize>,
@@ -92,6 +149,10 @@ struct Jukebox {
     /// "(default)" means OutputStream::try_default() at startup —
     /// captures whatever the OS default was at that moment.
     current_device: String,
+    /// Multi-track mixer slots. Each slot can hold one file from the
+    /// catalogue, plays in parallel with the others when the global
+    /// transport is started.
+    mix: Vec<MixSlot>,
 }
 
 fn list_output_devices() -> Vec<String> {
@@ -139,7 +200,71 @@ impl Jukebox {
             refresh_dirs: dirs,
             devices,
             current_device: "(default)".to_string(),
+            mix: vec![MixSlot::default(), MixSlot::default()],
         })
+    }
+
+    fn play_mix(&mut self) {
+        // Stop any currently-playing single-track preview.
+        if let Some(s) = self.sink.take() {
+            s.stop();
+            drop(s);
+        }
+        // Stop all currently-running mix sinks first so a re-play
+        // restarts every slot from t=0 in lockstep.
+        for slot in self.mix.iter_mut() {
+            if let Some(s) = slot.sink.take() {
+                s.stop();
+                drop(s);
+            }
+        }
+        // Now spawn fresh sinks for each non-muted slot with a file.
+        for slot in self.mix.iter_mut() {
+            if slot.muted {
+                continue;
+            }
+            let idx = match slot.file_idx {
+                Some(i) => i,
+                None => continue,
+            };
+            let track = match self.tracks.get(idx) {
+                Some(t) => t,
+                None => continue,
+            };
+            let file = match File::open(&track.path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("jukebox: open {}: {e}", track.path.display());
+                    continue;
+                }
+            };
+            let decoder = match Decoder::new(BufReader::new(file)) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("jukebox: decode {}: {e}", track.path.display());
+                    continue;
+                }
+            };
+            let sink = match Sink::try_new(&self.handle) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("jukebox: sink: {e}");
+                    continue;
+                }
+            };
+            sink.set_volume(slot.volume.clamp(0.0, 2.0));
+            sink.append(decoder);
+            slot.sink = Some(sink);
+        }
+    }
+
+    fn stop_mix(&mut self) {
+        for slot in self.mix.iter_mut() {
+            if let Some(s) = slot.sink.take() {
+                s.stop();
+                drop(s);
+            }
+        }
     }
 
     fn rebind_device(&mut self, name: &str) {
@@ -285,6 +410,107 @@ impl eframe::App for Jukebox {
             });
         });
 
+        // ----- Bottom panel: multi-track mixer ----------------------
+        egui::TopBottomPanel::bottom("mixer")
+            .resizable(true)
+            .min_height(180.0)
+            .default_height(220.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("mixer");
+                    ui.separator();
+                    let mix_playing = self.mix.iter().any(|s| {
+                        s.sink.as_ref().map(|sk| !sk.empty()).unwrap_or(false)
+                    });
+                    if ui.button("▶ play all").clicked() {
+                        self.play_mix();
+                    }
+                    if ui.button("■ stop all").clicked() {
+                        self.stop_mix();
+                    }
+                    ui.separator();
+                    if ui.button("+ track").clicked() {
+                        self.mix.push(MixSlot::default());
+                    }
+                    ui.separator();
+                    let n_active = self.mix.iter().filter(|s| s.file_idx.is_some()).count();
+                    ui.label(format!("{n_active}/{} loaded · {}", self.mix.len(),
+                        if mix_playing { "playing" } else { "stopped" }));
+                });
+                ui.separator();
+                // Track-list snapshot for combo box (label + source).
+                let track_choices: Vec<(usize, String)> = self
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (i, format!("[{}] {}_{}", t.source, t.piece, t.engine)))
+                    .collect();
+                egui::ScrollArea::vertical()
+                    .id_salt("mixer-scroll")
+                    .show(ui, |ui| {
+                        let mut to_remove: Option<usize> = None;
+                        for (slot_idx, slot) in self.mix.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.monospace(format!("{:>2}", slot_idx + 1));
+                                let current = slot
+                                    .file_idx
+                                    .and_then(|i| track_choices.iter().find(|(j, _)| *j == i))
+                                    .map(|(_, l)| l.as_str())
+                                    .unwrap_or("(empty)");
+                                egui::ComboBox::from_id_salt(format!("mix-{slot_idx}"))
+                                    .selected_text(current)
+                                    .width(420.0)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(slot.file_idx.is_none(), "(empty)")
+                                            .clicked()
+                                        {
+                                            slot.file_idx = None;
+                                        }
+                                        for (i, label) in &track_choices {
+                                            if ui
+                                                .selectable_label(slot.file_idx == Some(*i), label)
+                                                .clicked()
+                                            {
+                                                slot.file_idx = Some(*i);
+                                            }
+                                        }
+                                    });
+                                ui.add(
+                                    egui::Slider::new(&mut slot.volume, 0.0..=2.0)
+                                        .text("vol")
+                                        .step_by(0.05),
+                                );
+                                if let Some(s) = &slot.sink {
+                                    s.set_volume(slot.volume.clamp(0.0, 2.0));
+                                }
+                                ui.checkbox(&mut slot.muted, "mute");
+                                let live = slot
+                                    .sink
+                                    .as_ref()
+                                    .map(|s| !s.empty())
+                                    .unwrap_or(false);
+                                if live {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        "▶",
+                                    );
+                                }
+                                if ui.button("×").clicked() {
+                                    to_remove = Some(slot_idx);
+                                }
+                            });
+                        }
+                        if let Some(idx) = to_remove {
+                            if let Some(s) = self.mix[idx].sink.take() {
+                                s.stop();
+                                drop(s);
+                            }
+                            self.mix.remove(idx);
+                        }
+                    });
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let needle = self.filter.to_lowercase();
             // Group tracks by piece. Each piece row gets a selectable
@@ -301,11 +527,33 @@ impl eframe::App for Jukebox {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut to_play: Option<usize> = None;
+                let avail_w = ui.available_width();
                 for (piece, indices) in &grouped {
                     ui.horizontal_wrapped(|ui| {
                         let active_in_group = indices
                             .iter()
                             .any(|i| self.selected == Some(*i) && playing_now);
+                        let source_label = indices
+                            .first()
+                            .and_then(|i| self.tracks.get(*i))
+                            .map(|t| t.source.as_str())
+                            .unwrap_or("?");
+                        let source_color = match source_label {
+                            "keysynth" => egui::Color32::from_rgb(180, 200, 255),
+                            "chiptune-demo" => egui::Color32::from_rgb(120, 220, 140),
+                            "listener-lab" => egui::Color32::from_rgb(220, 180, 255),
+                            "midi" => egui::Color32::from_rgb(255, 200, 120),
+                            _ => egui::Color32::from_rgb(180, 180, 180),
+                        };
+                        ui.add_sized(
+                            [110.0, 22.0],
+                            egui::Label::new(
+                                egui::RichText::new(source_label)
+                                    .color(source_color)
+                                    .monospace()
+                                    .small(),
+                            ),
+                        );
                         let piece_text = if active_in_group {
                             egui::RichText::new(piece)
                                 .color(egui::Color32::from_rgb(255, 200, 80))
@@ -314,7 +562,8 @@ impl eframe::App for Jukebox {
                         } else {
                             egui::RichText::new(piece).monospace()
                         };
-                        ui.add_sized([260.0, 22.0], egui::Label::new(piece_text));
+                        let piece_w = (avail_w * 0.35).max(220.0);
+                        ui.add_sized([piece_w, 22.0], egui::Label::new(piece_text));
                         ui.separator();
                         for &i in indices {
                             let t = &self.tracks[i];
@@ -359,7 +608,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Jukebox::new(dirs)?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([720.0, 600.0])
+            .with_inner_size([1280.0, 800.0])
             .with_title("keysynth jukebox"),
         ..Default::default()
     };
