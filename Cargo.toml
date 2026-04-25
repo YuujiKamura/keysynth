@@ -55,3 +55,10 @@ path = "src/bin/extract_dump.rs"
 [[bin]]
 name = "render_modal"
 path = "src/bin/render_modal.rs"
+
+# score binary: weighted multi-metric loss between a reference and a
+# candidate WAV. Combines MR-STFT, T60 vector, onset envelope, centroid
+# trajectory, and inharmonicity-coefficient residual into one scalar.
+[[bin]]
+name = "score"
+path = "src/bin/score.rs"

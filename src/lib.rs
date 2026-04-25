@@ -9,6 +9,7 @@ pub mod analysis;
 pub mod extract;
 pub mod gm;
 pub mod reverb;
+pub mod score;
 pub mod sfz;
 pub mod soundboard;
 pub mod sympathetic;
