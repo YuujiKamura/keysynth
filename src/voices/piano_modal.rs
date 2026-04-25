@@ -755,6 +755,20 @@ impl VoiceImpl for ModalPianoVoice {
             }
             self.damper_pending = false;
         }
+        // Per-voice output gain. The modal-bank impulse response has
+        // peak amplitude ~b0 = 1 - r² ≈ 3e-4 per resonator, so even
+        // summed across 144 sub-modes the raw voice peak is only
+        // ~3e-3 — about 300× quieter than Square / KS / Piano (peak
+        // ~1.0). render_song / render_chord normalise to -3 dBFS so
+        // their output sounds level-matched, but the real-time DAC
+        // path in main.rs has no normalisation and the modal voice
+        // ended up inaudible against the master fader. Pre-multiply
+        // the summed bank so live playback matches the loudness of
+        // the other engines. The residual_l2 metric is invariant to
+        // this gain (both ref and candidate go through the same
+        // peak normalisation in render_song), so iter A-J accept
+        // decisions are unaffected.
+        const MODAL_OUTPUT_GAIN: f32 = 50.0;
         for sample in buf.iter_mut() {
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).
@@ -770,7 +784,7 @@ impl VoiceImpl for ModalPianoVoice {
                 sum += r.step(x);
             }
             let env = self.release.step();
-            *sample += sum * env;
+            *sample += sum * env * MODAL_OUTPUT_GAIN;
         }
     }
     fn trigger_release(&mut self) {
