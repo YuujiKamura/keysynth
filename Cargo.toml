@@ -42,3 +42,9 @@ path = "src/bin/analyse.rs"
 [[bin]]
 name = "cpubench"
 path = "src/bin/cpubench.rs"
+
+# extract_dump binary: dump the issue #3 extractors' output for a WAV.
+# Used to pin / re-pin golden values when an extractor's algorithm changes.
+[[bin]]
+name = "extract_dump"
+path = "src/bin/extract_dump.rs"

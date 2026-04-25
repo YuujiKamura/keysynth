@@ -103,15 +103,10 @@ const EXPECTED: &[PartialExpect] = &[
     },
 ];
 
-// `#[ignore]`d on this worktree because the SFZ Salamander reference WAV
-// landed on main at commit `0fb3840` AFTER this worktree forked, so the
-// file isn't physically present here. Once the worktree is rebased onto
-// `0fb3840` (or later) the file will be at
-// `bench-out/REF/sfz_salamander_grand_v3_C4.wav` and this test can be
-// run with `cargo test --test extract_decompose -- --ignored`. See
-// issue #3 for the pinned per-partial values' provenance.
+// SFZ Salamander reference WAV is committed at
+// `bench-out/REF/sfz_salamander_grand_v3_C4.wav` (main commit `0fb3840`).
+// See issue #3 for the pinned per-partial values' provenance.
 #[test]
-#[ignore = "requires bench-out/REF/sfz_salamander_grand_v3_C4.wav (issue #3)"]
 fn golden_ref_sfz_c4() {
     let Some((signal, sr)) = load_ref_sfz_c4() else {
         panic!(
