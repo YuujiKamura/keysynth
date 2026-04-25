@@ -777,14 +777,18 @@ impl ModalLut {
 
 impl VoiceImpl for ModalPianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        // Lazy damper engage: cheaper than wrapping every step in a
-        // branch, and we can do it once at the top of each render pass.
-        if self.damper_pending {
-            for r in &mut self.resonators {
-                r.engage_damper(self.damper_t60_sec);
-            }
-            self.damper_pending = false;
-        }
+        // Iter S: per-sample damper-pending check (was per-block at
+        // the top of render_add). trigger_release runs on the MIDI /
+        // UI thread between audio blocks; a per-block check delayed
+        // the biquad coefficient swap by up to one block (~21 ms at
+        // 1024 frames / 48 kHz). The latency between the instant
+        // release_env trigger and the delayed damper engage was
+        // perceptually distinguishable from the attack itself —
+        // listener heard 二拍 / two events on quick keys. Per-sample
+        // branch is ~0.3 ns and trivially predicted; cost is
+        // negligible against the 144-biquad inner loop.
+        // (kept here so the inner loop body can flip damper at the
+        //  exact sample without re-reading the flag every step.)
         // Per-voice output gain. The modal-bank impulse response has
         // peak amplitude ~b0 = 1 - r² ≈ 3e-4 per resonator, so even
         // summed across 144 sub-modes the raw voice peak is only
@@ -807,14 +811,22 @@ impl VoiceImpl for ModalPianoVoice {
         // modal to ~1.0 raw peak puts it in the same headroom band as
         // the rest at master=1.0, so the master fader doesn't have to
         // span 1.0-3.0 just to balance modal against SFZ.
-        // Iter Q: 100 → 95. iter P's T60 ceiling let mid partials
-        // sustain longer, lifting the chord raw_peak from 0.97 to 1.02
-        // (chord_headroom_audit). At master=1 with ParallelComp's 1.3×
-        // multiplier this crossed into audible tanh saturation that
-        // the user heard as 「割れ気味」. 95 brings peak back to ~0.97,
-        // matching iter M's chord-clean tier.
-        const MODAL_OUTPUT_GAIN: f32 = 95.0;
+        // Iter S: 95 → 80. iter R's monotone-decay envelope removed
+        // the noise-tail dip but kept noise active continuously across
+        // the full 250 ms tail; polyphony piled up and the chord
+        // raw_peak crept back into tanh's warm-saturation knee
+        // ("音も割れてる"). 80 brings sustained-chord headroom back.
+        const MODAL_OUTPUT_GAIN: f32 = 80.0;
         for sample in buf.iter_mut() {
+            // Per-sample damper engage (iter S). Cheap predictable
+            // branch; eliminates up-to-21 ms note_off latency that
+            // perceptually split into "release click" + "decay".
+            if self.damper_pending {
+                for r in &mut self.resonators {
+                    r.engage_damper(self.damper_t60_sec);
+                }
+                self.damper_pending = false;
+            }
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).
             let x = if self.excitation_idx < self.excitation.len() {
