@@ -42,36 +42,49 @@ pub struct Mode {
 }
 
 struct ModalResonator {
+    /// Cosine of the resonant angular frequency. Coefficient `a1` is
+    /// `-2·r·cos_omega` and is recomputed on damper engage to swap the
+    /// pole radius without rebuilding the resonator from scratch.
+    cos_omega: f32,
     a1: f32,
     a2: f32,
     b0: f32,
     y1: f32,
     y2: f32,
     init_amp: f32,
+    sr: f32,
 }
 
 impl ModalResonator {
     fn new(mode: Mode, sr: f32) -> Self {
         let omega = 2.0 * std::f32::consts::PI * mode.freq_hz / sr;
-        // Pole radius chosen so r^(T60·sr) = 1e-3 (i.e. -60 dB at exactly
-        // T60 seconds). ln(1e-3) = -6.9077, but we use 3·ln(10) for
-        // numerical clarity.
+        let cos_omega = omega.cos();
         let t60 = mode.t60_sec.max(1e-3);
-        let r = (-3.0 * 10f32.ln() / (t60 * sr)).exp();
-        let a1 = -2.0 * r * omega.cos();
-        let a2 = r * r;
-        // Unity peak gain at resonance: a bandpass with pole radius r
-        // has |H(e^{jω₀})| = 1 / (1 - r²) at resonance. Pre-multiplying
-        // b0 by (1 - r²) normalises peak to 1.
-        let b0 = 1.0 - r * r;
+        let (a1, a2, b0) = compute_coefs(cos_omega, t60, sr);
         Self {
+            cos_omega,
             a1,
             a2,
             b0,
             y1: 0.0,
             y2: 0.0,
             init_amp: mode.init_amp,
+            sr,
         }
+    }
+
+    /// Engage the damper: swap the pole radius to one that decays to
+    /// -60 dB in `damper_t60_sec` (typically 0.05-0.20 s). This kills
+    /// the mode much faster than its natural T60, mimicking a felt
+    /// damper landing on a piano string. Cheap: just re-derives the
+    /// three IIR coefficients; internal state (y1, y2) is preserved
+    /// so there's no click.
+    fn engage_damper(&mut self, damper_t60_sec: f32) {
+        let t60 = damper_t60_sec.max(1e-3);
+        let (a1, a2, b0) = compute_coefs(self.cos_omega, t60, self.sr);
+        self.a1 = a1;
+        self.a2 = a2;
+        self.b0 = b0;
     }
 
     #[inline]
@@ -83,17 +96,48 @@ impl ModalResonator {
     }
 }
 
+/// Pole radius chosen so r^(T60·sr) = 1e-3 (i.e. -60 dB at exactly
+/// T60 seconds). Returns (a1, a2, b0) for the biquad bandpass with
+/// unity peak gain at resonance.
+fn compute_coefs(cos_omega: f32, t60_sec: f32, sr: f32) -> (f32, f32, f32) {
+    let r = (-3.0 * 10f32.ln() / (t60_sec * sr)).exp();
+    let a1 = -2.0 * r * cos_omega;
+    let a2 = r * r;
+    // |H(e^{jω₀})| = 1 / (1 - r²) at resonance; pre-multiplying b0
+    // by (1 - r²) normalises peak to 1 — at the moment of damper
+    // engage this rescales the steady-state gain, which is the
+    // physically correct behaviour (less coupling area = less
+    // radiated amplitude).
+    let b0 = 1.0 - r * r;
+    (a1, a2, b0)
+}
+
 /// Modal piano voice. Holds a parallel bank of resonators (one per
 /// mode) plus a hammer-impulse excitation buffer that's played out at
 /// note-on. After the impulse runs out, the resonators ring out at
 /// their per-mode T60.
+///
+/// On `trigger_release` the voice engages a virtual damper:
+/// `damper_t60_sec` (default 0.12 s) is swapped into every resonator
+/// in place of its natural T60, which mimics a wool damper landing on
+/// a piano string and stopping it within ~100 ms. Without this the
+/// per-mode resonators would happily ring through their full T60
+/// (h1 ~ 18 s) regardless of note_off, producing the audible "電子
+/// ピアノっぽい / 減衰しない" character of the early pilot.
 pub struct ModalPianoVoice {
     resonators: Vec<ModalResonator>,
     /// Hammer-impulse waveform played into every resonator at note-on.
-    /// Typically a short half-sine (~3 ms) windowed burst with a flat
-    /// spectrum across the audio band, so every mode is excited.
+    /// Single-sample delta in the default constructor (broadband, every
+    /// mode excited equally); callers can supply any shape.
     excitation: Vec<f32>,
     excitation_idx: usize,
+    /// Damper T60 applied to every resonator on `trigger_release`. Real
+    /// piano felt dampers stop the string in ~80-200 ms; 0.12 s is a
+    /// reasonable middle.
+    damper_t60_sec: f32,
+    /// Becomes true after `trigger_release` so the damper engages on
+    /// the next render pass. Idempotent.
+    damper_pending: bool,
     release: ReleaseEnvelope,
 }
 
@@ -101,15 +145,69 @@ impl ModalPianoVoice {
     /// Construct from a list of modes and an explicit excitation buffer.
     /// `velocity_amp` (typically `velocity / 127.0`) scales the
     /// excitation peak so per-velocity loudness behaves intuitively.
+    /// Each mode is also expanded into 3 sub-modes detuned by ±0.7
+    /// cents around the centre frequency, mimicking the natural
+    /// detune across a piano's 3-string unison and producing audible
+    /// inter-partial beating ("生っぽさ"). Pass `with_modes_no_detune`
+    /// if you don't want this expansion.
     pub fn with_modes(sr: f32, modes: &[Mode], excitation: Vec<f32>, velocity_amp: f32) -> Self {
-        let resonators = modes.iter().copied().map(|m| ModalResonator::new(m, sr)).collect();
+        const DETUNE_CENTS: f32 = 0.7;
+        let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
+        let mut detuned: Vec<Mode> = Vec::with_capacity(modes.len() * 3);
+        for m in modes {
+            // Each sub-mode gets 1/3 of the original amplitude so total
+            // energy stays constant. Centre is exactly on-pitch; flanks
+            // are ±DETUNE_CENTS.
+            let third = m.init_amp / 3.0_f32.sqrt();
+            detuned.push(Mode {
+                freq_hz: m.freq_hz * cents_to_ratio(-DETUNE_CENTS),
+                t60_sec: m.t60_sec,
+                init_amp: third,
+            });
+            detuned.push(Mode {
+                freq_hz: m.freq_hz,
+                t60_sec: m.t60_sec,
+                init_amp: third,
+            });
+            detuned.push(Mode {
+                freq_hz: m.freq_hz * cents_to_ratio(DETUNE_CENTS),
+                t60_sec: m.t60_sec,
+                init_amp: third,
+            });
+        }
+        Self::with_modes_no_detune(sr, &detuned, excitation, velocity_amp)
+    }
+
+    /// Construct without the 3-sub-mode detune expansion — modes are
+    /// used exactly as given. Useful for testing the resonator bank
+    /// in isolation; the user-facing path is `with_modes`.
+    pub fn with_modes_no_detune(
+        sr: f32,
+        modes: &[Mode],
+        excitation: Vec<f32>,
+        velocity_amp: f32,
+    ) -> Self {
+        let resonators = modes
+            .iter()
+            .copied()
+            .map(|m| ModalResonator::new(m, sr))
+            .collect();
         let scaled_excitation: Vec<f32> = excitation.iter().map(|&s| s * velocity_amp).collect();
         Self {
             resonators,
             excitation: scaled_excitation,
             excitation_idx: 0,
+            damper_t60_sec: 0.12,
+            damper_pending: false,
             release: ReleaseEnvelope::new(0.300, sr),
         }
+    }
+
+    /// Override the damper T60 (default 0.12 s). Useful for the una-corda
+    /// (slower damper) or for the SF2 placeholder pattern where dampers
+    /// are emulated by silence (set very small).
+    pub fn set_damper_t60_sec(&mut self, t60_sec: f32) {
+        self.damper_t60_sec = t60_sec;
     }
 
     /// Construct with a default broadband impulse (single-sample delta).
@@ -131,6 +229,14 @@ impl ModalPianoVoice {
 
 impl VoiceImpl for ModalPianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
+        // Lazy damper engage: cheaper than wrapping every step in a
+        // branch, and we can do it once at the top of each render pass.
+        if self.damper_pending {
+            for r in &mut self.resonators {
+                r.engage_damper(self.damper_t60_sec);
+            }
+            self.damper_pending = false;
+        }
         for sample in buf.iter_mut() {
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).
@@ -148,6 +254,16 @@ impl VoiceImpl for ModalPianoVoice {
             let env = self.release.step();
             *sample += sum * env;
         }
+    }
+    fn trigger_release(&mut self) {
+        // Default behaviour: fade the output via ReleaseEnvelope (~0.3 s
+        // multiplicative) AND engage the damper on the next render pass
+        // so the resonators themselves stop ringing rather than just
+        // getting quieter.
+        if let Some(env) = self.release_env_mut() {
+            env.trigger();
+        }
+        self.damper_pending = true;
     }
     fn release_env(&self) -> Option<&ReleaseEnvelope> {
         Some(&self.release)
