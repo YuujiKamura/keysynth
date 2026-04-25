@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::synth::{ReleaseEnvelope, VoiceImpl};
+use crate::synth::{modal_params, ReleaseEnvelope, VoiceImpl};
 
 /// One modal resonance: (f, T60, gain). `init_amp` is the LINEAR
 /// amplitude (not dB), so callers converting from `extract::Partial::init_db`
@@ -156,36 +156,48 @@ impl ModalPianoVoice {
     /// inter-partial beating ("生っぽさ"). Pass `with_modes_no_detune`
     /// if you don't want this expansion.
     pub fn with_modes(sr: f32, modes: &[Mode], excitation: Vec<f32>, velocity_amp: f32) -> Self {
-        const DETUNE_CENTS: f32 = 0.7;
-        // Two-polarization split per Weinreich (JASA 1977 "Coupled
-        // motion of piano strings"): each string vibrates in vertical
-        // and horizontal planes with very different bridge coupling.
-        // Vertical (strong coupling) decays fast and dominates the
-        // attack; horizontal (weak coupling) decays slow and provides
-        // the after-sound. Implemented as two parallel resonators per
-        // detuned sub-mode with different T60 multipliers and weights.
+        // Iter U: detune + polarization parameters now live-tunable via
+        // `synth::set_modal_params`. detune_cents = 0 collapses the
+        // 3-sub-mode detune layer to a single centre. pol_h_weight = 0
+        // disables the after-sound (H-polarization) layer entirely.
+        // T60 polarisation multipliers stay fixed at the Weinreich
+        // values (0.4 / 1.8) — they aren't perceptually distinct from
+        // the weight knob in casual A/B and would just clutter the UI.
         const POL_V_T60_MUL: f32 = 0.40;
         const POL_H_T60_MUL: f32 = 1.80;
-        const POL_V_WEIGHT: f32 = 0.85;
-        const POL_H_WEIGHT: f32 = 0.15;
+        let p = modal_params();
+        let pol_h = p.pol_h_weight.clamp(0.0, 1.0);
+        let pol_v = 1.0 - pol_h;
+        let detune_cents = p.detune_cents.max(0.0);
+
         let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
+        let detune_offsets: &[f32] = if detune_cents > 0.0 {
+            &[-1.0, 0.0, 1.0]
+        } else {
+            &[0.0]
+        };
+        let detune_count = detune_offsets.len() as f32;
+        let amp_per_detune = 1.0 / detune_count.sqrt();
+
         let mut detuned: Vec<Mode> = Vec::with_capacity(modes.len() * 6);
         for m in modes {
-            // 3-string detune split (preserved): each sub-string gets
-            // 1/sqrt(3) of the original amplitude.
-            let third = m.init_amp / 3.0_f32.sqrt();
-            for cents in [-DETUNE_CENTS, 0.0, DETUNE_CENTS] {
-                let f = m.freq_hz * cents_to_ratio(cents);
-                detuned.push(Mode {
-                    freq_hz: f,
-                    t60_sec: m.t60_sec * POL_V_T60_MUL,
-                    init_amp: third * POL_V_WEIGHT,
-                });
-                detuned.push(Mode {
-                    freq_hz: f,
-                    t60_sec: m.t60_sec * POL_H_T60_MUL,
-                    init_amp: third * POL_H_WEIGHT,
-                });
+            let scale = m.init_amp * amp_per_detune;
+            for off in detune_offsets {
+                let f = m.freq_hz * cents_to_ratio(off * detune_cents);
+                if pol_v > 0.0 {
+                    detuned.push(Mode {
+                        freq_hz: f,
+                        t60_sec: m.t60_sec * POL_V_T60_MUL,
+                        init_amp: scale * pol_v,
+                    });
+                }
+                if pol_h > 0.0 {
+                    detuned.push(Mode {
+                        freq_hz: f,
+                        t60_sec: m.t60_sec * POL_H_T60_MUL,
+                        init_amp: scale * pol_h,
+                    });
+                }
             }
         }
         Self::with_modes_no_detune(sr, &detuned, excitation, velocity_amp)
@@ -334,19 +346,12 @@ impl ModalPianoVoice {
                 } else {
                     FALLBACK_T60
                 };
-                // Iter P: clamp T60 to [floor, 12 s]. The LUT extractor
-                // estimates partial-1 T60 around 25-33 s on the 10-s SFZ
-                // samples — physically possible only with damper pedal
-                // permanently down. In our voice the H-polarization
-                // multiplier (×1.8) further stretches that to 50+ s,
-                // making the fundamental ring far longer than any real
-                // piano. centroid_mse_hz ≈ 1000 across stimuli traced
-                // to this: fundamentals out-sustain everything else,
-                // dragging the spectral centroid below the SFZ
-                // trajectory. 12 s ceiling matches the longest plausible
-                // pedal-down sustain on a Yamaha C5.
-                const T60_CEIL_SEC: f32 = 12.0;
-                let t60 = raw.max(t60_floor_for_partial(n)).min(T60_CEIL_SEC);
+                // T60 ceiling now live-tunable. See `ModalParams::t60_cap_sec`
+                // — clamps the LUT artifact (25-33 s extracted from a
+                // 10-s SFZ sample, ×1.8 for H-pol → unphysical sustain).
+                let t60 = raw
+                    .max(t60_floor_for_partial(n))
+                    .min(modal_params().t60_cap_sec);
                 Mode {
                     freq_hz: m.freq_hz * ratio,
                     t60_sec: t60,
@@ -493,10 +498,10 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
     let attack_n = ((sr * 0.001).round() as usize).max(2);
 
     const STAGE_A_GAIN: f32 = 0.55;
-    // Iter M: 0.15 → 0.10 to reduce the held-note noise tail
-    // contribution across all bands; per-band residual showed the
-    // tail was over-stacking on the bass low surplus too.
-    const STAGE_B_GAIN: f32 = 0.10;
+    // Stage B gain now live-tunable via `ModalParams::stage_b_gain`.
+    // 0 disables the held-note noise tail entirely (only the 12 ms
+    // attack burst remains).
+    let stage_b_gain: f32 = modal_params().stage_b_gain.max(0.0);
 
     for i in 0..total {
         state ^= state << 13;
@@ -508,7 +513,7 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
         hp_prev_y = hp;
         lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
 
-        // Iter R: Stage A now tapers to STAGE_B_GAIN (not 0) and
+        // Iter R: Stage A now tapers to stage_b_gain (not 0) and
         // Stage B starts at that level directly with no inter-stage
         // ramp. Eliminates the env dip-and-bump at t≈12-22 ms that
         // the high-Q modal bank registered as a second excitation
@@ -522,17 +527,17 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
             (i as f32) / (attack_n as f32) * STAGE_A_GAIN
         } else if i < n_a {
             // Stage A decay: half-cosine from STAGE_A_GAIN down to
-            // STAGE_B_GAIN over the remainder of n_a (~11 ms).
+            // stage_b_gain over the remainder of n_a (~11 ms).
             let t = (i - attack_n) as f32 / (n_a - attack_n) as f32;
             let env_norm = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
-            STAGE_B_GAIN + env_norm * (STAGE_A_GAIN - STAGE_B_GAIN)
+            stage_b_gain + env_norm * (STAGE_A_GAIN - stage_b_gain)
         } else {
-            // Stage B sustained tail: half-cosine STAGE_B_GAIN → 0
+            // Stage B sustained tail: half-cosine stage_b_gain → 0
             // across n_b. Starts exactly where Stage A ended, no
             // ramp, no dip.
             let stage_b_pos = i - n_a;
             let t = stage_b_pos as f32 / n_b as f32;
-            0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_B_GAIN
+            0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * stage_b_gain
         };
         buf[i + 1] = lp_prev * env;
     }
@@ -811,12 +816,12 @@ impl VoiceImpl for ModalPianoVoice {
         // modal to ~1.0 raw peak puts it in the same headroom band as
         // the rest at master=1.0, so the master fader doesn't have to
         // span 1.0-3.0 just to balance modal against SFZ.
-        // Iter S: 95 → 80. iter R's monotone-decay envelope removed
-        // the noise-tail dip but kept noise active continuously across
-        // the full 250 ms tail; polyphony piled up and the chord
-        // raw_peak crept back into tanh's warm-saturation knee
-        // ("音も割れてる"). 80 brings sustained-chord headroom back.
-        const MODAL_OUTPUT_GAIN: f32 = 80.0;
+        // Output gain now live-tunable via `ModalParams::output_gain`.
+        // Read once per audio block (per render_add invocation) so a
+        // moving slider takes effect on already-playing voices, not
+        // just new note_ons. Default 80 keeps PianoModal in the same
+        // chord-clean tier as Piano / PianoLite (chord_headroom_audit).
+        let modal_output_gain: f32 = modal_params().output_gain.max(0.0);
         for sample in buf.iter_mut() {
             // Per-sample damper engage (iter S). Cheap predictable
             // branch; eliminates up-to-21 ms note_off latency that
@@ -841,7 +846,7 @@ impl VoiceImpl for ModalPianoVoice {
                 sum += r.step(x);
             }
             let env = self.release.step();
-            *sample += sum * env * MODAL_OUTPUT_GAIN;
+            *sample += sum * env * modal_output_gain;
         }
     }
     fn trigger_release(&mut self) {

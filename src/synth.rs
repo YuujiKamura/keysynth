@@ -17,6 +17,7 @@
 //! importing them via `keysynth::synth::*`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 pub mod voices {
     //! Re-exported for callers that prefer `keysynth::synth::voices::...`.
@@ -337,6 +338,63 @@ pub struct LiveParams {
     /// Final-stage bus mixing strategy. Live-switchable from GUI / CLI;
     /// see `MixMode` for the available modes (issue #4).
     pub mix_mode: MixMode,
+}
+
+/// Live-tunable parameters for `Engine::PianoModal`. Shared via a
+/// process-wide `Mutex` so the egui dashboard can adjust them and the
+/// next note_on picks them up. `output_gain` is re-read per audio
+/// block so it tracks the slider in real-time even on a held note;
+/// the others are snapshot at voice construction (changes apply
+/// only to subsequent notes).
+#[derive(Clone, Copy, Debug)]
+pub struct ModalParams {
+    /// Sub-mode detune split, ± cents around the LUT centre. 0
+    /// disables the detune layer entirely (3 sub-modes → 1).
+    pub detune_cents: f32,
+    /// Horizontal-polarisation weight 0..=1. The vertical weight is
+    /// derived as `1.0 - pol_h_weight`. Setting 0 disables the
+    /// after-sound layer (pure prompt decay).
+    pub pol_h_weight: f32,
+    /// Maximum per-partial T60 in seconds. The LUT extractor reports
+    /// 25-33 s on the 10-s SFZ samples (artifact); ceiling clamps that.
+    pub t60_cap_sec: f32,
+    /// Held-note noise tail amplitude (Stage B in build_hammer_excitation).
+    /// 0 disables the tail entirely; the attack burst (Stage A) stays.
+    pub stage_b_gain: f32,
+    /// Per-voice output gain applied to the summed bank in render_add.
+    /// Read live per audio block so the slider takes effect on
+    /// already-playing voices, not just new note_ons.
+    pub output_gain: f32,
+}
+
+impl Default for ModalParams {
+    fn default() -> Self {
+        Self {
+            detune_cents: 0.7,
+            pol_h_weight: 0.15,
+            t60_cap_sec: 12.0,
+            stage_b_gain: 0.10,
+            output_gain: 80.0,
+        }
+    }
+}
+
+static MODAL_PARAMS: OnceLock<Mutex<ModalParams>> = OnceLock::new();
+
+fn modal_params_cell() -> &'static Mutex<ModalParams> {
+    MODAL_PARAMS.get_or_init(|| Mutex::new(ModalParams::default()))
+}
+
+/// Snapshot the current global modal-voice params.
+pub fn modal_params() -> ModalParams {
+    *modal_params_cell().lock().unwrap()
+}
+
+/// Replace the global modal-voice params. Subsequent note_ons see
+/// the new values; already-playing voices keep what they captured
+/// at construction except for `output_gain` which is read live.
+pub fn set_modal_params(p: ModalParams) {
+    *modal_params_cell().lock().unwrap() = p;
 }
 
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,

@@ -21,7 +21,10 @@ use rustysynth::Synthesizer;
 
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
 use crate::sfz::SfzPlayer;
-use crate::synth::{make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, Voice, VoiceImpl};
+use crate::synth::{
+    make_voice, midi_to_freq, modal_params, set_modal_params, DashState, Engine, LiveParams,
+    MixMode, ModalParams, Voice, VoiceImpl,
+};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
 /// MIDI handles so they aren't dropped while the GUI is open.
@@ -316,6 +319,56 @@ impl eframe::App for KeysynthApp {
                     );
                 }
             });
+
+            // PianoModal live-tunable parameters. Only shown when the
+            // PianoModal engine is selected (sliders are no-ops for
+            // other engines but the visual clutter is unwelcome).
+            if engine == Engine::PianoModal {
+                let mut p = modal_params();
+                let p_before = p;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("modal:")
+                            .color(egui::Color32::from_rgb(160, 200, 255)),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut p.detune_cents, 0.0..=3.0)
+                            .step_by(0.05)
+                            .text("detune ¢"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut p.pol_h_weight, 0.0..=0.5)
+                            .step_by(0.01)
+                            .text("H-pol"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut p.t60_cap_sec, 2.0..=30.0)
+                            .step_by(0.5)
+                            .text("T60 cap (s)"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut p.stage_b_gain, 0.0..=0.30)
+                            .step_by(0.005)
+                            .text("noise tail"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut p.output_gain, 20.0..=200.0)
+                            .step_by(1.0)
+                            .text("modal gain"),
+                    );
+                    if ui.button("reset").clicked() {
+                        p = ModalParams::default();
+                    }
+                });
+                if p.detune_cents != p_before.detune_cents
+                    || p.pol_h_weight != p_before.pol_h_weight
+                    || p.t60_cap_sec != p_before.t60_cap_sec
+                    || p.stage_b_gain != p_before.stage_b_gain
+                    || p.output_gain != p_before.output_gain
+                {
+                    set_modal_params(p);
+                }
+            }
         });
 
         // Left side panel: GM 128 program picker. Always visible so the
