@@ -1186,6 +1186,18 @@ impl eframe::App for Jukebox {
                         return (*root).to_string();
                     }
                 }
+                // midi_<composer>_<rest> → root "midi_<composer>".
+                // Otherwise the whole midi import dumps into one
+                // mega-group and you can't browse Chopin vs Beethoven
+                // separately. The composer token is whatever follows
+                // "midi_" up to the next underscore.
+                if let Some(rest) = p.strip_prefix("midi_") {
+                    if let Some(composer) = rest.split('_').next() {
+                        if !composer.is_empty() {
+                            return format!("midi_{composer}");
+                        }
+                    }
+                }
                 // Fallback: first underscore-delimited token.
                 p.split('_').next().unwrap_or(&p).to_string()
             }
