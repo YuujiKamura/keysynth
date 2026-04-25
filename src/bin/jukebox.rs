@@ -1146,80 +1146,178 @@ impl eframe::App for Jukebox {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let needle = self.filter.to_lowercase();
-            // Group tracks by piece. Each piece row gets a selectable
-            // button per engine so the same sequence rendered through
-            // different engines lines up for one-click A/B switching.
-            let mut grouped: std::collections::BTreeMap<String, Vec<usize>> =
-                std::collections::BTreeMap::new();
+            // Two-level grouping. The first key folds the iter-variant
+            // sprawl (twinkle / twinkle_h2 / twinkle_p / twinkle_revert)
+            // under one collapsible header; the second is the exact
+            // piece name that lines up engine renders into one row.
+            //
+            // fold_key heuristic: known piece roots are detected first
+            // (multi-word names like "maple_leaf_rag" / "bach_invention"),
+            // otherwise fall back to the first underscore-delimited
+            // token. The default-collapsed state hides 80 % of the
+            // iter-spam from the catalogue while keeping every render
+            // reachable.
+            fn fold_key(piece: &str) -> String {
+                const KNOWN_ROOTS: &[&str] = &[
+                    "maple_leaf_rag",
+                    "bach_invention",
+                    "bach_prelude_c",
+                    "bach_prelude12",
+                    "twelfth_street_rag",
+                    "st_louis_blues",
+                    "king_porter_stomp",
+                    "fur_elise",
+                    "canon_d",
+                    "blues_in_c",
+                    "c_progression",
+                    "minor_cadence",
+                    "demo_four_on_the_floor",
+                    "demo_breakbeat",
+                    "midi_bach",
+                    "midi_maple",
+                    "midi_maple12",
+                    "tap",
+                    "bach_baseline",
+                    "bach_prelude",
+                ];
+                let p = piece.to_lowercase();
+                for root in KNOWN_ROOTS {
+                    if p == *root || p.starts_with(&format!("{root}_")) {
+                        return (*root).to_string();
+                    }
+                }
+                // Fallback: first underscore-delimited token.
+                p.split('_').next().unwrap_or(&p).to_string()
+            }
+
+            // root → piece → Vec<track index>
+            let mut folded: std::collections::BTreeMap<
+                String,
+                std::collections::BTreeMap<String, Vec<usize>>,
+            > = std::collections::BTreeMap::new();
             for (i, t) in self.tracks.iter().enumerate() {
                 if !needle.is_empty() && !t.piece.to_lowercase().contains(&needle) {
                     continue;
                 }
-                grouped.entry(t.piece.clone()).or_default().push(i);
+                let root = fold_key(&t.piece);
+                folded
+                    .entry(root)
+                    .or_default()
+                    .entry(t.piece.clone())
+                    .or_default()
+                    .push(i);
             }
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut to_play: Option<usize> = None;
                 let avail_w = ui.available_width();
-                for (piece, indices) in &grouped {
-                    ui.horizontal_wrapped(|ui| {
-                        let active_in_group = indices
-                            .iter()
-                            .any(|i| self.selected == Some(*i) && any_playing);
-                        let source_label = indices
-                            .first()
-                            .and_then(|i| self.tracks.get(*i))
-                            .map(|t| t.source.as_str())
-                            .unwrap_or("?");
-                        let source_color = match source_label {
-                            "keysynth" => egui::Color32::from_rgb(180, 200, 255),
-                            "chiptune-demo" => egui::Color32::from_rgb(120, 220, 140),
-                            "listener-lab" => egui::Color32::from_rgb(220, 180, 255),
-                            "midi" => egui::Color32::from_rgb(255, 200, 120),
-                            _ => egui::Color32::from_rgb(180, 180, 180),
-                        };
-                        ui.add_sized(
-                            [110.0, 22.0],
-                            egui::Label::new(
-                                egui::RichText::new(source_label)
-                                    .color(source_color)
-                                    .monospace()
-                                    .small(),
-                            ),
-                        );
-                        let piece_text = if active_in_group {
-                            egui::RichText::new(piece)
-                                .color(egui::Color32::from_rgb(255, 200, 80))
-                                .strong()
-                                .monospace()
-                        } else {
-                            egui::RichText::new(piece).monospace()
-                        };
-                        let piece_w = (avail_w * 0.35).max(220.0);
-                        ui.add_sized([piece_w, 22.0], egui::Label::new(piece_text));
-                        ui.separator();
-                        for &i in indices {
-                            let t = &self.tracks[i];
-                            let active = self.selected == Some(i) && any_playing;
-                            let label = if active {
-                                format!("▶ {}", t.engine)
-                            } else {
-                                t.engine.clone()
-                            };
-                            if ui
-                                .selectable_label(active, label)
-                                .on_hover_text(format!(
-                                    "{} ({} KB)",
-                                    t.path.display(),
-                                    t.size_kb
-                                ))
-                                .clicked()
-                            {
-                                to_play = Some(i);
-                            }
-                        }
+                for (root, pieces) in &folded {
+                    let total_renders: usize =
+                        pieces.values().map(|v| v.len()).sum();
+                    let n_pieces = pieces.len();
+                    // If the root has only one piece (and ≤ 4 renders),
+                    // skip the collapsing header — render the row
+                    // inline for cheap browse.
+                    let inline = n_pieces <= 1 && total_renders <= 4;
+                    let any_active_in_root = pieces.values().flatten().any(|i| {
+                        self.selected == Some(*i) && any_playing
                     });
-                    ui.add_space(2.0);
+
+                    let render_piece_row =
+                        |ui: &mut egui::Ui,
+                         piece: &str,
+                         indices: &[usize],
+                         to_play: &mut Option<usize>| {
+                            ui.horizontal_wrapped(|ui| {
+                                let active_in_group = indices.iter().any(|i| {
+                                    self.selected == Some(*i) && any_playing
+                                });
+                                let source_label = indices
+                                    .first()
+                                    .and_then(|i| self.tracks.get(*i))
+                                    .map(|t| t.source.as_str())
+                                    .unwrap_or("?");
+                                let source_color = match source_label {
+                                    "keysynth" => egui::Color32::from_rgb(180, 200, 255),
+                                    "chiptune-demo" => egui::Color32::from_rgb(120, 220, 140),
+                                    "listener-lab" => egui::Color32::from_rgb(220, 180, 255),
+                                    "midi" => egui::Color32::from_rgb(255, 200, 120),
+                                    _ => egui::Color32::from_rgb(180, 180, 180),
+                                };
+                                ui.add_sized(
+                                    [110.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(source_label)
+                                            .color(source_color)
+                                            .monospace()
+                                            .small(),
+                                    ),
+                                );
+                                let piece_text = if active_in_group {
+                                    egui::RichText::new(piece)
+                                        .color(egui::Color32::from_rgb(255, 200, 80))
+                                        .strong()
+                                        .monospace()
+                                } else {
+                                    egui::RichText::new(piece).monospace()
+                                };
+                                let piece_w = (avail_w * 0.30).max(200.0);
+                                ui.add_sized(
+                                    [piece_w, 22.0],
+                                    egui::Label::new(piece_text),
+                                );
+                                ui.separator();
+                                for &i in indices {
+                                    let t = &self.tracks[i];
+                                    let active = self.selected == Some(i) && any_playing;
+                                    let label = if active {
+                                        format!("▶ {}", t.engine)
+                                    } else {
+                                        t.engine.clone()
+                                    };
+                                    if ui
+                                        .selectable_label(active, label)
+                                        .on_hover_text(format!(
+                                            "{} ({} KB)",
+                                            t.path.display(),
+                                            t.size_kb
+                                        ))
+                                        .clicked()
+                                    {
+                                        *to_play = Some(i);
+                                    }
+                                }
+                            });
+                        };
+
+                    if inline {
+                        for (piece, indices) in pieces {
+                            render_piece_row(ui, piece, indices, &mut to_play);
+                            ui.add_space(2.0);
+                        }
+                    } else {
+                        let header_text = if any_active_in_root {
+                            egui::RichText::new(format!(
+                                "{root}  ({n_pieces} pieces · {total_renders} renders)  ▶"
+                            ))
+                            .color(egui::Color32::from_rgb(255, 200, 80))
+                            .strong()
+                        } else {
+                            egui::RichText::new(format!(
+                                "{root}  ({n_pieces} pieces · {total_renders} renders)"
+                            ))
+                            .strong()
+                        };
+                        let header = egui::CollapsingHeader::new(header_text)
+                            .default_open(any_active_in_root || total_renders <= 3)
+                            .id_salt(format!("fold-{root}"));
+                        header.show(ui, |ui| {
+                            for (piece, indices) in pieces {
+                                render_piece_row(ui, piece, indices, &mut to_play);
+                                ui.add_space(2.0);
+                            }
+                        });
+                    }
                 }
                 if let Some(i) = to_play {
                     self.preview(i);
