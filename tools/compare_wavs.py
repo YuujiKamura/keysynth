@@ -23,12 +23,11 @@ import numpy as np
 
 
 def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
-    """Load a mono 16-bit WAV. Returns (samples in [-1, 1], sample_rate)."""
+    """Load a WAV (mono or stereo) and downmix to mono in [-1, 1]."""
     with open(path, "rb") as f:
         d = f.read()
     if d[:4] != b"RIFF" or d[8:12] != b"WAVE":
         raise ValueError(f"{path}: not a RIFF/WAVE file")
-    # fmt chunk
     fmt_idx = d.find(b"fmt ")
     fmt_size = struct.unpack("<I", d[fmt_idx + 4 : fmt_idx + 8])[0]
     audio_format, n_channels, sr, _byte_rate, _block_align, bits_per_sample = struct.unpack(
@@ -36,7 +35,6 @@ def read_wav_mono(path: Path) -> tuple[np.ndarray, int]:
     )
     if audio_format != 1 or bits_per_sample != 16:
         raise ValueError(f"{path}: only PCM 16-bit supported (got fmt={audio_format} bits={bits_per_sample})")
-    # data chunk
     data_idx = d.find(b"data", fmt_idx + 8 + fmt_size)
     n_bytes = struct.unpack("<I", d[data_idx + 4 : data_idx + 8])[0]
     raw = np.frombuffer(d[data_idx + 8 : data_idx + 8 + n_bytes], dtype="<i2")
@@ -96,7 +94,7 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
     t_ref_st, f_ref_st, mag_ref_st = stft_db(ref, sr)
     t_cand_st, f_cand_st, mag_cand_st = stft_db(cand, sr)
 
-    fig, axes = plt.subplots(3, 2, figsize=(16, 10), sharex="col")
+    fig, axes = plt.subplots(4, 2, figsize=(16, 13))
     fig.suptitle(f"WAV comparison: {label_ref} (left) vs {label_cand} (right)", fontsize=12)
 
     t_axis = np.arange(n) / sr
@@ -123,6 +121,7 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
     # Row 3: spectrogram (clamp 0-8 kHz, dB-scaled)
     f_lim = 8000.0
     vmin, vmax = -80, 0
+    peak_global = max(np.max(mag_ref_st), np.max(mag_cand_st))
     for ax, t_st, f_st, mag, label in [
         (axes[2, 0], t_ref_st, f_ref_st, mag_ref_st, label_ref),
         (axes[2, 1], t_cand_st, f_cand_st, mag_cand_st, label_cand),
@@ -130,9 +129,7 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
         if mag.size == 0:
             ax.set_title(f"{label} — (signal too short for STFT)")
             continue
-        # Normalise so 0 dB = peak across both files (consistent scale).
-        peak = max(np.max(mag_ref_st), np.max(mag_cand_st))
-        mag_norm = mag - peak  # dB relative to global peak
+        mag_norm = mag - peak_global
         f_mask = f_st <= f_lim
         ax.pcolormesh(
             t_st,
@@ -144,14 +141,116 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
             cmap="magma",
         )
         ax.set_title(f"{label} — spectrogram (dB rel. peak)")
-        ax.set_xlabel("time (s)")
         ax.set_ylabel("freq (Hz)")
         ax.set_ylim(0, f_lim)
+
+    # Row 4: residual = (ref - cand) in dB. Red = ref louder than cand
+    # (modal lacks this content). Blue = cand louder than ref (modal
+    # over-shoots here). Centred at 0, clip ±25 dB.
+    if mag_ref_st.size > 0 and mag_cand_st.size > 0:
+        # Align dimensions (truncate to min in each axis)
+        n_t = min(mag_ref_st.shape[1], mag_cand_st.shape[1])
+        n_f = min(mag_ref_st.shape[0], mag_cand_st.shape[0])
+        diff = mag_ref_st[:n_f, :n_t] - mag_cand_st[:n_f, :n_t]
+        f_axis = f_ref_st[:n_f]
+        t_axis_st = t_ref_st[:n_t]
+        f_mask = f_axis <= f_lim
+        residual_ax = axes[3, 0]
+        im = residual_ax.pcolormesh(
+            t_axis_st,
+            f_axis[f_mask],
+            diff[f_mask, :],
+            vmin=-25,
+            vmax=25,
+            shading="auto",
+            cmap="RdBu_r",
+        )
+        residual_ax.set_title(
+            "spectral residual (ref - cand, dB) — red = cand DEFICIT, blue = cand SURPLUS"
+        )
+        residual_ax.set_xlabel("time (s)")
+        residual_ax.set_ylabel("freq (Hz)")
+        residual_ax.set_ylim(0, f_lim)
+        plt.colorbar(im, ax=residual_ax, fraction=0.04, pad=0.02)
+
+        # Per-frequency-band average residual: positive → cand deficit
+        band_ax = axes[3, 1]
+        avg = np.mean(diff[f_mask, :], axis=1)
+        band_ax.plot(f_axis[f_mask], avg, linewidth=1.0)
+        band_ax.axhline(0, color="black", linewidth=0.5)
+        band_ax.fill_between(f_axis[f_mask], 0, avg, where=(avg > 0), alpha=0.3, color="red")
+        band_ax.fill_between(f_axis[f_mask], 0, avg, where=(avg < 0), alpha=0.3, color="blue")
+        band_ax.set_title("avg residual per frequency band (red = deficit)")
+        band_ax.set_xlabel("freq (Hz)")
+        band_ax.set_ylabel("ref - cand (dB)")
+        band_ax.set_xlim(0, f_lim)
+        band_ax.grid(alpha=0.3)
+    else:
+        for ax in axes[3]:
+            ax.set_title("(no residual — signal too short)")
 
     plt.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=120)
     plt.close(fig)
+
+    # ----- Numeric residual summary (no listener loop, supervised metric)
+    if mag_ref_st.size > 0 and mag_cand_st.size > 0:
+        # Recompute STFT in LINEAR-magnitude domain, not dB. dB residual
+        # is inflated by silent bins (log of near-zero blows up); linear
+        # mag residual measures actual energy gap.
+        n_fft = 2048
+        hop = 512
+
+        def stft_linear(samples: np.ndarray) -> np.ndarray:
+            window = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(n_fft) / (n_fft - 1)))
+            n_frames = 1 + (len(samples) - n_fft) // hop
+            out = np.zeros((n_fft // 2 + 1, n_frames), dtype=np.float32)
+            for k in range(n_frames):
+                start = k * hop
+                frame = samples[start : start + n_fft] * window
+                out[:, k] = np.abs(np.fft.rfft(frame))
+            return out
+
+        ref_lin = stft_linear(ref)
+        cand_lin = stft_linear(cand)
+        n_t = min(ref_lin.shape[1], cand_lin.shape[1])
+        n_f = min(ref_lin.shape[0], cand_lin.shape[0])
+        ref_lin = ref_lin[:n_f, :n_t]
+        cand_lin = cand_lin[:n_f, :n_t]
+        f_axis = np.arange(n_f) * 44100.0 / n_fft
+        f_mask = f_axis <= 8000.0
+
+        # L2 residual in linear magnitude. Treats "missing energy" and
+        # "extra energy" symmetrically; doesn't blow up on silent bins.
+        diff = ref_lin - cand_lin
+        residual_l2 = float(np.sqrt(np.mean(diff[f_mask, :] ** 2)))
+
+        # Per-band energy ratio: ref total / cand total in linear sum.
+        # Ratio > 1 means cand is QUIETER than ref (deficit), <1 means
+        # cand is LOUDER (surplus).
+        bands = [
+            (0, 250, "low (<250)"),
+            (250, 500, "low-mid (250-500)"),
+            (500, 1000, "mid (500-1k)"),
+            (1000, 2000, "mid-hi (1-2k)"),
+            (2000, 4000, "hi (2-4k)"),
+            (4000, 8000, "very-hi (4-8k)"),
+        ]
+        print(f"residual_l2={residual_l2:.6f}")
+        for lo, hi, name in bands:
+            band_mask = (f_axis >= lo) & (f_axis < hi)
+            if band_mask.any():
+                ref_e = float(np.sum(ref_lin[band_mask, :] ** 2))
+                cand_e = float(np.sum(cand_lin[band_mask, :] ** 2))
+                if cand_e > 1e-12:
+                    ratio_db = 10.0 * np.log10(ref_e / cand_e)
+                else:
+                    ratio_db = float("inf")
+                print(
+                    f"  band {name}: ref={ref_e:.2e} cand={cand_e:.2e} "
+                    f"ref/cand={ratio_db:+.1f} dB"
+                )
 
 
 def main() -> int:

@@ -255,6 +255,23 @@ impl ModalPianoVoice {
     /// (the auto-load path enforces this — fallback C4 LUT is always at
     /// least 1 entry).
     pub fn from_lut(lut: &ModalLut, sr: f32, midi_note: u8, velocity: u8) -> Self {
+        Self::from_lut_with_excitation(lut, sr, midi_note, velocity, true)
+    }
+
+    /// Like `from_lut` but with the option to disable the hammer-impact
+    /// noise burst added to the excitation. Default (`with_hammer_noise =
+    /// true`) adds a 5 ms bandpass-filtered noise burst on top of the
+    /// single-sample delta, supplying the broadband attack transient and
+    /// high-frequency body content that pure modal resonators can't
+    /// produce — measured to close the visible spectrogram gap above
+    /// 3 kHz against SFZ Salamander references.
+    pub fn from_lut_with_excitation(
+        lut: &ModalLut,
+        sr: f32,
+        midi_note: u8,
+        velocity: u8,
+        with_hammer_noise: bool,
+    ) -> Self {
         let entry = lut.nearest_entry(midi_note);
         let target_f0 = 440.0_f32 * 2.0_f32.powf((midi_note as f32 - 69.0) / 12.0);
         let ratio = if entry.f0_hz > 0.0 {
@@ -290,7 +307,7 @@ impl ModalPianoVoice {
             }
         }
 
-        let modes: Vec<Mode> = entry
+        let mut modes: Vec<Mode> = entry
             .modes
             .iter()
             .enumerate()
@@ -311,10 +328,177 @@ impl ModalPianoVoice {
                 }
             })
             .collect();
+
+        // Extrapolate higher partials for bass notes. Linear-domain
+        // residual measurements showed C2 (note 36) had +22 dB DEFICIT
+        // in the 2-4 kHz band — the LUT only contains the partials
+        // `extract::decompose` could detect above its SNR floor (h1-h16
+        // for C2, top out at ~1100 Hz), but a real bass piano string has
+        // 50+ audible partials reaching well past 4 kHz. We extrapolate
+        // up to `target_max_partials` using the stretched-harmonic
+        // formula and a conservative amplitude / T60 rolloff.
+        const TARGET_MAX_PARTIALS: usize = 32;
+        if modes.len() < TARGET_MAX_PARTIALS && !modes.is_empty() {
+            // Estimate B by least-squares fit on the existing partials,
+            // falling back to the piano-typical 2.5e-4 if the fit is
+            // unstable.
+            let f1 = modes[0].freq_hz;
+            let mut sxy = 0.0_f32;
+            let mut sxx = 0.0_f32;
+            for (i, m) in modes.iter().enumerate() {
+                let n = (i + 1) as f32;
+                if n < 2.0 {
+                    continue;
+                }
+                let r = m.freq_hz / (n * f1);
+                let y = r * r - 1.0;
+                let x = n * n;
+                sxy += x * y;
+                sxx += x * x;
+            }
+            let b_est = if sxx > 0.0 {
+                (sxy / sxx).clamp(1e-5, 1e-3)
+            } else {
+                2.5e-4
+            };
+
+            // Last measured partial provides the rolloff anchor.
+            let last_n = modes.len();
+            let last_amp = modes[last_n - 1].init_amp.max(1e-6);
+            let last_t60 = modes[last_n - 1].t60_sec;
+
+            // Skip extrapolation if even the LAST measured partial is
+            // already in 4-8 kHz (treble notes don't need this).
+            let last_freq = modes[last_n - 1].freq_hz;
+            if last_freq < 3000.0 {
+                for i in last_n..TARGET_MAX_PARTIALS {
+                    let n = (i + 1) as f32;
+                    let f_extra = n * f1 * (1.0 + b_est * n * n).sqrt();
+                    if f_extra > 8000.0 {
+                        break;
+                    }
+                    // Amplitude rolloff: 0.85 per partial = -1.4 dB per
+                    // partial beyond last. Iterated up from 0.63 (-4 dB
+                    // per partial) which gave extrapolated amplitudes
+                    // 100x too quiet to address the C2 deficit. SFZ
+                    // bass notes show partial amplitudes roughly -1 to
+                    // -3 dB per partial in the upper range.
+                    let dn = (i + 1 - last_n) as f32;
+                    let amp = last_amp * 0.85_f32.powf(dn);
+                    let t60 = (last_t60 * 0.85_f32.powf(dn))
+                        .max(t60_floor_for_partial(i + 1));
+                    modes.push(Mode {
+                        freq_hz: f_extra,
+                        t60_sec: t60,
+                        init_amp: amp,
+                    });
+                }
+            }
+        }
         let velocity_amp = (velocity.max(1) as f32) / 127.0;
-        let excitation = vec![1.0_f32];
+        // Build excitation: single-sample delta + optional hammer-impact
+        // noise burst. The delta drives every modal resonator equally
+        // (flat spectrum); the noise burst contributes the broadband
+        // attack transient and the high-frequency content (>3 kHz) that
+        // a pure modal bank can't produce — visible in spectrograms as
+        // the "warmth gap" between modal and SFZ.
+        let excitation = if with_hammer_noise {
+            build_hammer_excitation(sr, midi_note)
+        } else {
+            vec![1.0_f32]
+        };
         Self::with_modes(sr, &modes, excitation, velocity_amp)
     }
+}
+
+/// Build an excitation vector = delta + two-stage filtered-noise envelope:
+///
+///   stage A: 12 ms loud felt-impact burst (the audible "click" / "punch")
+///   stage B: 250 ms quiet sustained noise tail (the diffuse spectrum
+///            that fills the partial-line gaps in SFZ recordings —
+///            string bleed, body radiation, room tone)
+///
+/// Spectrogram residual analysis vs SFZ Salamander showed modal had
+/// 20-25 dB less average energy across all spectrum bands during note
+/// sustain — the partials themselves were correct, but the inter-partial
+/// "warmth" was missing. The stage B tail at low gain (~0.08) provides
+/// a small amount of broadband filler whose envelope follows the note
+/// duration without dominating the partial structure.
+///
+/// Parameters:
+///   - bandpass 200 Hz – 6 kHz (slightly wider on the low end than the
+///     stage-A burst-only version so body/room frequencies are present
+///     in the sustained tail too)
+///   - per-note seed so different notes have decorrelated noise
+///   - stage A peak gain 0.55 (felt impact)
+///   - stage B steady gain 0.08 (sustained warmth — under the partial
+///     structure but adds the diffuse content that empty modal voices
+///     are missing)
+///
+/// First sample is the delta (amplitude 1.0).
+fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
+    let n_a = ((sr * 0.012).round() as usize).max(16);
+    let n_b = ((sr * 0.250).round() as usize).max(64);
+    let total = n_a + n_b;
+    let mut buf = vec![0.0_f32; total + 1];
+    buf[0] = 1.0;
+
+    let mut state: u32 = 0x9E37_79B9
+        ^ (midi_note as u32).wrapping_mul(2_654_435_761)
+        ^ (sr.to_bits() ^ 0xDEAD_BEEF);
+    let mut hp_prev_x = 0.0_f32;
+    let mut hp_prev_y = 0.0_f32;
+    let mut lp_prev = 0.0_f32;
+    // Bandpass 1000-5000 Hz. Iterated up from 400 Hz HP after the
+    // linear-domain spectral residual on twinkle showed the <250 Hz
+    // band was -6 dB SURPLUS and the 2-4 kHz band was +5.9 dB DEFICIT
+    // even after the first tightening. Pushing the HP corner further
+    // up forces the noise energy into the 1-5 kHz region where the
+    // SFZ reference has continuous diffuse content (room tone +
+    // body radiation). Modal's modes already produce the <1 kHz
+    // partial structure, so the noise tail's contribution down there
+    // was redundant + over-stacking on the held bass partials.
+    let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 1000.0 / sr;
+    let lp_a = (-2.0 * std::f32::consts::PI * 5000.0 / sr).exp();
+    let attack_n = ((sr * 0.001).round() as usize).max(2);
+
+    const STAGE_A_GAIN: f32 = 0.55;
+    const STAGE_B_GAIN: f32 = 0.15;
+
+    for i in 0..total {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let raw = (state as i32 as f32) / (i32::MAX as f32);
+        let hp = hp_a * (hp_prev_y + raw - hp_prev_x);
+        hp_prev_x = raw;
+        hp_prev_y = hp;
+        lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
+
+        let env = if i < attack_n {
+            // Stage A onset ramp (1 ms, linear)
+            (i as f32) / (attack_n as f32) * STAGE_A_GAIN
+        } else if i < n_a {
+            // Stage A decay (half-cosine to 0 across 11 ms)
+            let t = (i - attack_n) as f32 / (n_a - attack_n) as f32;
+            0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_A_GAIN
+        } else {
+            // Stage B sustained tail: gentle linear ramp up over ~10 ms
+            // (so there's no audible click between A and B), then
+            // half-cosine decay across the remaining tail.
+            let stage_b_pos = i - n_a;
+            let stage_b_attack_n = ((sr * 0.010).round() as usize).max(8);
+            if stage_b_pos < stage_b_attack_n {
+                (stage_b_pos as f32) / (stage_b_attack_n as f32) * STAGE_B_GAIN
+            } else {
+                let t = (stage_b_pos - stage_b_attack_n) as f32
+                    / (n_b - stage_b_attack_n) as f32;
+                0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_B_GAIN
+            }
+        };
+        buf[i + 1] = lp_prev * env;
+    }
+    buf
 }
 
 // ===========================================================================

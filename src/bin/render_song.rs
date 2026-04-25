@@ -263,27 +263,53 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn write_wav(path: &std::path::Path, samples: &[f32]) -> Result<(), String> {
+fn write_wav_stereo(
+    path: &std::path::Path,
+    left: &[f32],
+    right: &[f32],
+) -> Result<(), String> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
     }
     let spec = WavSpec {
-        channels: 1,
+        channels: 2,
         sample_rate: SR,
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
     let mut w = WavWriter::create(path, spec).map_err(|e| format!("WavWriter::create: {e}"))?;
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let i = (clamped * i16::MAX as f32) as i16;
-        w.write_sample(i).map_err(|e| format!("write_sample: {e}"))?;
+    let n = left.len().min(right.len());
+    for i in 0..n {
+        let l = (left[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        let r = (right[i].clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+        w.write_sample(l)
+            .map_err(|e| format!("write_sample(L): {e}"))?;
+        w.write_sample(r)
+            .map_err(|e| format!("write_sample(R): {e}"))?;
     }
     w.finalize().map_err(|e| format!("finalize: {e}"))?;
     Ok(())
 }
 
-fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<Vec<f32>, String> {
+/// Constant-power pan curve. `pan` in [-1, +1]. Returns (left_gain, right_gain)
+/// with `left_gain² + right_gain² == 1.0`. pan = -1 → fully left, +1 → fully right.
+fn constant_power_pan(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    let theta = (p + 1.0) * std::f32::consts::FRAC_PI_4; // [0, π/2]
+    (theta.cos(), theta.sin())
+}
+
+/// Per-MIDI-note pan, mimicking a grand piano keyboard's spatial layout
+/// from the audience's perspective. MIDI 60 (C4) sits centre, the bass
+/// pans left, the treble pans right. Linear in semitones across MIDI
+/// 24..96 (≈ piano range), clamped beyond.
+fn pan_for_note(midi_note: u8) -> f32 {
+    const CENTRE: f32 = 60.0;
+    const SPAN: f32 = 36.0;
+    ((midi_note as f32 - CENTRE) / SPAN).clamp(-1.0, 1.0)
+}
+
+fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<f32>), String> {
     if args.engine == Engine::PianoModal {
         let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
         eprintln!("render_song: modal LUT source = {source}");
@@ -296,11 +322,13 @@ fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<Vec<f32>, 
         .fold(0.0_f32, f32::max);
     let total_sec = max_end + 2.0;
     let total_samples = (total_sec * SR as f32) as usize;
-    let mut mono = vec![0.0_f32; total_samples];
+    let mut left = vec![0.0_f32; total_samples];
+    let mut right = vec![0.0_f32; total_samples];
 
-    // Per-event voice. Each event occupies a window
-    // [start_sample, end_sample]; render note_on..note_off then let
-    // the release tail trail off through the remaining samples.
+    // Per-event voice. Each event renders mono (the voice itself
+    // doesn't know about stereo); we pan into L/R based on the note's
+    // position on the keyboard so the chord opens up spatially the way
+    // a recorded grand piano does.
     for ev in events {
         let start_sample = (ev.start_sec * SR as f32) as usize;
         let release_sample = ((ev.start_sec + ev.duration_sec) * SR as f32) as usize;
@@ -320,14 +348,16 @@ fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<Vec<f32>, 
         if release_at < voice_total {
             voice.render_add(&mut voice_buf[release_at..voice_total]);
         }
+        let (lg, rg) = constant_power_pan(pan_for_note(ev.midi_note));
         for (i, s) in voice_buf.iter().enumerate() {
-            mono[start_sample + i] += *s;
+            left[start_sample + i] += *s * lg;
+            right[start_sample + i] += *s * rg;
         }
     }
-    Ok(mono)
+    Ok((left, right))
 }
 
-fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<Vec<f32>, String> {
+fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<f32>), String> {
     let sfz_path = args
         .sfz_path
         .as_ref()
@@ -378,19 +408,22 @@ fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<Vec<f32>, Strin
     if cursor < total_samples {
         player.render(&mut left[cursor..total_samples], &mut right[cursor..total_samples]);
     }
-    let mut mono = vec![0.0_f32; total_samples];
-    for i in 0..total_samples {
-        mono[i] = (left[i] + right[i]) * 0.5;
-    }
-    Ok(mono)
+    // Keep the SFZ player's native stereo image — that's what makes it
+    // sound "spacious" vs the per-voice-pan modal stereo we synthesise.
+    Ok((left, right))
 }
 
-fn peak_normalise(samples: &mut [f32], target_dbfs: f32) {
-    let peak = samples.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+fn peak_normalise_stereo(left: &mut [f32], right: &mut [f32], target_dbfs: f32) {
+    let peak_l = left.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    let peak_r = right.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    let peak = peak_l.max(peak_r);
     if peak > 1e-9 {
         let target = 10f32.powf(target_dbfs / 20.0);
         let scale = target / peak;
-        for s in samples.iter_mut() {
+        for s in left.iter_mut() {
+            *s *= scale;
+        }
+        for s in right.iter_mut() {
             *s *= scale;
         }
     }
@@ -419,7 +452,7 @@ fn main() {
         events.len()
     );
 
-    let mut mono = match args.engine {
+    let (mut left, mut right) = match args.engine {
         Engine::SfzPiano => render_sfz_piece(&args, &events),
         _ => render_keysynth_piece(&args, &events),
     }
@@ -428,13 +461,17 @@ fn main() {
         std::process::exit(2);
     });
 
-    let raw_peak = mono.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
-    peak_normalise(&mut mono, -3.0);
-    eprintln!("render_song: raw peak {:.3} → normalised -3 dBFS", raw_peak);
+    let raw_peak_l = left.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    let raw_peak_r = right.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    peak_normalise_stereo(&mut left, &mut right, -3.0);
+    eprintln!(
+        "render_song: raw peak L={:.3} R={:.3} → normalised -3 dBFS",
+        raw_peak_l, raw_peak_r
+    );
 
-    if let Err(e) = write_wav(&args.out_path, &mono) {
+    if let Err(e) = write_wav_stereo(&args.out_path, &left, &right) {
         eprintln!("render_song: {e}");
         std::process::exit(2);
     }
-    eprintln!("render_song: wrote {}", args.out_path.display());
+    eprintln!("render_song: wrote {} (stereo)", args.out_path.display());
 }
