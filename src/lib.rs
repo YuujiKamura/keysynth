@@ -8,10 +8,13 @@
 pub mod analysis;
 pub mod chiptune_import;
 pub mod drums;
+pub mod dsp;
 pub mod extract;
 pub mod gm;
+pub mod resample;
 pub mod reverb;
 pub mod score;
+pub mod sequencer;
 pub mod sfz;
 pub mod soundboard;
 pub mod sympathetic;
