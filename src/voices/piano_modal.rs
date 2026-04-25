@@ -775,7 +775,16 @@ impl VoiceImpl for ModalPianoVoice {
         // this gain (both ref and candidate go through the same
         // peak normalisation in render_song), so iter A-J accept
         // decisions are unaffected.
-        const MODAL_OUTPUT_GAIN: f32 = 50.0;
+        // Iter M+: 50 → 100. The chord_headroom_audit test reports
+        // modal raw_peak ≈ 0.49 vs ~1.0-1.5 for other "clean" tier
+        // engines (Piano, PianoLite, KsRich, Sub). Users compensated
+        // by cranking master to ~3, which pushed modal into the warm
+        // tanh knee AND hard-clipped every other engine simultaneously
+        // — the reported 「三和音はまだ割れる」 on PianoModal. Bringing
+        // modal to ~1.0 raw peak puts it in the same headroom band as
+        // the rest at master=1.0, so the master fader doesn't have to
+        // span 1.0-3.0 just to balance modal against SFZ.
+        const MODAL_OUTPUT_GAIN: f32 = 100.0;
         for sample in buf.iter_mut() {
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).

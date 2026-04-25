@@ -1791,7 +1791,12 @@ mod tests {
             midi_to_freq(67),
         ];
         let velocity = 100;
-        let n_samples = (SR * 0.5) as usize; // 0.5 s = 22050 samples
+        // 3.0 s captures the steady-state plateau of even slow biquads.
+        // 0.5 s undercounted PianoModal because its partial T60s (1-29 s)
+        // mean the biquad bank is still ringing up in the first 500 ms;
+        // user reported audible 「割れ」 on 3-note chords that the
+        // initial 0.5 s window missed.
+        let n_samples = (SR * 3.0) as usize;
         let engines = [
             Engine::Square,
             Engine::Ks,
@@ -1815,7 +1820,11 @@ mod tests {
         // perceptually 「割れ」 on chord playing.
         const HARD_CLIP_PEAK: f32 = 2.5;
 
-        let mut report = String::from("\nchord headroom audit (Cmaj chord, vel=100, master=1.0):\n");
+        let mut report = String::from(
+            "\nchord headroom audit (Cmaj chord, vel=100):\n  \
+             format: raw_peak  post_tanh@m=1  m_safe (master at which post-tanh\n  \
+             leaves 'clean'<0.95)  m_clip (master at which post-tanh ≥ 0.99 hard clip)\n\n",
+        );
         let mut hard_clippers: Vec<(Engine, f32)> = Vec::new();
         for engine in engines.iter().copied() {
             let mut buf = vec![0.0_f32; n_samples];
@@ -1825,9 +1834,12 @@ mod tests {
             }
             let peak = buf.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
             let post_tanh = peak.tanh();
+            // tanh(x) = 0.95 → x ≈ 1.832 ; tanh(x) = 0.99 → x ≈ 2.647
+            let m_safe = 1.832 / peak.max(1e-6);
+            let m_clip = 2.647 / peak.max(1e-6);
             report.push_str(&format!(
-                "  {:>14?}  raw_peak={:6.3}  post_tanh@m=1.0={:.3}  ",
-                engine, peak, post_tanh
+                "  {:>14?}  raw={:6.3}  m=1→{:.3}  m_safe={:5.2}  m_clip={:5.2}  ",
+                engine, peak, post_tanh, m_safe, m_clip,
             ));
             if peak >= HARD_CLIP_PEAK {
                 report.push_str("HARD-CLIP");
