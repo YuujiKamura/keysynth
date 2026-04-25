@@ -117,66 +117,6 @@ fn compute_coefs(cos_omega: f32, t60_sec: f32, sr: f32) -> (f32, f32, f32) {
     (a1, a2, b0)
 }
 
-/// RBJ Audio EQ Cookbook low-shelf biquad (S=1 slope).
-/// Returns (b0, b1, b2, a1, a2) with a0 already divided out.
-fn low_shelf_coeffs(f0: f32, gain_db: f32, sr: f32) -> (f32, f32, f32, f32, f32) {
-    let a = 10f32.powf(gain_db / 40.0);
-    let w0 = 2.0 * std::f32::consts::PI * f0 / sr;
-    let cos_w0 = w0.cos();
-    let sin_w0 = w0.sin();
-    let alpha = sin_w0 / 2.0 * 2.0_f32.sqrt();
-    let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
-    let b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
-    let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0);
-    let b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha);
-    let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
-    let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
-    let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
-    (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
-}
-
-/// Per-voice low-shelf attenuator modeling soundboard radiation
-/// inefficiency below ~200 Hz. fc=200 Hz, gain=-6 dB, S=1.
-///
-/// Iter H tried fc=90 Hz/-9 dB + high-shelf @ 1.4 kHz/+2 dB; the
-/// high-shelf over-amplified mid-hi and very-hi (4-8k went from -2.2
-/// to -5.1 dB surplus). Iter H' drops the high-shelf and moves the
-/// low-shelf corner up to 200 Hz where the actual <250 surplus lives
-/// in the SFZ residual (twinkle modal vs SFZ, baseline 5.7 dB
-/// surplus across 0-250 Hz).
-struct LowShelf {
-    s1: f32,
-    s2: f32,
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-}
-
-impl LowShelf {
-    fn new(sr: f32) -> Self {
-        let (b0, b1, b2, a1, a2) = low_shelf_coeffs(200.0, -6.0, sr);
-        Self {
-            s1: 0.0,
-            s2: 0.0,
-            b0,
-            b1,
-            b2,
-            a1,
-            a2,
-        }
-    }
-
-    #[inline]
-    fn step(&mut self, x: f32) -> f32 {
-        let y = self.b0 * x + self.s1;
-        self.s1 = self.b1 * x - self.a1 * y + self.s2;
-        self.s2 = self.b2 * x - self.a2 * y;
-        y
-    }
-}
-
 /// Modal piano voice. Holds a parallel bank of resonators (one per
 /// mode) plus a hammer-impulse excitation buffer that's played out at
 /// note-on. After the impulse runs out, the resonators ring out at
@@ -204,7 +144,6 @@ pub struct ModalPianoVoice {
     /// the next render pass. Idempotent.
     damper_pending: bool,
     release: ReleaseEnvelope,
-    radiation: LowShelf,
 }
 
 impl ModalPianoVoice {
@@ -272,7 +211,6 @@ impl ModalPianoVoice {
             damper_t60_sec: 0.8,
             damper_pending: false,
             release: ReleaseEnvelope::new(0.800, sr),
-            radiation: LowShelf::new(sr),
         }
     }
 
@@ -823,9 +761,8 @@ impl VoiceImpl for ModalPianoVoice {
             for r in &mut self.resonators {
                 sum += r.step(x);
             }
-            let radiated = self.radiation.step(sum);
             let env = self.release.step();
-            *sample += radiated * env;
+            *sample += sum * env;
         }
     }
     fn trigger_release(&mut self) {
