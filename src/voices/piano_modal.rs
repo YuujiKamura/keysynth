@@ -144,6 +144,16 @@ pub struct ModalPianoVoice {
     /// the next render pass. Idempotent.
     damper_pending: bool,
     release: ReleaseEnvelope,
+    /// Residual layer (Smith commuted synthesis). Pre-recorded buffer
+    /// extracted from the SFZ ref minus the modal voice render of the
+    /// same note; carries the soundboard / body / room / hammer-felt
+    /// transient that the partial sum can't generate. Played sample-
+    /// for-sample alongside the biquad output starting at note_on.
+    /// Empty `Arc` if no residual was loaded for this note (caller
+    /// fell through `RESIDUAL_LUT::get()`).
+    residual: std::sync::Arc<Vec<f32>>,
+    residual_idx: usize,
+    residual_amp: f32,
 }
 
 impl ModalPianoVoice {
@@ -237,6 +247,11 @@ impl ModalPianoVoice {
             // (-15 dB/s) is a slow safety fade. Combined decay rate
             // is essentially damper-only on the audible portion.
             release: ReleaseEnvelope::new(4.000, sr),
+            // No residual by default — `from_lut` overrides this with
+            // the nearest residual buffer when RESIDUAL_LUT is set.
+            residual: std::sync::Arc::new(Vec::new()),
+            residual_idx: 0,
+            residual_amp: 0.0,
         }
     }
 
@@ -438,7 +453,24 @@ impl ModalPianoVoice {
         } else {
             vec![1.0_f32]
         };
-        Self::with_modes(sr, &modes, excitation, velocity_amp)
+        let mut voice = Self::with_modes(sr, &modes, excitation, velocity_amp);
+        // Smith commuted-synthesis residual: load the nearest pre-
+        // recorded "SFZ - modal" residual buffer if RESIDUAL_LUT is
+        // populated. The residual carries everything the partial sum
+        // can't generate (soundboard / body / room / hammer-felt
+        // transient). Velocity-scaled so quieter notes have a
+        // proportionally quieter residual.
+        let res_scale = modal_params().residual_amp;
+        if res_scale > 0.0 {
+            if let Some(reslut) = RESIDUAL_LUT.get() {
+                if let Some(entry) = reslut.nearest_entry(midi_note) {
+                    voice.residual = entry.samples.clone();
+                    voice.residual_idx = 0;
+                    voice.residual_amp = velocity_amp * res_scale;
+                }
+            }
+        }
+        voice
     }
 }
 
@@ -614,6 +646,125 @@ pub struct ModalLut {
 /// itself is `Clone` but every voice needs only a borrowed view, so we
 /// just keep one instance.
 pub static MODAL_LUT: OnceLock<ModalLut> = OnceLock::new();
+
+/// Per-note residual buffer extracted from the SFZ Salamander recording
+/// minus the modal voice render of the same note (Smith commuted-
+/// synthesis-style). Carries everything modal can't generate from a
+/// partial sum: hammer-felt contact noise, soundboard radiation modes,
+/// body resonances, sympathetic strings, room reflections, microphone
+/// characteristics. Trimmed to ~0.5 s (the transient + early decay
+/// portion that defines the recorded character; later sustain is
+/// partial-dominated and would just over-stack on modal output).
+#[derive(Clone, Debug)]
+pub struct ResidualEntry {
+    pub midi_note: u8,
+    /// Mono samples at 44.1 kHz. Held behind an `Arc` so multiple voices
+    /// share one allocation; each voice keeps its own playback index.
+    pub samples: std::sync::Arc<Vec<f32>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResidualLut {
+    pub entries: Vec<ResidualEntry>,
+    pub source: String,
+}
+
+impl ResidualLut {
+    /// Load every `residual_NN.wav` from `dir`. Names that don't parse as
+    /// `residual_<int>.wav` are skipped. Returns an empty Lut if no files
+    /// are found (caller decides whether to fall back to no-residual mode).
+    pub fn from_dir(dir: &Path) -> Result<Self, String> {
+        let mut entries: Vec<ResidualEntry> = Vec::new();
+        let read = std::fs::read_dir(dir)
+            .map_err(|e| format!("residual dir {dir:?}: {e}"))?;
+        for ent in read {
+            let ent = ent.map_err(|e| format!("residual entry: {e}"))?;
+            let path = ent.path();
+            let stem = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let midi: u8 = match stem.strip_prefix("residual_").and_then(|s| s.parse().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
+            let samples = read_wav_mono_44k(&path)?;
+            entries.push(ResidualEntry {
+                midi_note: midi,
+                samples: std::sync::Arc::new(samples),
+            });
+        }
+        entries.sort_by_key(|e| e.midi_note);
+        Ok(Self {
+            entries,
+            source: dir.display().to_string(),
+        })
+    }
+
+    pub fn nearest_entry(&self, midi_note: u8) -> Option<&ResidualEntry> {
+        self.entries
+            .iter()
+            .min_by_key(|e| (e.midi_note as i32 - midi_note as i32).unsigned_abs())
+    }
+}
+
+/// Process-wide residual buffer set, set once at startup by `main` (or
+/// left unset if no residual files are present, in which case modal
+/// voice runs without commuted-synthesis layer).
+pub static RESIDUAL_LUT: OnceLock<ResidualLut> = OnceLock::new();
+
+/// Minimal mono WAV reader for residual files (44.1 kHz, 16-bit PCM,
+/// 1 channel — what `tools/build_residual_ir.py` writes).
+fn read_wav_mono_44k(path: &Path) -> Result<Vec<f32>, String> {
+    use std::fs::File;
+    use std::io::{BufReader, Read};
+    let file = File::open(path).map_err(|e| format!("open {path:?}: {e}"))?;
+    let mut reader = BufReader::new(file);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {path:?}: {e}"))?;
+    if buf.len() < 44 || &buf[..4] != b"RIFF" || &buf[8..12] != b"WAVE" {
+        return Err(format!("{path:?}: not a RIFF/WAVE"));
+    }
+    let mut i = 12;
+    let mut data_off = None;
+    let mut data_len = 0usize;
+    let mut channels = 0u16;
+    let mut sr = 0u32;
+    let mut bits = 0u16;
+    while i + 8 <= buf.len() {
+        let chunk_id = &buf[i..i + 4];
+        let chunk_len = u32::from_le_bytes(buf[i + 4..i + 8].try_into().unwrap()) as usize;
+        match chunk_id {
+            b"fmt " => {
+                channels = u16::from_le_bytes(buf[i + 10..i + 12].try_into().unwrap());
+                sr = u32::from_le_bytes(buf[i + 12..i + 16].try_into().unwrap());
+                bits = u16::from_le_bytes(buf[i + 22..i + 24].try_into().unwrap());
+            }
+            b"data" => {
+                data_off = Some(i + 8);
+                data_len = chunk_len;
+                break;
+            }
+            _ => {}
+        }
+        i += 8 + chunk_len;
+    }
+    let data_off = data_off.ok_or_else(|| format!("{path:?}: no data chunk"))?;
+    if channels != 1 || sr != 44100 || bits != 16 {
+        return Err(format!(
+            "{path:?}: expected mono 16-bit 44.1 kHz, got ch={channels} sr={sr} bits={bits}"
+        ));
+    }
+    let pcm = &buf[data_off..data_off + data_len];
+    let mut out = Vec::with_capacity(pcm.len() / 2);
+    for chunk in pcm.chunks_exact(2) {
+        let v = i16::from_le_bytes([chunk[0], chunk[1]]);
+        out.push(v as f32 / 32768.0);
+    }
+    Ok(out)
+}
 
 /// Errors produced by `ModalLut::from_json_path`.
 #[derive(Debug)]
@@ -846,7 +997,17 @@ impl VoiceImpl for ModalPianoVoice {
                 sum += r.step(x);
             }
             let env = self.release.step();
+            // Modal partial sum (biquad bank output * envelope * gain).
             *sample += sum * env * modal_output_gain;
+            // Smith commuted-synthesis residual layer. Adds the pre-
+            // recorded SFZ - modal difference for the duration of the
+            // residual buffer (~0.5 s); note-on captures the recorded
+            // hammer-felt transient + soundboard / body / room
+            // characteristics that the partial bank can't produce.
+            if self.residual_idx < self.residual.len() {
+                *sample += self.residual[self.residual_idx] * self.residual_amp;
+                self.residual_idx += 1;
+            }
         }
     }
     fn trigger_release(&mut self) {

@@ -266,6 +266,21 @@ fn render_keysynth(args: &Args) -> Result<(Vec<f32>, Vec<f32>), String> {
         let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
         eprintln!("render_chord: modal LUT source = {source}");
         let _ = MODAL_LUT.set(lut);
+        // Optional residual layer (Smith commuted synthesis). Loaded
+        // when bench-out/RESIDUAL/ exists. Silently skipped otherwise
+        // so legacy renders (and the `build_residual_ir.py` pipeline
+        // itself, which renders modal-only) keep working.
+        let res_dir = std::path::PathBuf::from("bench-out/RESIDUAL");
+        if res_dir.is_dir() {
+            if let Ok(rl) = keysynth::voices::piano_modal::ResidualLut::from_dir(&res_dir) {
+                eprintln!(
+                    "render_chord: residual LUT source = {} ({} entries)",
+                    rl.source,
+                    rl.entries.len(),
+                );
+                let _ = keysynth::voices::piano_modal::RESIDUAL_LUT.set(rl);
+            }
+        }
     }
     let total_samples = (args.duration_sec * SR as f32) as usize;
     let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);

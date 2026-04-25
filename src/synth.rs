@@ -365,6 +365,14 @@ pub struct ModalParams {
     /// Read live per audio block so the slider takes effect on
     /// already-playing voices, not just new note_ons.
     pub output_gain: f32,
+    /// Smith commuted-synthesis residual layer amplitude. 0 disables
+    /// the layer (modal voice = pure partial sum). Higher values
+    /// inject more of the recorded SFZ-minus-modal residual on each
+    /// note_on. Trade-off: residual carries the missing hammer-felt
+    /// transient + body color for clean solo timbre, but stacks on
+    /// polyphonic passages because the body-color tail re-fires per
+    /// note. Default 0.0 keeps iter T baseline on long-form pieces.
+    pub residual_amp: f32,
 }
 
 impl Default for ModalParams {
@@ -375,6 +383,7 @@ impl Default for ModalParams {
             t60_cap_sec: 12.0,
             stage_b_gain: 0.10,
             output_gain: 80.0,
+            residual_amp: 0.0,
         }
     }
 }

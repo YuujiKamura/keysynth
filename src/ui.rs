@@ -356,6 +356,11 @@ impl eframe::App for KeysynthApp {
                             .step_by(1.0)
                             .text("modal gain"),
                     );
+                    ui.add(
+                        egui::Slider::new(&mut p.residual_amp, 0.0..=1.0)
+                            .step_by(0.05)
+                            .text("residual"),
+                    );
                     if ui.button("reset").clicked() {
                         p = ModalParams::default();
                     }
@@ -365,6 +370,7 @@ impl eframe::App for KeysynthApp {
                     || p.t60_cap_sec != p_before.t60_cap_sec
                     || p.stage_b_gain != p_before.stage_b_gain
                     || p.output_gain != p_before.output_gain
+                    || p.residual_amp != p_before.residual_amp
                 {
                     set_modal_params(p);
                 }

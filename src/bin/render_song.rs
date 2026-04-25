@@ -595,6 +595,17 @@ fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>,
         let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
         eprintln!("render_song: modal LUT source = {source}");
         let _ = MODAL_LUT.set(lut);
+        let res_dir = std::path::PathBuf::from("bench-out/RESIDUAL");
+        if res_dir.is_dir() {
+            if let Ok(rl) = keysynth::voices::piano_modal::ResidualLut::from_dir(&res_dir) {
+                eprintln!(
+                    "render_song: residual LUT source = {} ({} entries)",
+                    rl.source,
+                    rl.entries.len(),
+                );
+                let _ = keysynth::voices::piano_modal::RESIDUAL_LUT.set(rl);
+            }
+        }
     }
     // Total length = max(start + duration) + 2 s release tail.
     let max_end = events

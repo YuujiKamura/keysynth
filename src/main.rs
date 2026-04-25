@@ -303,6 +303,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = MODAL_LUT.set(lut);
     }
 
+    // Smith commuted-synthesis residual buffers. Optional — if the
+    // bench-out/RESIDUAL/ directory isn't present (built by
+    // `tools/build_residual_ir.py`), the modal voice runs without
+    // the residual layer (back to pure partial sum behaviour).
+    {
+        let dir = std::path::PathBuf::from("bench-out/RESIDUAL");
+        if dir.is_dir() {
+            match keysynth::voices::piano_modal::ResidualLut::from_dir(&dir) {
+                Ok(rl) => {
+                    eprintln!(
+                        "keysynth: residual LUT source = {} ({} entries)",
+                        rl.source,
+                        rl.entries.len(),
+                    );
+                    let _ = keysynth::voices::piano_modal::RESIDUAL_LUT.set(rl);
+                }
+                Err(e) => {
+                    eprintln!("keysynth: residual LUT load failed ({e}); modal runs without it");
+                }
+            }
+        } else {
+            eprintln!("keysynth: no residual LUT (bench-out/RESIDUAL/ not found)");
+        }
+    }
+
     let mut midi_in = MidiInput::new("keysynth")?;
     midi_in.ignore(Ignore::None);
 
