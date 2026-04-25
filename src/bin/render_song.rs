@@ -1296,11 +1296,11 @@ fn piece_assistant_uptempo() -> Vec<NoteEvent> {
 }
 
 fn piece_gemini_nocturne() -> Vec<NoteEvent> {
-    // Gemini original: Nocturne in C# Minor. 
+    // Gemini original: Nocturne in C# Minor.
     // Slow, atmospheric ballad, ~53 seconds at 72 BPM.
     // ABA structure (8 + 4 + 4 bars).
     let q = 60.0 / 72.0;
-    
+
     // Voicings
     const CSM: &[u8] = &[49, 52, 56]; // C#3 E3 G#3
     const FSM: &[u8] = &[54, 57, 61]; // F#3 A3 C#4
@@ -1390,6 +1390,201 @@ fn piece_gemini_nocturne() -> Vec<NoteEvent> {
     lay_layers_with_feel(q, Feel::Straight, &melody, &bass, &chords, 92, 75, 65)
 }
 
+fn piece_gemini_boogie() -> Vec<NoteEvent> {
+    // Gemini original: Boogie-Woogie Stride in G Major.
+    // High-energy, danceable, ~40 seconds at 144 BPM.
+    // Structure: A (8) + A (8) + B (4) + A-Final (8).
+    let q = 60.0 / 144.0;
+
+    // Voicings
+    const G_MAJ: &[u8] = &[55, 59, 62]; // G3 B3 D4
+    const C_MAJ: &[u8] = &[52, 55, 60, 64]; // C3 G3 C4 E4
+    const D7: &[u8] = &[54, 57, 60, 62]; // D3 F#3 A3 C4 D4
+    const E7: &[u8] = &[52, 56, 59, 62]; // E3 G#3 B3 D4
+
+    let mut melody = Vec::new();
+    let mut bass = Vec::new();
+    let mut chords = Vec::new();
+
+    // Section A Bass & Chords (0.0 to 32.0 beats)
+    let a_bass_chords: &[(f32, u8, &'static [u8])] = &[
+        (0.0, 31, G_MAJ), (4.0, 31, G_MAJ), (8.0, 36, C_MAJ), (12.0, 31, G_MAJ),
+        (16.0, 38, D7), (20.0, 36, C_MAJ), (24.0, 31, G_MAJ), (28.0, 38, D7),
+    ];
+    for &(off, root, chord) in a_bass_chords {
+        bass.push((off + 0.0, root, 0.9));
+        bass.push((off + 2.0, root + 7, 0.9));
+        chords.push((off + 1.0, chord, 0.6));
+        chords.push((off + 3.0, chord, 0.6));
+    }
+
+    // A Melody: Rhythmic, syncopated
+    let a_mel: &[(f32, u8, f32)] = &[
+        (0.0, 67, 0.5), (0.5, 71, 0.5), (1.0, 74, 1.0), (2.5, 74, 0.5), (3.0, 76, 1.0),
+        (4.0, 74, 0.5), (4.5, 71, 0.5), (5.0, 67, 1.0), (6.5, 67, 0.5), (7.0, 64, 1.0),
+        (8.0, 64, 0.5), (8.5, 67, 0.5), (9.0, 70, 0.5), (9.5, 72, 1.0), (11.0, 70, 0.5), (11.5, 67, 0.5),
+        (12.0, 67, 2.0),
+        (16.0, 78, 0.5), (17.0, 78, 0.5), (18.0, 76, 0.5), (19.0, 74, 1.0),
+        (20.0, 72, 0.5), (21.0, 72, 0.5), (22.0, 70, 0.5), (23.0, 67, 1.0),
+        (24.0, 67, 0.5), (24.5, 71, 0.5), (25.0, 74, 0.5), (25.5, 76, 0.5), (26.0, 79, 1.0), (27.0, 82, 1.0),
+        (28.0, 83, 0.5), (29.0, 79, 0.5), (30.0, 74, 1.0), (31.0, 67, 1.0),
+    ];
+    push_line(&mut melody, 0.0, a_mel);
+    push_line(&mut melody, 32.0, a_mel); // Repeat A
+
+    // Repeat Bass/Chords for A repeat
+    for &(off, root, chord) in a_bass_chords {
+        let b_off = off + 32.0;
+        bass.push((b_off + 0.0, root, 0.9));
+        bass.push((b_off + 2.0, root + 7, 0.9));
+        chords.push((b_off + 1.0, chord, 0.6));
+        chords.push((b_off + 3.0, chord, 0.6));
+    }
+
+    // --- Section B (Bridge, 4 bars) ---
+    // E7 | A7 (D7) | D7 | D7
+    let b_bass_chords: &[(f32, u8, &'static [u8])] = &[
+        (64.0, 28, E7), (68.0, 33, D7), (72.0, 38, D7), (76.0, 38, D7),
+    ];
+    for &(off, root, chord) in b_bass_chords {
+        bass.push((off + 0.0, root, 0.9));
+        bass.push((off + 2.0, root + 7, 0.9));
+        chords.push((off + 1.0, chord, 0.6));
+        chords.push((off + 3.0, chord, 0.6));
+    }
+    let b_mel: &[(f32, u8, f32)] = &[
+        (64.0, 76, 0.5), (64.5, 76, 0.5), (65.0, 80, 0.5), (65.5, 83, 1.0),
+        (68.0, 81, 0.5), (68.5, 78, 0.5), (69.0, 74, 1.0),
+        (72.0, 74, 0.5), (72.5, 78, 0.5), (73.0, 81, 0.5), (73.5, 84, 0.5), (74.0, 86, 2.0),
+    ];
+    push_line(&mut melody, 0.0, b_mel);
+
+    // Final A return
+    for &(off, root, chord) in a_bass_chords {
+        let f_off = off + 80.0;
+        bass.push((f_off + 0.0, root, 0.9));
+        bass.push((f_off + 2.0, root + 7, 0.9));
+        chords.push((f_off + 1.0, chord, 0.6));
+        chords.push((f_off + 3.0, chord, 0.6));
+    }
+    push_line(&mut melody, 80.0, a_mel);
+
+    lay_layers_with_feel(q, Feel::LightSwing, &melody, &bass, &chords, 105, 95, 85)
+}
+fn piece_codex_railspike() -> Vec<NoteEvent> {
+    // 「railspike」 — Codex がこの名前を選んだあと usage limit に当たって
+    // 中身は書けなかったので、本体は assistant の引き取り。train-clack
+    // boogie-woogie in C: classic 8-note bass figure on each bar
+    // (root-3-5-6-♭7-6-5-3) is the train. 12-bar blues progression
+    // I-I-I-I7 / IV7-IV7-I-I / V7-IV7-I-V7. Two choruses, ~144 BPM.
+    // Treble layers blues-scale shouts on the I/IV/V landings.
+    let q = 60.0 / 144.0;
+    let mut v: Vec<NoteEvent> = Vec::new();
+
+    let push_note = |v: &mut Vec<NoteEvent>, beat: f32, n: u8, dur: f32, vel: u8| {
+        v.push(NoteEvent {
+            start_sec: beat * q,
+            midi_note: n,
+            duration_sec: dur * q * 0.85,
+            velocity: vel,
+        });
+    };
+
+    // Boogie bass figure: 8 eighth notes per bar = root, 3rd, 5th,
+    // 6th, ♭7, 6th, 5th, 3rd. Dominant 7th flavour throughout — the
+    // ♭7 on beat 3 is the engine of the figure.
+    fn push_boogie_bar(
+        v: &mut Vec<NoteEvent>,
+        push_note: &impl Fn(&mut Vec<NoteEvent>, f32, u8, f32, u8),
+        bar_start: f32,
+        chord_root_midi: u8,
+    ) {
+        // Intervals in semitones from root for the 8 eighths:
+        // 0 (root), 4 (3), 7 (5), 9 (6), 10 (♭7), 9, 7, 4
+        const INTERVALS: [u8; 8] = [0, 4, 7, 9, 10, 9, 7, 4];
+        for (i, semi) in INTERVALS.iter().enumerate() {
+            let beat = bar_start + (i as f32) * 0.5;
+            push_note(v, beat, chord_root_midi + semi, 0.5, 90);
+        }
+    }
+
+    // 12-bar blues in C: I-I-I-I7 / IV-IV-I-I / V-IV-I-V (turnaround)
+    // C2=36, F2=41, G2=43.
+    let progression: [u8; 12] = [36, 36, 36, 36, 41, 41, 36, 36, 43, 41, 36, 43];
+
+    // Treble shouts — short syncopated riffs on each chord landing
+    // C blues scale: C E♭ F G♭ G B♭ C → 60, 63, 65, 66, 67, 70, 72
+    // F blues scale: F A♭ B♭ B C E♭ F → 65, 68, 70, 71, 72, 75, 77
+    // G blues scale: G B♭ C D♭ D F G → 67, 70, 72, 73, 74, 77, 79
+
+    // Chorus 1 treble (sparse — let the bass drive the train)
+    let treble_chorus_1: &[(f32, u8, f32)] = &[
+        // Bar 1 — 8th-note pickup riff into beat 3
+        (1.5, 67, 0.5), (2.0, 70, 0.5), (2.5, 72, 1.0),
+        // Bar 2 — answer
+        (5.5, 70, 0.5), (6.0, 67, 0.5), (6.5, 65, 1.5),
+        // Bar 5 — IV chord shout
+        (16.0, 72, 0.5), (16.5, 75, 0.5), (17.0, 77, 1.0),
+        (18.0, 75, 0.5), (18.5, 72, 0.5), (19.0, 70, 1.0),
+        // Bar 7 — back to I
+        (24.0, 67, 0.5), (24.5, 70, 0.5), (25.0, 72, 1.0),
+        (26.0, 70, 0.5), (26.5, 67, 0.5),
+        // Bar 9 — V chord climax
+        (32.0, 74, 0.5), (32.5, 77, 0.5), (33.0, 79, 1.0),
+        (34.0, 77, 0.5), (34.5, 74, 0.5),
+        // Bar 10 — IV (resolving)
+        (36.0, 75, 0.5), (36.5, 72, 0.5), (37.0, 70, 1.0),
+        // Bar 11 — I cadence
+        (40.0, 72, 0.5), (40.5, 70, 0.5), (41.0, 67, 1.0),
+        // Bar 12 — turnaround pickup to chorus 2
+        (44.0, 67, 0.5), (44.5, 70, 0.5), (45.0, 72, 0.5), (45.5, 74, 0.5),
+    ];
+
+    // Chorus 2 treble — busier, bigger
+    let treble_chorus_2: &[(f32, u8, f32)] = &[
+        // Bar 13 — call up high
+        (48.0, 75, 0.5), (48.5, 77, 0.5), (49.0, 79, 0.5), (49.5, 82, 0.5),
+        (50.0, 84, 1.0),
+        // Bar 14 — descend through C blues
+        (52.0, 82, 0.5), (52.5, 79, 0.5), (53.0, 77, 0.5), (53.5, 75, 0.5),
+        (54.0, 72, 1.0),
+        // Bar 15 — repeat with variation
+        (56.0, 75, 0.5), (56.5, 78, 0.5), (57.0, 79, 1.0),
+        (58.0, 77, 0.5), (58.5, 75, 0.5), (59.0, 72, 1.0),
+        // Bar 17 — IV
+        (64.0, 72, 0.5), (64.5, 75, 0.5), (65.0, 77, 0.5), (65.5, 80, 0.5),
+        (66.0, 81, 1.0),
+        // Bar 18
+        (68.0, 80, 0.5), (68.5, 77, 0.5), (69.0, 75, 1.0),
+        // Bar 19 — back to I
+        (72.0, 79, 0.5), (72.5, 75, 0.5), (73.0, 72, 0.5), (73.5, 70, 0.5),
+        (74.0, 67, 1.0),
+        // Bar 21 — V climax
+        (80.0, 79, 0.5), (80.5, 82, 0.5), (81.0, 84, 1.0),
+        // Bar 22 — IV resolution
+        (84.0, 82, 0.5), (84.5, 79, 0.5), (85.0, 77, 1.0),
+        // Bar 23 — I final
+        (88.0, 75, 0.5), (88.5, 72, 0.5), (89.0, 67, 0.5), (89.5, 60, 0.5),
+        // Bar 24 — V hold
+        (92.0, 67, 1.0), (93.0, 70, 1.0), (94.0, 72, 2.0),
+    ];
+
+    // Lay out bass: 24 bars (chorus 1: 0..12, chorus 2: 12..24)
+    for chorus in 0..2 {
+        for bar_idx in 0..12 {
+            let bar_start = (chorus as f32) * 48.0 + (bar_idx as f32) * 4.0;
+            push_boogie_bar(&mut v, &push_note, bar_start, progression[bar_idx]);
+        }
+    }
+    for &(b, n, d) in treble_chorus_1 {
+        push_note(&mut v, b, n, d, 100);
+    }
+    for &(b, n, d) in treble_chorus_2 {
+        push_note(&mut v, b, n, d, 105);
+    }
+    v
+}
+
 fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
     match name {
         "c_progression" => Ok(piece_c_progression()),
@@ -1410,13 +1605,15 @@ fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
         "assistant_internal" => Ok(piece_assistant_internal()),
         "assistant_uptempo" => Ok(piece_assistant_uptempo()),
         "codex_punchout" => Ok(piece_assistant_uptempo()),
+        "codex_railspike" => Ok(piece_codex_railspike()),
         "gemini_nocturne" => Ok(piece_gemini_nocturne()),
+        "gemini_boogie" => Ok(piece_gemini_boogie()),
         other => Err(format!(
             "unknown piece: {other} \
              (c_progression|minor_cadence|arpeggio|twinkle|bach_invention|\
               bach_prelude_c|fur_elise|gymnopedie|canon_d|blues_in_c|\
               maple_leaf_rag|entertainer|twelfth_street_rag|st_louis_blues|king_porter_stomp|\
-              assistant_internal|assistant_uptempo|codex_punchout|gemini_nocturne)"
+              assistant_internal|assistant_uptempo|codex_punchout|codex_railspike|gemini_nocturne|gemini_boogie)"
         )),
     }
 }
@@ -1471,7 +1668,7 @@ fn parse_args() -> Result<Args, String> {
                      options:\n  \
                      --engine ENGINE   square|ks|ks-rich|sub|fm|piano|piano-thick|piano-lite|\
                                        piano-5am|piano-modal|sfz-piano|koto\n  \
-                     --piece NAME      c_progression|minor_cadence|arpeggio|twinkle|bach_invention|gemini_nocturne\n  \
+                     --piece NAME      c_progression|minor_cadence|arpeggio|twinkle|bach_invention|gemini_nocturne|gemini_boogie\n  \
                      --sfz PATH        SFZ manifest (required for sfz-piano)\n  \
                      --modal-lut PATH  modal LUT JSON (auto-discovered if omitted)\n  \
                      --out PATH        output WAV path (required)"
