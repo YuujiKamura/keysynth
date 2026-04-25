@@ -21,6 +21,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# render_midi binary: parse SMF (Standard MIDI File) and play through any engine.
+midly = "0.5"
+
+# jukebox binary: simple egui WAV browser for A/B listening.
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -85,3 +91,29 @@ path = "src/bin/render_chord.rs"
 [[bin]]
 name = "render_song"
 path = "src/bin/render_song.rs"
+
+# render_midi binary: parse a Standard MIDI File (.mid) and render it
+# through any keysynth engine. Lets us test against real human-played
+# performances (piano-midi.de, Mutopia, Joplin piano rolls) instead of
+# hand-coded note tuples that lack microtiming.
+[[bin]]
+name = "render_midi"
+path = "src/bin/render_midi.rs"
+
+# render_chiptune binary: parse a chiptune-lab song JSON
+# (ai-chiptune-demo / listener-lab format) and render it through any
+# keysynth engine. Lead+harm+bass become pitched voices; drums overlay
+# via the rhythm-box module. Lets us listen to listener-lab's
+# transcriptions through SFZ Salamander or PianoModal instead of the
+# Web Audio NES synth.
+[[bin]]
+name = "render_chiptune"
+path = "src/bin/render_chiptune.rs"
+
+# jukebox binary: minimal egui WAV browser. Scans bench-out/iterH/ +
+# bench-out/songs/ for *.wav, lists them as selectable rows, plays the
+# selected one through the default audio output. For quick A/B listening
+# of multiple engine renders without launching a media player per file.
+[[bin]]
+name = "jukebox"
+path = "src/bin/jukebox.rs"

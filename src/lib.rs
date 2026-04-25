@@ -6,6 +6,7 @@
 //! future tools) can re-skin or embed it.
 
 pub mod analysis;
+pub mod chiptune_import;
 pub mod drums;
 pub mod extract;
 pub mod gm;
