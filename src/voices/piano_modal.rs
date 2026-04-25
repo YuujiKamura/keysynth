@@ -210,15 +210,21 @@ impl ModalPianoVoice {
             resonators,
             excitation: scaled_excitation,
             excitation_idx: 0,
-            // Damper T60 raised 0.12 → 0.8 s after live A/B against SFZ
-            // ("音圧が足りない" feedback): 0.12 s killed modes within
-            // ~0.4 s of note_off while SFZ samples sustain ~1.5-3 s.
-            // 0.8 s effective T60 gives ~2.6 s audible tail (-20 dB at
-            // T60/3, well above floor) — closer to the recorded
-            // release envelope.
+            // Damper T60 = 0.8 s on note_off. Felt damper landing on
+            // a Yamaha C5 string stops vibration in ~80-200 ms physically,
+            // but 0.12 s killed modes too aggressively in our voice
+            // (the partial bank was already lossy from the modal-only
+            // model); 0.8 s gives ~2.6 s audible tail closer to SFZ.
             damper_t60_sec: 0.8,
             damper_pending: false,
-            release: ReleaseEnvelope::new(0.800, sr),
+            // Iter Q: release envelope decoupled from damper. Was 0.8 s
+            // (matching damper) which compounded multiplicatively at
+            // note_off → effective decay ≈ -120 dB / 0.8 s, so a quick
+            // keypress dropped to silence in ~0.4 s ("変な途切れ方").
+            // Slowed to 4.0 s so damper (-75 dB/s) dominates and env
+            // (-15 dB/s) is a slow safety fade. Combined decay rate
+            // is essentially damper-only on the audible portion.
+            release: ReleaseEnvelope::new(4.000, sr),
         }
     }
 
@@ -796,7 +802,13 @@ impl VoiceImpl for ModalPianoVoice {
         // modal to ~1.0 raw peak puts it in the same headroom band as
         // the rest at master=1.0, so the master fader doesn't have to
         // span 1.0-3.0 just to balance modal against SFZ.
-        const MODAL_OUTPUT_GAIN: f32 = 100.0;
+        // Iter Q: 100 → 95. iter P's T60 ceiling let mid partials
+        // sustain longer, lifting the chord raw_peak from 0.97 to 1.02
+        // (chord_headroom_audit). At master=1 with ParallelComp's 1.3×
+        // multiplier this crossed into audible tanh saturation that
+        // the user heard as 「割れ気味」. 95 brings peak back to ~0.97,
+        // matching iter M's chord-clean tier.
+        const MODAL_OUTPUT_GAIN: f32 = 95.0;
         for sample in buf.iter_mut() {
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).
