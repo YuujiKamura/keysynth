@@ -38,6 +38,8 @@ reference/*.wav
 !bench-out/REF/square_c4_4s.wav
 !bench-out/REF/sfz_salamander_grand_v3_C4.wav
 !bench-out/REF/README.md
+!bench-out/REF/sfz_salamander_multi/
+!bench-out/REF/sfz_salamander_multi/**
 **/*.flac
 **/*.aif
 **/*.aiff
