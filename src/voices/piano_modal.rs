@@ -157,28 +157,36 @@ impl ModalPianoVoice {
     /// if you don't want this expansion.
     pub fn with_modes(sr: f32, modes: &[Mode], excitation: Vec<f32>, velocity_amp: f32) -> Self {
         const DETUNE_CENTS: f32 = 0.7;
+        // Two-polarization split per Weinreich (JASA 1977 "Coupled
+        // motion of piano strings"): each string vibrates in vertical
+        // and horizontal planes with very different bridge coupling.
+        // Vertical (strong coupling) decays fast and dominates the
+        // attack; horizontal (weak coupling) decays slow and provides
+        // the after-sound. Implemented as two parallel resonators per
+        // detuned sub-mode with different T60 multipliers and weights.
+        const POL_V_T60_MUL: f32 = 0.40;
+        const POL_H_T60_MUL: f32 = 1.80;
+        const POL_V_WEIGHT: f32 = 0.85;
+        const POL_H_WEIGHT: f32 = 0.15;
         let cents_to_ratio = |c: f32| 2.0_f32.powf(c / 1200.0);
-        let mut detuned: Vec<Mode> = Vec::with_capacity(modes.len() * 3);
+        let mut detuned: Vec<Mode> = Vec::with_capacity(modes.len() * 6);
         for m in modes {
-            // Each sub-mode gets 1/3 of the original amplitude so total
-            // energy stays constant. Centre is exactly on-pitch; flanks
-            // are ±DETUNE_CENTS.
+            // 3-string detune split (preserved): each sub-string gets
+            // 1/sqrt(3) of the original amplitude.
             let third = m.init_amp / 3.0_f32.sqrt();
-            detuned.push(Mode {
-                freq_hz: m.freq_hz * cents_to_ratio(-DETUNE_CENTS),
-                t60_sec: m.t60_sec,
-                init_amp: third,
-            });
-            detuned.push(Mode {
-                freq_hz: m.freq_hz,
-                t60_sec: m.t60_sec,
-                init_amp: third,
-            });
-            detuned.push(Mode {
-                freq_hz: m.freq_hz * cents_to_ratio(DETUNE_CENTS),
-                t60_sec: m.t60_sec,
-                init_amp: third,
-            });
+            for cents in [-DETUNE_CENTS, 0.0, DETUNE_CENTS] {
+                let f = m.freq_hz * cents_to_ratio(cents);
+                detuned.push(Mode {
+                    freq_hz: f,
+                    t60_sec: m.t60_sec * POL_V_T60_MUL,
+                    init_amp: third * POL_V_WEIGHT,
+                });
+                detuned.push(Mode {
+                    freq_hz: f,
+                    t60_sec: m.t60_sec * POL_H_T60_MUL,
+                    init_amp: third * POL_H_WEIGHT,
+                });
+            }
         }
         Self::with_modes_no_detune(sr, &detuned, excitation, velocity_amp)
     }
