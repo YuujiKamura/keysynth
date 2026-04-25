@@ -17,9 +17,11 @@ use std::time::Duration;
 use cpal::Stream;
 use eframe::egui;
 use midir::MidiInputConnection;
+use rustysynth::Synthesizer;
 
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
-use crate::synth::{DashState, Engine, LiveParams, MixMode};
+use crate::sfz::SfzPlayer;
+use crate::synth::{make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, Voice, VoiceImpl};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
 /// MIDI handles so they aren't dropped while the GUI is open.
@@ -28,6 +30,13 @@ pub struct AppContext {
     pub midi_conn: MidiInputConnection<()>,
     pub live: Arc<Mutex<LiveParams>>,
     pub dash: Arc<Mutex<DashState>>,
+    /// Shared voice pool — UI injects QWERTY keypresses through the
+    /// same path the MIDI callback uses.
+    pub voices: Arc<Mutex<Vec<Voice>>>,
+    /// Shared SF2 synth (None unless --sf2 was loaded).
+    pub synth: Arc<Mutex<Option<Synthesizer>>>,
+    /// Shared SFZ player (None unless --sfz was loaded).
+    pub sfz: Arc<Mutex<Option<SfzPlayer>>>,
     pub port_name: String,
     pub out_name: String,
     pub sr_hz: u32,
@@ -61,10 +70,152 @@ impl KeysynthApp {
     }
 }
 
+/// QWERTY → MIDI mapping (FL-Studio-style two-octave layout).
+/// Lower row Z..M = C4-B4 (60-71); upper row Q..U = C5-B5 (72-83).
+/// Black keys live on the row above (S/D/G/H/J for sharps in the
+/// lower octave; 2/3/5/6/7 for sharps in the upper octave).
+const QWERTY_TO_MIDI: &[(egui::Key, u8)] = &[
+    (egui::Key::Z, 60),
+    (egui::Key::S, 61),
+    (egui::Key::X, 62),
+    (egui::Key::D, 63),
+    (egui::Key::C, 64),
+    (egui::Key::V, 65),
+    (egui::Key::G, 66),
+    (egui::Key::B, 67),
+    (egui::Key::H, 68),
+    (egui::Key::N, 69),
+    (egui::Key::J, 70),
+    (egui::Key::M, 71),
+    (egui::Key::Q, 72),
+    (egui::Key::Num2, 73),
+    (egui::Key::W, 74),
+    (egui::Key::Num3, 75),
+    (egui::Key::E, 76),
+    (egui::Key::R, 77),
+    (egui::Key::Num5, 78),
+    (egui::Key::T, 79),
+    (egui::Key::Num6, 80),
+    (egui::Key::Y, 81),
+    (egui::Key::Num7, 82),
+    (egui::Key::U, 83),
+    (egui::Key::I, 84),
+];
+
+/// MIDI channel used for QWERTY keypresses so the dashboard can
+/// distinguish them from real MIDI input on channel 0-14.
+const QWERTY_MIDI_CHANNEL: u8 = 15;
+const QWERTY_VELOCITY: u8 = 100;
+
 impl eframe::App for KeysynthApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Repaint at ~60 fps so live indicators feel responsive.
         ctx.request_repaint_after(Duration::from_millis(16));
+
+        // QWERTY → voice pool injection. Same code path the MIDI
+        // callback uses (make_voice + voice-pool insert / eviction);
+        // mirrors note_off via trigger_release.
+        let (engine, sr_hz) = {
+            let lp = self.ctx.live.lock().unwrap();
+            (lp.engine, self.ctx.sr_hz as f32)
+        };
+        let mut presses: Vec<u8> = Vec::new();
+        let mut releases: Vec<u8> = Vec::new();
+        // Enumerate raw Key events instead of `key_pressed`/`key_released`
+        // so we can drop OS auto-repeat (WM_KEYDOWN keeps firing while
+        // a key is held, which would otherwise spawn a new voice every
+        // frame — heard as 連打).
+        ctx.input(|i| {
+            for event in &i.events {
+                if let egui::Event::Key {
+                    key,
+                    pressed,
+                    repeat,
+                    ..
+                } = event
+                {
+                    if *repeat {
+                        continue;
+                    }
+                    if let Some((_, n)) = QWERTY_TO_MIDI.iter().find(|(k, _)| k == key) {
+                        if *pressed {
+                            presses.push(*n);
+                        } else {
+                            releases.push(*n);
+                        }
+                    }
+                }
+            }
+        });
+        if !presses.is_empty() || !releases.is_empty() {
+            // Drive the shared SFZ / SF2 player too — Engine::SfzPiano and
+            // Engine::SfPiano return silent placeholder voices, so the real
+            // audio for those engines comes from the SFZ player or the
+            // rustysynth instance, not the voice pool.
+            if engine == Engine::SfzPiano {
+                if let Some(player) = self.ctx.sfz.lock().unwrap().as_mut() {
+                    for n in &presses {
+                        player.note_on(QWERTY_MIDI_CHANNEL, *n, QWERTY_VELOCITY);
+                    }
+                    for n in &releases {
+                        player.note_off(QWERTY_MIDI_CHANNEL, *n);
+                    }
+                }
+            } else if engine == Engine::SfPiano {
+                if let Some(synth) = self.ctx.synth.lock().unwrap().as_mut() {
+                    for n in &presses {
+                        synth.note_on(
+                            QWERTY_MIDI_CHANNEL as i32,
+                            *n as i32,
+                            QWERTY_VELOCITY as i32,
+                        );
+                    }
+                    for n in &releases {
+                        synth.note_off(QWERTY_MIDI_CHANNEL as i32, *n as i32);
+                    }
+                }
+            }
+            let mut pool = self.ctx.voices.lock().unwrap();
+            let mut dash = self.ctx.dash.lock().unwrap();
+            for note in presses {
+                let freq = midi_to_freq(note);
+                let inner: Box<dyn VoiceImpl> = make_voice(engine, sr_hz, freq, QWERTY_VELOCITY);
+                let v = Voice {
+                    key: (QWERTY_MIDI_CHANNEL, note),
+                    inner,
+                };
+                if let Some(slot) = pool
+                    .iter_mut()
+                    .find(|x| x.key == (QWERTY_MIDI_CHANNEL, note))
+                {
+                    *slot = v;
+                } else {
+                    const MAX_VOICES: usize = 32;
+                    if pool.len() >= MAX_VOICES {
+                        let evict_idx = pool
+                            .iter()
+                            .position(|x| x.inner.is_done() || x.inner.is_releasing())
+                            .unwrap_or(0);
+                        pool.remove(evict_idx);
+                    }
+                    pool.push(v);
+                }
+                dash.active_notes.insert((QWERTY_MIDI_CHANNEL, note));
+                dash.push_event(format!(
+                    "qwerty   ch{QWERTY_MIDI_CHANNEL} n{note} v{QWERTY_VELOCITY}"
+                ));
+            }
+            for note in releases {
+                if let Some(slot) = pool
+                    .iter_mut()
+                    .find(|x| x.key == (QWERTY_MIDI_CHANNEL, note))
+                {
+                    slot.inner.trigger_release();
+                }
+                dash.active_notes.remove(&(QWERTY_MIDI_CHANNEL, note));
+                dash.push_event(format!("qwerty-off ch{QWERTY_MIDI_CHANNEL} n{note}"));
+            }
+        }
 
         // Snapshot shared state under brief locks; release before drawing.
         let (
