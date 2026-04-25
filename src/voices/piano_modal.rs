@@ -467,11 +467,18 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
     // partial structure, so the noise tail's contribution down there
     // was redundant + over-stacking on the held bass partials.
     let hp_a = 1.0 - 2.0 * std::f32::consts::PI * 1000.0 / sr;
-    let lp_a = (-2.0 * std::f32::consts::PI * 5000.0 / sr).exp();
+    // Iter M: LP corner 5000 → 4000 Hz to stop the noise tail
+    // leaking into 4-8 kHz, where bach baseline showed -7.3 dB
+    // surplus (the band SFZ counterpoint pieces have almost
+    // nothing in, but modal noise tail did).
+    let lp_a = (-2.0 * std::f32::consts::PI * 4000.0 / sr).exp();
     let attack_n = ((sr * 0.001).round() as usize).max(2);
 
     const STAGE_A_GAIN: f32 = 0.55;
-    const STAGE_B_GAIN: f32 = 0.15;
+    // Iter M: 0.15 → 0.10 to reduce the held-note noise tail
+    // contribution across all bands; per-band residual showed the
+    // tail was over-stacking on the bass low surplus too.
+    const STAGE_B_GAIN: f32 = 0.10;
 
     for i in 0..total {
         state ^= state << 13;
