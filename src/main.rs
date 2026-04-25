@@ -74,14 +74,17 @@ impl Default for Args {
             engine: Engine::Square,
             port: None,
             list: false,
-            // Master gain pre-tanh. 3.0 sits well into the soft-clip
-            // saturation region for any non-trivial signal — single
-            // voice peak (1.0) → tanh(3.0) ≈ 0.995, two voices already
-            // bumping the ceiling. This trades early saturation for an
-            // "always loud, always present" feel under live MIDI, vs
-            // the older 0.3 which bench-favoured a clean linear region
-            // but felt distant on real hardware. Override via --master.
-            master: 3.0,
+            // Master gain pre-tanh. 1.0 leaves chord headroom: a
+            // single voice peak (1.0) reaches tanh(1.0) ≈ 0.76 (subtle
+            // saturation = warmth), and a 3-voice chord (peak ~3.0)
+            // hits ParallelComp's limiter side before tanh, keeping
+            // chords audible without crushing the attack transient.
+            // Was 3.0 historically when Modal was 300× quieter than
+            // other engines and master had to compensate; modal now
+            // ships an internal 50× output gain so the bus is level-
+            // matched and master no longer needs the boost. Override
+            // via --master.
+            master: 1.0,
             sf2: None,
             sf2_program: 0,
             sf2_bank: 0,
@@ -93,10 +96,14 @@ impl Default for Args {
             // grew their own modal soundboard, but live playing felt
             // dry; restore to 0.3.
             reverb_wet: 0.3,
-            // Default to plain tanh; user can switch to Limiter or
-            // ParallelComp via GUI dropdown / `--mix-mode <label>`.
+            // Default to ParallelComp so chord playing is the out-of-
+            // the-box experience, not Plain tanh hard-clip. The clean
+            // path (α=0.7) preserves attack dynamics while the
+            // compressed path (β=0.6) catches polyphony peaks. User
+            // can switch to Plain (honest tanh) or Limiter (hard
+            // peak limiting) via GUI dropdown / `--mix-mode <label>`.
             // Issue #4 phase 1.
-            mix_mode: MixMode::Plain,
+            mix_mode: MixMode::ParallelComp,
             modal_lut: None,
         }
     }

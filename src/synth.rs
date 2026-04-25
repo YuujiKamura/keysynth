@@ -840,11 +840,18 @@ pub fn midi_to_freq(note: u8) -> f32 {
 /// only exists so the voice-pool eviction logic can still track which
 /// (channel, note) pairs are sounding.
 pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn VoiceImpl + Send> {
+    // Per-engine velocity attenuation for chord headroom. The
+    // `chord_headroom_audit` test renders a 3-note Cmaj chord through
+    // every engine and reports raw bus peak; engines that exceed
+    // ~2.5 hard-clip post-tanh and were heard as 「割れ」 on chord
+    // playing. These divisors bring KsRich (3.70) and Sub (2.94) under
+    // the 2.0 threshold while leaving single-note loudness audible.
+    let vel_scaled = |div: u8| (velocity / div).max(1);
     match engine {
         Engine::Square => Box::new(SquareVoice::new(sr, freq, velocity)),
         Engine::Ks => Box::new(KsVoice::new(sr, freq, velocity)),
-        Engine::KsRich => Box::new(KsRichVoice::new(sr, freq, velocity)),
-        Engine::Sub => Box::new(SubVoice::new(sr, freq, velocity)),
+        Engine::KsRich => Box::new(KsRichVoice::new(sr, freq, vel_scaled(3))),
+        Engine::Sub => Box::new(SubVoice::new(sr, freq, vel_scaled(2))),
         Engine::Fm => Box::new(FmVoice::new(sr, freq, velocity)),
         Engine::Piano => Box::new(PianoVoice::with_preset(
             PianoPreset::PIANO,
@@ -1765,6 +1772,83 @@ mod tests {
                 engine,
             );
         }
+    }
+
+    /// Polyphony headroom audit: render a 3-note Cmaj chord through
+    /// every engine and report the raw bus peak. tanh saturation is
+    /// imperceptibly nonlinear up to ~0.5, "warm" up to ~1.5, hard
+    /// clip above ~2.0. With master=1.0 default, voices that produce
+    /// chord peaks > 2.0 will be heard as 「割れ」 even on moderate
+    /// chords, exactly the user complaint that motivated this test.
+    /// SFZ/SF placeholders render silence (their audio comes from the
+    /// shared player, not the voice pool) so they're skipped.
+    #[test]
+    fn chord_headroom_audit() {
+        // Cmaj triad: C4 (60) + E4 (64) + G4 (67).
+        let chord_freqs = [
+            midi_to_freq(60),
+            midi_to_freq(64),
+            midi_to_freq(67),
+        ];
+        let velocity = 100;
+        let n_samples = (SR * 0.5) as usize; // 0.5 s = 22050 samples
+        let engines = [
+            Engine::Square,
+            Engine::Ks,
+            Engine::KsRich,
+            Engine::Sub,
+            Engine::Fm,
+            Engine::Piano,
+            Engine::PianoThick,
+            Engine::PianoLite,
+            Engine::Piano5AM,
+            Engine::PianoModal,
+            Engine::Koto,
+        ];
+        // Initialise the modal LUT for PianoModal — without it
+        // make_voice falls back to a single-partial C4 patch which
+        // skews the headroom number.
+        let _ = MODAL_LUT.set(ModalLut::fallback_c4());
+
+        // tanh hard-clip threshold. master=1.0 default puts post-tanh
+        // saturation at >0.99 once the bus peak crosses ~2.0; that is
+        // perceptually 「割れ」 on chord playing.
+        const HARD_CLIP_PEAK: f32 = 2.5;
+
+        let mut report = String::from("\nchord headroom audit (Cmaj chord, vel=100, master=1.0):\n");
+        let mut hard_clippers: Vec<(Engine, f32)> = Vec::new();
+        for engine in engines.iter().copied() {
+            let mut buf = vec![0.0_f32; n_samples];
+            for &freq in &chord_freqs {
+                let mut v = make_voice(engine, SR, freq, velocity);
+                v.render_add(&mut buf);
+            }
+            let peak = buf.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+            let post_tanh = peak.tanh();
+            report.push_str(&format!(
+                "  {:>14?}  raw_peak={:6.3}  post_tanh@m=1.0={:.3}  ",
+                engine, peak, post_tanh
+            ));
+            if peak >= HARD_CLIP_PEAK {
+                report.push_str("HARD-CLIP");
+                hard_clippers.push((engine, peak));
+            } else if peak >= 1.5 {
+                report.push_str("warm-saturated");
+            } else {
+                report.push_str("clean");
+            }
+            report.push('\n');
+        }
+        // Print regardless of pass/fail so the user can see all values.
+        println!("{report}");
+        // Fail loudly if any engine is in HARD-CLIP territory at the
+        // default master gain. Future iterations should bring those
+        // engines into the warm-saturated band via per-voice gain
+        // staging.
+        assert!(
+            hard_clippers.is_empty(),
+            "engines clipping at master=1.0 chord: {hard_clippers:?}"
+        );
     }
 
     #[test]
