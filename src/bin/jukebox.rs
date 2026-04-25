@@ -68,6 +68,17 @@ fn classify_source(path: &Path, piece: &str) -> &'static str {
     if path_str.contains("midi_") || piece.starts_with("midi_") {
         return "midi";
     }
+    if piece.starts_with("tofu_") {
+        // Acceleration-of-Tofu game asset — SFX or BGM rendered from
+        // its Pygame synth (drum_machine, famicom_drum, etc.).
+        return "tofu";
+    }
+    if piece.starts_with("audio_") {
+        // Direct mp3-to-wav conversion of a reference recording
+        // (archive.org piano roll capture, etc.). Source material
+        // not synthesised by us.
+        return "archive-ref";
+    }
     "keysynth"
 }
 
@@ -1254,6 +1265,8 @@ impl eframe::App for Jukebox {
                                     "chiptune-demo" => egui::Color32::from_rgb(120, 220, 140),
                                     "listener-lab" => egui::Color32::from_rgb(220, 180, 255),
                                     "midi" => egui::Color32::from_rgb(255, 200, 120),
+                                    "tofu" => egui::Color32::from_rgb(255, 140, 140),
+                                    "archive-ref" => egui::Color32::from_rgb(160, 240, 220),
                                     _ => egui::Color32::from_rgb(180, 180, 180),
                                 };
                                 ui.add_sized(
