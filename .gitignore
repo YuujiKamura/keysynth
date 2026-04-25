@@ -1,4 +1,5 @@
 /target
+target-local/
 
 # CARGO_TARGET_DIR may point elsewhere; keep the default rule too.
 
@@ -44,9 +45,26 @@ reference/*.wav
 **/*.aif
 **/*.aiff
 **/*.mp3
+**/*.mp4
+**/*.webm
+**/*.mkv
 **/*.ogg
 **/*.opus
 **/*.m4a
+**/*.aac
+**/*.wma
+# Standard MIDI files acquired from third-party sites (bitmidi, archive.org,
+# Mutopia, piano-midi.de, etc.) often have ambiguous redistribution terms even
+# when the underlying score is public domain. Keep the whole bench-out/MIDI/
+# tree local-only. Hand-authored .mid produced by our own tooling can be
+# explicitly whitelisted under bench-out/REF/ when needed.
+**/*.mid
+**/*.midi
+!bench-out/REF/**/*.mid
+!bench-out/REF/**/*.midi
+# JSON transcriptions emitted by listener-lab from copyrighted audio are
+# derivative works — keep them out of git the same as the source mp3s.
+bench-out/CHIPTUNE/
 **/*.sf2
 **/*.sf3
 **/*.sfz
