@@ -226,6 +226,29 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
         diff = ref_lin - cand_lin
         residual_l2 = float(np.sqrt(np.mean(diff[f_mask, :] ** 2)))
 
+        # A-weighted residual_l2: same diff² but weighted per-frequency
+        # by the IEC 61672 A-curve (linear power weight = 10^(A_dB/10)).
+        # Ear-relevant: emphasises 500-5000 Hz where human sensitivity
+        # peaks, de-emphasises <100 Hz and >10 kHz. Diverges from the
+        # unweighted metric when modal+filter trades a low-band fix
+        # for mid-band buildup that the listener still hears.
+        f_safe = np.maximum(f_axis, 1.0)
+        f2 = f_safe ** 2
+        ra = (
+            (12194.0 ** 2) * (f_safe ** 4)
+            / (
+                (f2 + 20.6 ** 2)
+                * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
+                * (f2 + 12194.0 ** 2)
+            )
+        )
+        a_db = 20.0 * np.log10(np.maximum(ra, 1e-12)) + 2.00
+        a_w = 10.0 ** (a_db / 10.0)  # linear power weight
+        a_w_masked = np.where(f_mask, a_w, 0.0)[:, None]
+        weighted_sq = (diff ** 2) * a_w_masked
+        denom = float(np.sum(a_w_masked) * diff.shape[1])
+        residual_l2_aw = float(np.sqrt(np.sum(weighted_sq) / max(denom, 1e-12)))
+
         # Per-band energy ratio: ref total / cand total in linear sum.
         # Ratio > 1 means cand is QUIETER than ref (deficit), <1 means
         # cand is LOUDER (surplus).
@@ -238,6 +261,7 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
             (4000, 8000, "very-hi (4-8k)"),
         ]
         print(f"residual_l2={residual_l2:.6f}")
+        print(f"residual_l2_aw={residual_l2_aw:.6f}")
         for lo, hi, name in bands:
             band_mask = (f_axis >= lo) & (f_axis < hi)
             if band_mask.any():
