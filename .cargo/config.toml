@@ -1,0 +1,11 @@
+# Persist build environment so render_nsf works without manually exporting
+# the CXXFLAGS workaround every time. The game-music-emu 0.3.0 build.rs
+# passes its USE_GME_* macros to cc-rs as space-separated `-D NAME` args,
+# which MSVC silently drops (the macro never reaches the compile, so
+# gme_type_list() returns empty and `gme_open_data` rejects every NSF file
+# as "Wrong file type for this emulator").
+#
+# Setting the defines explicitly via CXXFLAGS for the MSVC target makes
+# them stick, regardless of how cc-rs formats its own -D args.
+[env]
+CXXFLAGS_x86_64-pc-windows-msvc = "/DUSE_GME_NSF /DUSE_GME_NSFE /DUSE_GME_AY /DUSE_GME_GBS /DUSE_GME_HES /DUSE_GME_KSS /DUSE_GME_SAP /DUSE_GME_SPC"

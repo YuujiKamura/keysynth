@@ -28,6 +28,23 @@ midly = "0.5"
 # (issue #7 Stage 1). rodio dropped in favour of a direct cpal::Stream
 # that sums N tracks per audio callback.
 
+# NSF (Nintendo Sound Format) playback: bit-exact ground-truth renders of
+# NES game music that we can compare Listener-AI's transcriptions against.
+# Reduces audio fidelity to a measurable thing (NSF emu = truth, keysynth
+# square = engine, Gemini→keysynth = AI). LGPL-2.1 in the underlying
+# libgme is dynamic-linked so this stays compatible with our MIT licence.
+# NOTE: game-music-emu 0.3.0's safe wrapper has a `transmute(*const T) -> Arc<T>`
+# bug in EmuHandle::new that segfaults from_file() on Windows MSVC. We pull
+# in the crate purely so its build.rs static-links libgme into our binary;
+# render_nsf.rs declares the C ABI symbols itself and skips the broken
+# wrapper. NSF-only feature set keeps the build green (Vgm_Emu.cpp fails
+# under MSVC -W4).
+# Enable all formats EXCEPT vgm/gym which fail to build under MSVC -W4
+# (the Vgm_Emu.cpp / Gym_Emu.cpp sources hit unfixable warnings-as-errors).
+# Crucially keep nsfe — many "NSF" files in the wild are actually NSFE
+# (extended) and gme_open_data refuses them when only `nsf` is enabled.
+game-music-emu = { version = "0.3", default-features = false, features = ["nsf", "nsfe", "ay", "gbs", "hes", "kss", "sap", "spc"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -127,3 +144,12 @@ path = "src/bin/jukebox.rs"
 [[bin]]
 name = "seq_grid"
 path = "src/bin/seq_grid.rs"
+
+# render_nsf binary: decode an NSF (Nintendo Sound Format) file via libgme
+# and emit a wav. This is the *truth* track for the Listener-AI evaluation
+# pipeline -- whatever the emulator outputs IS what the original NES game
+# sounded like. Compare against listener_<song>_*.wav to score how far
+# the Gemini-transcribed render drifted from ground truth.
+[[bin]]
+name = "render_nsf"
+path = "src/bin/render_nsf.rs"

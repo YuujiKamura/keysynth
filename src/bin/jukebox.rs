@@ -39,6 +39,11 @@ struct Track {
 const ENGINE_SUFFIXES: &[&str] = &[
     "sfz", "modal", "square", "ks", "ks-rich", "sub", "fm", "piano", "piano-thick",
     "piano-lite", "piano-5am", "koto",
+    // "pure" marks an NSF/libgme ground-truth render — it isn't a keysynth
+    // engine, but tagging it like one lets the fold-by-piece grouper pair
+    // nsf_parodius_03_vic_viper_pure with audio_parodius_03_vic_viper /
+    // listener_parodius_03_vic_viper_square in the same row.
+    "pure",
 ];
 
 fn classify_source(path: &Path, piece: &str) -> &'static str {
@@ -78,6 +83,13 @@ fn classify_source(path: &Path, piece: &str) -> &'static str {
         // (archive.org piano roll capture, etc.). Source material
         // not synthesised by us.
         return "archive-ref";
+    }
+    if piece.starts_with("nsf_") {
+        // libgme-rendered ground truth from a Nintendo Sound Format file.
+        // This IS what the original NES game sounds like — every other
+        // *_parodius_* row should be measured against the matching
+        // nsf_parodius_*_pure track.
+        return "nsf-truth";
     }
     "keysynth"
 }
@@ -1267,6 +1279,9 @@ impl eframe::App for Jukebox {
                                     "midi" => egui::Color32::from_rgb(255, 200, 120),
                                     "tofu" => egui::Color32::from_rgb(255, 140, 140),
                                     "archive-ref" => egui::Color32::from_rgb(160, 240, 220),
+                                    // Ground-truth NSF render: bright yellow-green = "this is the
+                                    // measuring stick, line everything else up against it".
+                                    "nsf-truth" => egui::Color32::from_rgb(220, 255, 100),
                                     _ => egui::Color32::from_rgb(180, 180, 180),
                                 };
                                 ui.add_sized(
