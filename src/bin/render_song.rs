@@ -456,6 +456,280 @@ fn piece_canon_d() -> Vec<NoteEvent> {
     v
 }
 
+fn piece_blues_in_c() -> Vec<NoteEvent> {
+    // 12-bar blues in C at ~135 BPM (quarter = 0.444 s).
+    // Walking bass + 3-note rootless chord stabs on beats 2 & 4.
+    // Public-domain idiom (no specific copyrighted composition);
+    // tests modal voice on rhythmic keyboard material.
+    let q = 0.444_f32;
+    let mut v = Vec::new();
+    // Per-bar (chord, walking_bass_4_notes_quarter, stab_3_note_voicing).
+    // Walking bass picks chord tones + a passing tone leading to next bar.
+    let bars: &[([u8; 4], [u8; 3])] = &[
+        // bar 1: C7  bass C-E-G-A  stab E-G-Bb (3 7-th rootless)
+        ([36, 40, 43, 45], [52, 55, 58]),
+        // bar 2: C7  bass C-E-G-Bb (chromatic walk to F)
+        ([36, 40, 43, 46], [52, 55, 58]),
+        // bar 3: C7
+        ([36, 40, 43, 45], [52, 55, 58]),
+        // bar 4: C7  -> walk down to F (lead-in)
+        ([36, 40, 43, 41], [52, 55, 58]),
+        // bar 5: F7  bass F-A-C-D
+        ([41, 45, 48, 50], [57, 60, 63]), // A C Eb (b7 of F)
+        // bar 6: F7
+        ([41, 45, 48, 51], [57, 60, 63]),
+        // bar 7: C7
+        ([36, 40, 43, 45], [52, 55, 58]),
+        // bar 8: C7  -> walk up to G
+        ([36, 40, 43, 47], [52, 55, 58]),
+        // bar 9: G7  bass G-B-D-F
+        ([43, 47, 50, 53], [59, 62, 65]),
+        // bar 10: F7
+        ([41, 45, 48, 50], [57, 60, 63]),
+        // bar 11: C7
+        ([36, 40, 43, 45], [52, 55, 58]),
+        // bar 12: G7  turnaround
+        ([43, 47, 50, 47], [59, 62, 65]),
+    ];
+    for (bar_idx, (bass, stab)) in bars.iter().enumerate() {
+        let bar_start = bar_idx as f32 * 4.0 * q;
+        // 4 walking-bass quarter notes
+        for (beat, &n) in bass.iter().enumerate() {
+            v.push(NoteEvent {
+                start_sec: bar_start + beat as f32 * q,
+                midi_note: n,
+                duration_sec: q * 0.85,
+                velocity: 90,
+            });
+        }
+        // chord stabs on beat 2 and 4 (slightly shorter, accented)
+        for &beat in &[1.0_f32, 3.0] {
+            for &n in stab {
+                v.push(NoteEvent {
+                    start_sec: bar_start + beat * q,
+                    midi_note: n,
+                    duration_sec: q * 0.55,
+                    velocity: 80,
+                });
+            }
+        }
+    }
+    // RH melody: bluesy 4-bar pickup riff in bars 3-4 and 11-12
+    let melody: &[(f32, u8, f32)] = &[
+        // bars 3-4 fill (top voice): C5 Eb5 E5 G5 (blue thirds slide)
+        (8.0 * q, 72, 0.5 * q),
+        (8.5 * q, 75, 0.5 * q),
+        (9.0 * q, 76, 0.5 * q),
+        (9.5 * q, 79, q),
+        (10.5 * q, 76, 0.5 * q),
+        (11.0 * q, 75, 0.5 * q),
+        (11.5 * q, 72, 0.5 * q),
+        // bars 11-12 lick: same vibe
+        (40.0 * q, 76, 0.5 * q),
+        (40.5 * q, 79, 0.5 * q),
+        (41.0 * q, 82, q),
+        (42.0 * q, 79, 0.5 * q),
+        (42.5 * q, 76, 0.5 * q),
+        (43.0 * q, 72, q),
+    ];
+    for &(t, n, d) in melody {
+        v.push(NoteEvent {
+            start_sec: t,
+            midi_note: n,
+            duration_sec: d * 0.92,
+            velocity: 100,
+        });
+    }
+    v
+}
+
+/// Helper: lay melody/bass/chord (in beat-time) out as NoteEvents in seconds.
+fn lay_layers(
+    q: f32,
+    melody: &[(f32, u8, f32)],
+    bass: &[(f32, u8, f32)],
+    chords: &[(f32, &[u8], f32)],
+    melody_vel: u8,
+    bass_vel: u8,
+    chord_vel: u8,
+) -> Vec<NoteEvent> {
+    let mut v: Vec<NoteEvent> = Vec::new();
+    for &(b, n, d) in melody {
+        v.push(NoteEvent {
+            start_sec: b * q,
+            midi_note: n,
+            duration_sec: d * q * 0.92,
+            velocity: melody_vel,
+        });
+    }
+    for &(b, n, d) in bass {
+        v.push(NoteEvent {
+            start_sec: b * q,
+            midi_note: n,
+            duration_sec: d * q * 0.95,
+            velocity: bass_vel,
+        });
+    }
+    for &(b, ns, d) in chords {
+        for &n in ns {
+            v.push(NoteEvent {
+                start_sec: b * q,
+                midi_note: n,
+                duration_sec: d * q * 0.85,
+                velocity: chord_vel,
+            });
+        }
+    }
+    v
+}
+
+fn piece_maple_leaf_rag() -> Vec<NoteEvent> {
+    // Scott Joplin, Maple Leaf Rag (1899). A strain opening 8 bars in
+    // A♭ major. Stride left hand (bass on 1/3, chord on 2/4),
+    // single-line treble. Public domain. ~105 BPM.
+    let q = 60.0 / 105.0;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0, 68, 0.5), (0.5, 75, 0.25), (0.75, 73, 0.25),
+        (1.0, 72, 0.5), (1.5, 75, 0.5), (2.0, 80, 0.5),
+        (2.5, 75, 0.5), (3.0, 72, 1.0),
+        (4.0, 68, 0.5), (4.5, 75, 0.25), (4.75, 73, 0.25),
+        (5.0, 72, 0.5), (5.5, 75, 0.5), (6.0, 80, 1.0),
+        (7.0, 75, 1.0),
+    ];
+    let bass: &[(f32, u8, f32)] = &[
+        (0.0, 44, 0.5), (1.0, 51, 0.5), (2.0, 44, 0.5), (3.0, 51, 0.5),
+        (4.0, 44, 0.5), (5.0, 51, 0.5), (6.0, 44, 0.5), (7.0, 51, 0.5),
+    ];
+    let ab_triad: &[u8] = &[60, 63, 68];
+    let chords: &[(f32, &[u8], f32)] = &[
+        (0.5, ab_triad, 0.5), (1.5, ab_triad, 0.5),
+        (2.5, ab_triad, 0.5), (3.5, ab_triad, 0.5),
+        (4.5, ab_triad, 0.5), (5.5, ab_triad, 0.5),
+        (6.5, ab_triad, 0.5), (7.5, ab_triad, 0.5),
+    ];
+    lay_layers(q, melody, bass, chords, 100, 85, 75)
+}
+
+fn piece_entertainer() -> Vec<NoteEvent> {
+    // Scott Joplin, The Entertainer (1902). A strain opening 8 bars
+    // in C major. Public domain. ~95 BPM ("Not fast" per Joplin).
+    let q = 60.0 / 95.0;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0, 76, 0.25), (0.25, 72, 0.25), (0.5, 76, 0.25), (0.75, 79, 0.25),
+        (1.0, 84, 1.0),
+        (2.0, 72, 0.25), (2.25, 76, 0.25), (2.5, 79, 0.25), (2.75, 84, 0.25),
+        (3.0, 83, 0.5), (3.5, 79, 0.5),
+        (4.0, 77, 0.25), (4.25, 76, 0.25), (4.5, 74, 0.5),
+        (5.0, 72, 1.0),
+        (6.0, 71, 0.5), (6.5, 72, 0.5),
+        (7.0, 74, 1.0),
+    ];
+    let bass: &[(f32, u8, f32)] = &[
+        (0.0, 36, 0.5), (1.0, 43, 0.5), (2.0, 36, 0.5), (3.0, 43, 0.5),
+        (4.0, 36, 0.5), (5.0, 43, 0.5), (6.0, 38, 0.5), (7.0, 43, 0.5),
+    ];
+    let c_maj: &[u8] = &[60, 64, 67];
+    let g7: &[u8] = &[59, 62, 67];
+    let d_min: &[u8] = &[62, 65, 69];
+    let chords: &[(f32, &[u8], f32)] = &[
+        (0.5, c_maj, 0.5), (1.5, c_maj, 0.5),
+        (2.5, c_maj, 0.5), (3.5, c_maj, 0.5),
+        (4.5, c_maj, 0.5), (5.5, g7, 0.5),
+        (6.5, d_min, 0.5), (7.5, g7, 0.5),
+    ];
+    lay_layers(q, melody, bass, chords, 100, 85, 75)
+}
+
+fn piece_twelfth_street_rag() -> Vec<NoteEvent> {
+    // Euday Bowman, Twelfth Street Rag (1914). A strain opening 8
+    // bars in F major. The 3-note A-G-F repeating motif is the
+    // signature. ~130 BPM. Public domain.
+    let q = 60.0 / 130.0;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0, 69, 0.333), (0.333, 67, 0.333), (0.666, 65, 0.334),
+        (1.0, 69, 0.333), (1.333, 67, 0.333), (1.666, 65, 0.334),
+        (2.0, 69, 0.333), (2.333, 67, 0.333), (2.666, 65, 0.334),
+        (3.0, 65, 1.0),
+        (4.0, 70, 0.333), (4.333, 69, 0.333), (4.666, 67, 0.334),
+        (5.0, 70, 0.333), (5.333, 69, 0.333), (5.666, 67, 0.334),
+        (6.0, 70, 0.5), (6.5, 69, 0.5),
+        (7.0, 67, 1.0),
+    ];
+    let bass: &[(f32, u8, f32)] = &[
+        (0.0, 41, 0.5), (1.0, 48, 0.5), (2.0, 41, 0.5), (3.0, 48, 0.5),
+        (4.0, 41, 0.5), (5.0, 48, 0.5), (6.0, 41, 0.5), (7.0, 48, 0.5),
+    ];
+    let f_maj: &[u8] = &[57, 60, 65];
+    let c7: &[u8] = &[55, 60, 64];
+    let chords: &[(f32, &[u8], f32)] = &[
+        (0.5, f_maj, 0.5), (1.5, c7, 0.5),
+        (2.5, f_maj, 0.5), (3.5, c7, 0.5),
+        (4.5, f_maj, 0.5), (5.5, c7, 0.5),
+        (6.5, f_maj, 0.5), (7.5, c7, 0.5),
+    ];
+    lay_layers(q, melody, bass, chords, 100, 85, 75)
+}
+
+fn piece_st_louis_blues() -> Vec<NoteEvent> {
+    // W.C. Handy, St. Louis Blues (1914). 12-bar blues chorus
+    // opening 8 bars in G major. Public domain. ~100 BPM.
+    let q = 60.0 / 100.0;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0, 67, 0.5), (0.5, 70, 0.5),
+        (1.0, 71, 0.5), (1.5, 67, 0.5),
+        (2.0, 70, 1.0), (3.0, 67, 1.0),
+        (4.0, 65, 0.5), (4.5, 67, 0.5),
+        (5.0, 70, 1.0), (6.0, 67, 1.0),
+        (7.0, 62, 1.0),
+    ];
+    let bass: &[(f32, u8, f32)] = &[
+        (0.0, 43, 1.0), (1.0, 43, 1.0), (2.0, 43, 1.0), (3.0, 43, 1.0),
+        (4.0, 43, 1.0), (5.0, 43, 1.0),
+        (6.0, 48, 1.0), (7.0, 48, 1.0),
+    ];
+    let g_maj: &[u8] = &[62, 67, 71];
+    let g7: &[u8] = &[62, 65, 71];
+    let c_maj: &[u8] = &[60, 64, 67];
+    let chords: &[(f32, &[u8], f32)] = &[
+        (0.5, g_maj, 0.5), (1.5, g_maj, 0.5),
+        (2.5, g_maj, 0.5), (3.5, g_maj, 0.5),
+        (4.5, g7, 0.5), (5.5, g7, 0.5),
+        (6.5, c_maj, 0.5), (7.5, c_maj, 0.5),
+    ];
+    lay_layers(q, melody, bass, chords, 100, 85, 75)
+}
+
+fn piece_king_porter_stomp() -> Vec<NoteEvent> {
+    // Jelly Roll Morton, King Porter Stomp (1924). A strain opening
+    // 8 bars in A♭ major. The bridge from ragtime to NO jazz.
+    // Public domain. ~150 BPM (Morton 1923 solo recording).
+    let q = 60.0 / 150.0;
+    let melody: &[(f32, u8, f32)] = &[
+        (0.0, 75, 0.5), (0.5, 80, 0.5),
+        (1.0, 79, 0.25), (1.25, 80, 0.25), (1.5, 75, 0.5),
+        (2.0, 72, 0.5), (2.5, 75, 0.5),
+        (3.0, 80, 1.0),
+        (4.0, 78, 0.5), (4.5, 79, 0.5),
+        (5.0, 80, 0.5), (5.5, 82, 0.5),
+        (6.0, 80, 0.5), (6.5, 75, 0.5),
+        (7.0, 72, 1.0),
+    ];
+    let bass: &[(f32, u8, f32)] = &[
+        (0.0, 44, 0.5), (1.0, 51, 0.5), (2.0, 44, 0.5), (3.0, 51, 0.5),
+        (4.0, 44, 0.5), (5.0, 49, 0.5), (6.0, 44, 0.5), (7.0, 51, 0.5),
+    ];
+    let ab_voicing: &[u8] = &[63, 68, 72];
+    let eb7: &[u8] = &[63, 67, 70];
+    let db_voicing: &[u8] = &[65, 68, 72];
+    let chords: &[(f32, &[u8], f32)] = &[
+        (0.5, ab_voicing, 0.5), (1.5, ab_voicing, 0.5),
+        (2.5, ab_voicing, 0.5), (3.5, eb7, 0.5),
+        (4.5, ab_voicing, 0.5), (5.5, db_voicing, 0.5),
+        (6.5, ab_voicing, 0.5), (7.5, eb7, 0.5),
+    ];
+    lay_layers(q, melody, bass, chords, 100, 85, 75)
+}
+
 fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
     match name {
         "c_progression" => Ok(piece_c_progression()),
@@ -467,10 +741,17 @@ fn pick_piece(name: &str) -> Result<Vec<NoteEvent>, String> {
         "fur_elise" => Ok(piece_fur_elise()),
         "gymnopedie" => Ok(piece_gymnopedie()),
         "canon_d" => Ok(piece_canon_d()),
+        "blues_in_c" => Ok(piece_blues_in_c()),
+        "maple_leaf_rag" => Ok(piece_maple_leaf_rag()),
+        "entertainer" => Ok(piece_entertainer()),
+        "twelfth_street_rag" => Ok(piece_twelfth_street_rag()),
+        "st_louis_blues" => Ok(piece_st_louis_blues()),
+        "king_porter_stomp" => Ok(piece_king_porter_stomp()),
         other => Err(format!(
             "unknown piece: {other} \
              (c_progression|minor_cadence|arpeggio|twinkle|bach_invention|\
-              bach_prelude_c|fur_elise|gymnopedie|canon_d)"
+              bach_prelude_c|fur_elise|gymnopedie|canon_d|blues_in_c|\
+              maple_leaf_rag|entertainer|twelfth_street_rag|st_louis_blues|king_porter_stomp)"
         )),
     }
 }
