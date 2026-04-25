@@ -1278,6 +1278,44 @@ impl eframe::App for Jukebox {
                                             .small(),
                                     ),
                                 );
+                                // Notation indicator: ♪ if at least one
+                                // render in the row goes through a known
+                                // synth engine (sfz / modal / square /
+                                // ...) — that proves the source has a
+                                // symbolic score (midi / chiptune JSON /
+                                // hand-coded piece function), so it can
+                                // be re-rendered through any engine.
+                                // ▮ when every render's engine is "—":
+                                // a static wav with no score backing
+                                // (tofu game asset, archive.org rip).
+                                let any_notated = indices.iter().any(|i| {
+                                    self.tracks
+                                        .get(*i)
+                                        .map(|t| t.engine != "—")
+                                        .unwrap_or(false)
+                                });
+                                let kind_glyph = if any_notated { "♪" } else { "▮" };
+                                let kind_color = if any_notated {
+                                    egui::Color32::from_rgb(255, 215, 100)
+                                } else {
+                                    egui::Color32::from_rgb(150, 150, 150)
+                                };
+                                let kind_hover = if any_notated {
+                                    "score-backed (midi / chiptune JSON / piece fn) — \
+                                     can re-render through any engine"
+                                } else {
+                                    "wav-only — no symbolic source, fixed audio"
+                                };
+                                ui.add_sized(
+                                    [22.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(kind_glyph)
+                                            .color(kind_color)
+                                            .strong(),
+                                    ),
+                                )
+                                .on_hover_text(kind_hover);
+
                                 let piece_text = if active_in_group {
                                     egui::RichText::new(piece)
                                         .color(egui::Color32::from_rgb(255, 200, 80))
