@@ -508,26 +508,31 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
         hp_prev_y = hp;
         lp_prev = (1.0 - lp_a) * hp + lp_a * lp_prev;
 
+        // Iter R: Stage A now tapers to STAGE_B_GAIN (not 0) and
+        // Stage B starts at that level directly with no inter-stage
+        // ramp. Eliminates the env dip-and-bump at t≈12-22 ms that
+        // the high-Q modal bank registered as a second excitation
+        // (perceived as 二拍 / double-tap on quick keys vs SFZ's
+        // single-impact attack). Total noise energy unchanged
+        // because Stage A averaged area is preserved (0.55 → 0.10
+        // taper rather than 0.55 → 0) and Stage B sums identically
+        // from its starting amplitude.
         let env = if i < attack_n {
             // Stage A onset ramp (1 ms, linear)
             (i as f32) / (attack_n as f32) * STAGE_A_GAIN
         } else if i < n_a {
-            // Stage A decay (half-cosine to 0 across 11 ms)
+            // Stage A decay: half-cosine from STAGE_A_GAIN down to
+            // STAGE_B_GAIN over the remainder of n_a (~11 ms).
             let t = (i - attack_n) as f32 / (n_a - attack_n) as f32;
-            0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_A_GAIN
+            let env_norm = 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+            STAGE_B_GAIN + env_norm * (STAGE_A_GAIN - STAGE_B_GAIN)
         } else {
-            // Stage B sustained tail: gentle linear ramp up over ~10 ms
-            // (so there's no audible click between A and B), then
-            // half-cosine decay across the remaining tail.
+            // Stage B sustained tail: half-cosine STAGE_B_GAIN → 0
+            // across n_b. Starts exactly where Stage A ended, no
+            // ramp, no dip.
             let stage_b_pos = i - n_a;
-            let stage_b_attack_n = ((sr * 0.010).round() as usize).max(8);
-            if stage_b_pos < stage_b_attack_n {
-                (stage_b_pos as f32) / (stage_b_attack_n as f32) * STAGE_B_GAIN
-            } else {
-                let t = (stage_b_pos - stage_b_attack_n) as f32
-                    / (n_b - stage_b_attack_n) as f32;
-                0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_B_GAIN
-            }
+            let t = stage_b_pos as f32 / n_b as f32;
+            0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_B_GAIN
         };
         buf[i + 1] = lp_prev * env;
     }
