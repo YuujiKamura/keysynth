@@ -117,3 +117,12 @@ path = "src/bin/render_chiptune.rs"
 [[bin]]
 name = "jukebox"
 path = "src/bin/jukebox.rs"
+
+# seq_grid binary: standalone egui step-sequencer pattern grid (issue
+# #7 Stage 6). Drives keysynth::sequencer::Pattern only — no Stage 1
+# mixer integration, no piano-voice involvement. Exports wav via the
+# existing drum synthesiser and plays it back through rodio. Save /
+# load JSON in bench-out/PATTERNS/.
+[[bin]]
+name = "seq_grid"
+path = "src/bin/seq_grid.rs"
