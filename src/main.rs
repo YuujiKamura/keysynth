@@ -360,7 +360,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?
             .clone()
     } else {
-        ports[0].clone()
+        // Prefer an AKAI device when no --port was given. Live workflow
+        // is "boot the keysynth GUI with the AKAI MPK plugged in", and
+        // the OS may enumerate IAC / loopback / virtual ports ahead of
+        // the physical keyboard depending on driver load order.
+        ports
+            .iter()
+            .find(|p| {
+                midi_in
+                    .port_name(p)
+                    .map(|n| n.to_ascii_uppercase().contains("AKAI") || n.to_ascii_uppercase().contains("MPK"))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .unwrap_or_else(|| ports[0].clone())
     };
     let port_name = midi_in.port_name(&chosen_port)?;
 

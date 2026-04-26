@@ -11,19 +11,21 @@
 //! will rearrange into an MPK-mini-3 panel-mirror layout once the user has
 //! confirmed which CCs the knobs actually send.
 
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cpal::Stream;
 use eframe::egui;
 use midir::MidiInputConnection;
-use rustysynth::Synthesizer;
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
 use crate::sfz::SfzPlayer;
 use crate::synth::{
     make_voice, midi_to_freq, modal_params, set_modal_params, DashState, Engine, LiveParams,
-    MixMode, ModalParams, Voice, VoiceImpl,
+    MixMode, ModalParams, ModalPreset, Voice, VoiceImpl,
 };
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
@@ -65,11 +67,105 @@ pub fn run_app(ctx: AppContext) -> Result<(), Box<dyn std::error::Error>> {
 
 struct KeysynthApp {
     ctx: AppContext,
+    /// Currently-selected modal preset (UI side; the actual params live
+    /// in the global `MODAL_PARAMS` cell). Tracked here only so the
+    /// dropdown shows a sticky selection between repaints — moving a
+    /// slider afterwards leaves the dropdown on the last preset that
+    /// was clicked, which is the standard "preset → tweak" pattern.
+    modal_preset: ModalPreset,
+    /// Last asset (SFZ / SF2) load result for the user to read in the
+    /// GUI. Cleared by the next click; kept short so the status bar
+    /// doesn't grow.
+    last_asset_msg: Option<(egui::Color32, String)>,
 }
 
 impl KeysynthApp {
     fn new(ctx: AppContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            modal_preset: ModalPreset::Default,
+            last_asset_msg: None,
+        }
+    }
+
+    /// Open a native file dialog, pick a `.sfz`, decode it via
+    /// `SfzPlayer::load`, and atomically swap it into the shared slot.
+    /// Blocks the GUI thread for the duration of the load (Salamander
+    /// V3 = a few seconds) — acceptable because the audio callback
+    /// keeps running on the existing player until the lock is taken,
+    /// and the user explicitly clicked the button.
+    fn load_sfz_dialog(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("SFZ", &["sfz"])
+            .set_title("Load SFZ instrument")
+            .pick_file();
+        let Some(path) = picked else { return };
+        let started = std::time::Instant::now();
+        match SfzPlayer::load(&path, self.ctx.sr_hz as f32) {
+            Ok(player) => {
+                let regions = player.regions_len();
+                let samples = player.samples_len();
+                *self.ctx.sfz.lock().unwrap() = Some(player);
+                let msg = format!(
+                    "loaded SFZ '{}' ({} regions, {} samples, {:.1}s)",
+                    path.display(),
+                    regions,
+                    samples,
+                    started.elapsed().as_secs_f32(),
+                );
+                eprintln!("keysynth: {msg}");
+                self.last_asset_msg = Some((egui::Color32::from_rgb(120, 220, 120), msg));
+            }
+            Err(e) => {
+                let msg = format!("SFZ load failed for {}: {e}", path.display());
+                eprintln!("keysynth: {msg}");
+                self.last_asset_msg = Some((egui::Color32::from_rgb(255, 120, 120), msg));
+            }
+        }
+    }
+
+    /// Open a native file dialog, pick a `.sf2`, build a fresh
+    /// `Synthesizer`, and swap it into the shared slot. Mirrors the
+    /// startup `--sf2` path in `main.rs`.
+    fn load_sf2_dialog(&mut self, current_program: u8, current_bank: u8) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("SoundFont", &["sf2"])
+            .set_title("Load SoundFont (.sf2)")
+            .pick_file();
+        let Some(path) = picked else { return };
+        let result: Result<Synthesizer, String> = (|| {
+            let mut file = BufReader::new(
+                File::open(&path).map_err(|e| format!("opening SoundFont: {e}"))?,
+            );
+            let sf = std::sync::Arc::new(
+                SoundFont::new(&mut file).map_err(|e| format!("parsing SoundFont: {e}"))?,
+            );
+            let mut settings = SynthesizerSettings::new(self.ctx.sr_hz as i32);
+            settings.maximum_polyphony = 256;
+            let mut synth = Synthesizer::new(&sf, &settings)
+                .map_err(|e| format!("building Synthesizer: {e}"))?;
+            if current_bank > 0 {
+                synth.process_midi_message(0, 0xB0, 0, current_bank as i32);
+            }
+            synth.process_midi_message(0, 0xC0, current_program as i32, 0);
+            Ok(synth)
+        })();
+        match result {
+            Ok(synth) => {
+                *self.ctx.synth.lock().unwrap() = Some(synth);
+                let msg = format!(
+                    "loaded SoundFont '{}' (program={current_program} bank={current_bank})",
+                    path.display(),
+                );
+                eprintln!("keysynth: {msg}");
+                self.last_asset_msg = Some((egui::Color32::from_rgb(120, 220, 120), msg));
+            }
+            Err(e) => {
+                let msg = format!("SF2 load failed for {}: {e}", path.display());
+                eprintln!("keysynth: {msg}");
+                self.last_asset_msg = Some((egui::Color32::from_rgb(255, 120, 120), msg));
+            }
+        }
     }
 }
 
@@ -320,10 +416,60 @@ impl eframe::App for KeysynthApp {
                 }
             });
 
+            // Asset hot-load row. Buttons are always visible so the user
+            // can preload an SFZ before switching engine — same pattern
+            // as the GM patch picker which is always available even when
+            // sf-piano isn't the active engine.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("assets:");
+                let want_sfz = ui.button("Load SFZ...").clicked();
+                let want_sf2 = ui.button("Load SF2...").clicked();
+                let sfz_loaded = self.ctx.sfz.lock().unwrap().is_some();
+                let sf2_loaded = self.ctx.synth.lock().unwrap().is_some();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "[sfz: {}, sf2: {}]",
+                        if sfz_loaded { "ok" } else { "—" },
+                        if sf2_loaded { "ok" } else { "—" },
+                    ))
+                    .monospace()
+                    .color(egui::Color32::from_rgb(170, 170, 170)),
+                );
+                if want_sfz {
+                    self.load_sfz_dialog();
+                }
+                if want_sf2 {
+                    self.load_sf2_dialog(sf_program, sf_bank);
+                }
+            });
+            if let Some((color, text)) = &self.last_asset_msg {
+                ui.colored_label(*color, text);
+            }
+
             // PianoModal live-tunable parameters. Only shown when the
             // PianoModal engine is selected (sliders are no-ops for
             // other engines but the visual clutter is unwelcome).
             if engine == Engine::PianoModal {
+                // Preset row: clicking a preset overwrites the global
+                // ModalParams cell with that preset's tuning. Slider
+                // edits afterwards stay on top of the preset (the
+                // dropdown selection just sticks visually).
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new("preset:")
+                            .color(egui::Color32::from_rgb(160, 200, 255)),
+                    );
+                    for preset in ModalPreset::ALL {
+                        let selected = self.modal_preset == *preset;
+                        if ui
+                            .selectable_label(selected, preset.as_label())
+                            .clicked()
+                        {
+                            self.modal_preset = *preset;
+                            preset.apply();
+                        }
+                    }
+                });
                 let mut p = modal_params();
                 let p_before = p;
                 ui.horizontal_wrapped(|ui| {

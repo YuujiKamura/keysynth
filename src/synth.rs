@@ -423,6 +423,82 @@ pub fn set_modal_params(p: ModalParams) {
     *modal_params_cell().lock().unwrap() = p;
 }
 
+/// Live-selectable presets for `Engine::PianoModal`. Picking one in
+/// the GUI calls `set_modal_params(preset.params())` so subsequent
+/// note_ons run with the new tuning. The preset values mirror the
+/// env-var override sets that have been validated in
+/// `bin/render_chord.rs` / `bin/render_song.rs`; promoting them here
+/// gives the live synth the same reach without rebuilds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalPreset {
+    /// `ModalParams::default()` — current shipping baseline.
+    Default,
+    /// "Round-16" CDPAM-optimal preset (KS_DETUNE=2.0 KS_POL_H=0.6
+    /// KS_T60_CAP=6.0 KS_STAGE_B=0.4 KS_OUT_GAIN=45.0
+    /// KS_RESIDUAL=0.10). Subjectively muffled but spectrally close
+    /// to Salamander reference.
+    Round16,
+    /// "Arch-1 / physics" preset: residual layer engaged, longer T60
+    /// ceiling, modest detune. Hammer transient + body color via the
+    /// commuted-synthesis residual bank.
+    Arch1,
+    /// Bright lead variant: minimal detune / polarisation so the
+    /// fundamental dominates; useful when soloing over a chord bed.
+    Bright,
+}
+
+impl ModalPreset {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            ModalPreset::Default => "default",
+            ModalPreset::Round16 => "round-16",
+            ModalPreset::Arch1 => "arch-1",
+            ModalPreset::Bright => "bright",
+        }
+    }
+
+    pub const ALL: &'static [ModalPreset] = &[
+        ModalPreset::Default,
+        ModalPreset::Round16,
+        ModalPreset::Arch1,
+        ModalPreset::Bright,
+    ];
+
+    pub fn params(self) -> ModalParams {
+        match self {
+            ModalPreset::Default => ModalParams::default(),
+            ModalPreset::Round16 => ModalParams {
+                detune_cents: 2.0,
+                pol_h_weight: 0.6,
+                t60_cap_sec: 6.0,
+                stage_b_gain: 0.4,
+                output_gain: 45.0,
+                residual_amp: 0.10,
+            },
+            ModalPreset::Arch1 => ModalParams {
+                detune_cents: 1.5,
+                pol_h_weight: 0.35,
+                t60_cap_sec: 12.0,
+                stage_b_gain: 0.20,
+                output_gain: 60.0,
+                residual_amp: 0.55,
+            },
+            ModalPreset::Bright => ModalParams {
+                detune_cents: 0.3,
+                pol_h_weight: 0.05,
+                t60_cap_sec: 18.0,
+                stage_b_gain: 0.05,
+                output_gain: 90.0,
+                residual_amp: 0.0,
+            },
+        }
+    }
+
+    pub fn apply(self) {
+        set_modal_params(self.params());
+    }
+}
+
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,
 /// read by egui repaint. Decoupled from `LiveParams` because the audio
 /// callback only cares about a few numbers, while the dashboard wants to
