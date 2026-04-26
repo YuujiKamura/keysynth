@@ -62,11 +62,11 @@ fn piece_minor_cadence() -> Vec<NoteEvent> {
     // i – VI – III – VII / i in A minor. 8 s.
     let mut v = Vec::new();
     let chords: &[(f32, &[u8])] = &[
-        (0.0, &[33, 57, 60, 64, 69]),  // A minor
-        (1.6, &[41, 57, 60, 65, 69]),  // F major (VI of Am)
-        (3.2, &[40, 55, 59, 64, 67]),  // C major (III of Am)
-        (4.8, &[43, 59, 62, 67, 71]),  // G major (VII)
-        (6.4, &[33, 57, 60, 64, 69]),  // back to Am
+        (0.0, &[33, 57, 60, 64, 69]), // A minor
+        (1.6, &[41, 57, 60, 65, 69]), // F major (VI of Am)
+        (3.2, &[40, 55, 59, 64, 67]), // C major (III of Am)
+        (4.8, &[43, 59, 62, 67, 71]), // G major (VII)
+        (6.4, &[33, 57, 60, 64, 69]), // back to Am
     ];
     for (t, notes) in chords {
         for &n in *notes {
@@ -263,11 +263,7 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn write_wav_stereo(
-    path: &std::path::Path,
-    left: &[f32],
-    right: &[f32],
-) -> Result<(), String> {
+fn write_wav_stereo(path: &std::path::Path, left: &[f32], right: &[f32]) -> Result<(), String> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
     }
@@ -309,7 +305,10 @@ fn pan_for_note(midi_note: u8) -> f32 {
     ((midi_note as f32 - CENTRE) / SPAN).clamp(-1.0, 1.0)
 }
 
-fn render_keysynth_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<f32>), String> {
+fn render_keysynth_piece(
+    args: &Args,
+    events: &[NoteEvent],
+) -> Result<(Vec<f32>, Vec<f32>), String> {
     if args.engine == Engine::PianoModal {
         let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
         eprintln!("render_song: modal LUT source = {source}");
@@ -362,8 +361,8 @@ fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<
         .sfz_path
         .as_ref()
         .ok_or("--sfz PATH required for engine sfz-piano")?;
-    let mut player = SfzPlayer::load(sfz_path, SR as f32)
-        .map_err(|e| format!("SfzPlayer::load: {e}"))?;
+    let mut player =
+        SfzPlayer::load(sfz_path, SR as f32).map_err(|e| format!("SfzPlayer::load: {e}"))?;
     let max_end = events
         .iter()
         .map(|e| e.start_sec + e.duration_sec)
@@ -381,7 +380,10 @@ fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<
     for ev in events {
         let on_at = (ev.start_sec * SR as f32) as usize;
         let off_at = ((ev.start_sec + ev.duration_sec) * SR as f32) as usize;
-        timeline.push((on_at.min(total_samples), Kind::On(ev.midi_note, ev.velocity)));
+        timeline.push((
+            on_at.min(total_samples),
+            Kind::On(ev.midi_note, ev.velocity),
+        ));
         timeline.push((off_at.min(total_samples), Kind::Off(ev.midi_note)));
     }
     timeline.sort_by_key(|(t, _)| *t);
@@ -406,7 +408,10 @@ fn render_sfz_piece(args: &Args, events: &[NoteEvent]) -> Result<(Vec<f32>, Vec<
         }
     }
     if cursor < total_samples {
-        player.render(&mut left[cursor..total_samples], &mut right[cursor..total_samples]);
+        player.render(
+            &mut left[cursor..total_samples],
+            &mut right[cursor..total_samples],
+        );
     }
     // Keep the SFZ player's native stereo image — that's what makes it
     // sound "spacious" vs the per-voice-pan modal stereo we synthesise.

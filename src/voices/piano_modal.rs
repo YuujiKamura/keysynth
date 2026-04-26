@@ -385,8 +385,7 @@ impl ModalPianoVoice {
                     // -3 dB per partial in the upper range.
                     let dn = (i + 1 - last_n) as f32;
                     let amp = last_amp * 0.85_f32.powf(dn);
-                    let t60 = (last_t60 * 0.85_f32.powf(dn))
-                        .max(t60_floor_for_partial(i + 1));
+                    let t60 = (last_t60 * 0.85_f32.powf(dn)).max(t60_floor_for_partial(i + 1));
                     modes.push(Mode {
                         freq_hz: f_extra,
                         t60_sec: t60,
@@ -443,9 +442,8 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
     let mut buf = vec![0.0_f32; total + 1];
     buf[0] = 1.0;
 
-    let mut state: u32 = 0x9E37_79B9
-        ^ (midi_note as u32).wrapping_mul(2_654_435_761)
-        ^ (sr.to_bits() ^ 0xDEAD_BEEF);
+    let mut state: u32 =
+        0x9E37_79B9 ^ (midi_note as u32).wrapping_mul(2_654_435_761) ^ (sr.to_bits() ^ 0xDEAD_BEEF);
     let mut hp_prev_x = 0.0_f32;
     let mut hp_prev_y = 0.0_f32;
     let mut lp_prev = 0.0_f32;
@@ -491,8 +489,7 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
             if stage_b_pos < stage_b_attack_n {
                 (stage_b_pos as f32) / (stage_b_attack_n as f32) * STAGE_B_GAIN
             } else {
-                let t = (stage_b_pos - stage_b_attack_n) as f32
-                    / (n_b - stage_b_attack_n) as f32;
+                let t = (stage_b_pos - stage_b_attack_n) as f32 / (n_b - stage_b_attack_n) as f32;
                 0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * STAGE_B_GAIN
             }
         };
