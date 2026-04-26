@@ -25,7 +25,7 @@ use hound::{SampleFormat, WavSpec, WavWriter};
 
 use keysynth::drums::{parse_drum_pattern, DrumEvent};
 use keysynth::sfz::SfzPlayer;
-use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
+use keysynth::synth::{make_voice, midi_to_freq, modal_params, set_modal_params, Engine, ModalLut, MODAL_LUT};
 
 const SR: u32 = 44100;
 
@@ -2043,6 +2043,20 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Optional ModalParams override via env vars (mirrors render_chord).
+    {
+        let mut p = modal_params();
+        if let Ok(v) = std::env::var("KS_DETUNE")    { if let Ok(x) = v.parse() { p.detune_cents = x; } }
+        if let Ok(v) = std::env::var("KS_POL_H")     { if let Ok(x) = v.parse() { p.pol_h_weight = x; } }
+        if let Ok(v) = std::env::var("KS_T60_CAP")   { if let Ok(x) = v.parse() { p.t60_cap_sec = x; } }
+        if let Ok(v) = std::env::var("KS_STAGE_B")   { if let Ok(x) = v.parse() { p.stage_b_gain = x; } }
+        if let Ok(v) = std::env::var("KS_OUT_GAIN")  { if let Ok(x) = v.parse() { p.output_gain = x; } }
+        if let Ok(v) = std::env::var("KS_RESIDUAL")  { if let Ok(x) = v.parse() { p.residual_amp = x; } }
+        eprintln!("render_song: ModalParams = {:?}", p);
+        set_modal_params(p);
+    }
+
     let events = match pick_piece(&args.piece) {
         Ok(e) => e,
         Err(e) => {
