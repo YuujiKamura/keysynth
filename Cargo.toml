@@ -15,6 +15,11 @@ egui = "0.29"
 rustysynth = "1.3"
 hound = "3.5"
 
+# jukebox MP3 decoding (issue: bench-out/songs/ moves to MP3 as primary
+# format because Gemini audio modality requires MP3 and disk footprint is
+# ~1/7 of WAV). symphonia is pure-Rust, no external libmp3lame needed.
+symphonia = { version = "0.5", default-features = false, features = ["mp3"] }
+
 # analyse binary: STFT, harmonic decay, spectrogram PNG, JSON report
 rustfft = "6"
 image = { version = "0.25", default-features = false, features = ["png"] }

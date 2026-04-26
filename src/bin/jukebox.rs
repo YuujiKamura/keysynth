@@ -19,6 +19,33 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use eframe::egui;
 use hound::{SampleFormat as WavSampleFormat, WavReader};
+use symphonia::core::audio::{AudioBufferRef, Signal};
+use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+/// Container format of a Track on disk. Drives which decoder we pick
+/// (hound for WAV, symphonia for MP3). Kept separate from per-engine
+/// suffixes so the catalogue can show / hide formats without re-parsing
+/// filenames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Wav,
+    Mp3,
+}
+
+impl Format {
+    fn from_ext(ext: &str) -> Option<Self> {
+        match ext.to_ascii_lowercase().as_str() {
+            "wav" => Some(Format::Wav),
+            "mp3" => Some(Format::Mp3),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct Track {
@@ -34,9 +61,16 @@ struct Track {
     /// "keysynth", "chiptune-demo", "listener-lab", "midi" etc.
     source: String,
     size_kb: u64,
+    /// Container format. Selects WAV (hound) vs MP3 (symphonia) decoder.
+    format: Format,
 }
 
 const ENGINE_SUFFIXES: &[&str] = &[
+    // Order matters: longer / more specific suffixes are listed first so the
+    // matcher catches them before shorter prefixes (e.g. "modal-r16" before
+    // "modal"). 2026-04-26: "modal-r16" tags the round-16 ModalParams preset
+    // tuned via 3-layer cross-check against Salamander Grand C4.
+    "modal-r16",
     "sfz", "modal", "square", "ks", "ks-rich", "sub", "fm", "piano", "piano-thick",
     "piano-lite", "piano-5am", "koto",
     // "pure" marks an NSF/libgme ground-truth render — it isn't a keysynth
@@ -96,6 +130,8 @@ fn classify_source(path: &Path, piece: &str) -> &'static str {
 
 fn parse_track(path: &Path) -> Option<Track> {
     let stem = path.file_stem()?.to_str()?.to_string();
+    let ext = path.extension().and_then(|s| s.to_str())?;
+    let format = Format::from_ext(ext)?;
     let size_kb = std::fs::metadata(path).ok()?.len() / 1024;
     // Try splitting "<piece>_<engine>" by recognised engine suffix.
     let (piece, engine) = ENGINE_SUFFIXES
@@ -113,9 +149,15 @@ fn parse_track(path: &Path) -> Option<Track> {
         engine,
         source,
         size_kb,
+        format,
     })
 }
 
+/// 2026-04-26: bench-out/songs/ is being migrated WAV → MP3 (Gemini
+/// audio modality requirement, ~1/7 disk footprint). During the
+/// transition both formats coexist on disk; this scanner keeps MP3 and
+/// drops the matching WAV so the catalogue isn't doubled. Same-stem
+/// pairs are detected per-directory using `(stem)` as the dedup key.
 fn scan_dirs(dirs: &[&Path]) -> Vec<Track> {
     let mut out: Vec<Track> = Vec::new();
     for d in dirs {
@@ -123,13 +165,34 @@ fn scan_dirs(dirs: &[&Path]) -> Vec<Track> {
             Ok(r) => r,
             Err(_) => continue,
         };
+        // Two-pass per directory: collect everything, then drop WAVs
+        // that have a same-stem MP3 sibling. Per-dir (not global) so a
+        // /tmp.wav and bench/tmp.mp3 don't accidentally cancel.
+        let mut dir_tracks: Vec<Track> = Vec::new();
         for ent in read.flatten() {
             let p = ent.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("wav") {
-                if let Some(t) = parse_track(&p) {
-                    out.push(t);
-                }
+            let ext = match p.extension().and_then(|s| s.to_str()) {
+                Some(e) => e.to_ascii_lowercase(),
+                None => continue,
+            };
+            if ext != "wav" && ext != "mp3" {
+                continue;
             }
+            if let Some(t) = parse_track(&p) {
+                dir_tracks.push(t);
+            }
+        }
+        // Build set of stems that have an MP3 in this directory.
+        let mp3_stems: std::collections::HashSet<String> = dir_tracks
+            .iter()
+            .filter(|t| t.format == Format::Mp3)
+            .map(|t| t.label.clone())
+            .collect();
+        for t in dir_tracks {
+            if t.format == Format::Wav && mp3_stems.contains(&t.label) {
+                continue; // MP3 sibling wins
+            }
+            out.push(t);
         }
     }
     // Sort by piece then engine for grouped display.
@@ -143,16 +206,49 @@ fn scan_dirs(dirs: &[&Path]) -> Vec<Track> {
 
 // ---------- Mixer ----------------------------------------------------
 
-/// Open hound::WavReader and capture the spec we care about. Sample-rate
-/// mismatch with the output device is tolerated (we don't resample in
-/// Stage 1), but is logged so the user can see why a track sounds wrong.
+/// MP3 decode state. symphonia decodes packet-by-packet into a planar
+/// AudioBuffer; we eagerly flatten each packet into an interleaved f32
+/// scratch and drain it sample-by-sample to match the existing
+/// `read_one_sample` contract used by the WAV path.
+struct Mp3State {
+    /// Source path retained for re-open on loop / seek-to-zero (symphonia
+    /// `seek` to packet 0 is awkward across formats; reopening is robust
+    /// and only happens at end-of-file).
+    path: PathBuf,
+    format: Box<dyn FormatReader>,
+    decoder: Box<dyn Decoder>,
+    track_id: u32,
+    /// Interleaved f32 samples already decoded but not yet drained.
+    /// Filled from the AudioBuffer when empty; consumed one f32 at a
+    /// time by `read_one_sample`.
+    scratch: Vec<f32>,
+    /// Read position into `scratch`.
+    scratch_pos: usize,
+    /// True once next_packet returned UnexpectedEof (or any terminal
+    /// error). The caller treats this like WAV EOF.
+    eof: bool,
+}
+
+/// Per-format decoded handle. WAV uses hound (incremental sample iter);
+/// MP3 uses symphonia (packet decode → flatten → drain).
+enum DecoderState {
+    Wav {
+        reader: WavReader<BufReader<File>>,
+        sample_format: WavSampleFormat,
+        bits_per_sample: u16,
+    },
+    Mp3(Mp3State),
+}
+
+/// Common per-track metadata + decoder state, regardless of format.
+/// `total_samples` is the interleaved sample count (frames * channels)
+/// — for MP3 this is best-effort from symphonia's track metadata; the
+/// audio callback never *requires* it (EOF is detected by the decoder),
+/// but the UI uses it for the position readout.
 struct DecodedTrack {
-    reader: WavReader<BufReader<File>>,
+    state: DecoderState,
     sample_rate: u32,
     channels: u16,
-    sample_format: WavSampleFormat,
-    bits_per_sample: u16,
-    /// Total interleaved sample count (frames * channels).
     total_samples: u64,
 }
 
@@ -161,13 +257,221 @@ fn open_wav(path: &Path) -> Result<DecodedTrack, String> {
     let spec = reader.spec();
     let total_samples = reader.duration() as u64 * spec.channels as u64;
     Ok(DecodedTrack {
-        reader,
         sample_rate: spec.sample_rate,
         channels: spec.channels,
-        sample_format: spec.sample_format,
-        bits_per_sample: spec.bits_per_sample,
         total_samples,
+        state: DecoderState::Wav {
+            reader,
+            sample_format: spec.sample_format,
+            bits_per_sample: spec.bits_per_sample,
+        },
     })
+}
+
+/// Open an MP3 file with symphonia. Initialises the format reader, picks
+/// the first decodable track, and constructs the matching decoder. The
+/// scratch buffer starts empty — first `read_one_sample` call triggers
+/// `decode_next_packet`.
+fn open_mp3(path: &Path) -> Result<DecodedTrack, String> {
+    let file = File::open(path).map_err(|e| format!("mp3 open: {e}"))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("mp3 probe: {e}"))?;
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| "mp3: no decodable track".to_string())?;
+    let track_id = track.id;
+    let codec_params = track.codec_params.clone();
+    let sample_rate = codec_params
+        .sample_rate
+        .ok_or_else(|| "mp3: missing sample rate".to_string())?;
+    let channels_count = codec_params
+        .channels
+        .map(|c| c.count() as u16)
+        .unwrap_or(2);
+    // n_frames is "frames" in the *codec* sense (PCM frame = one sample
+    // per channel). Multiply by channels to get the interleaved sample
+    // count expected by total_samples.
+    let total_samples = codec_params
+        .n_frames
+        .map(|n| n * channels_count as u64)
+        .unwrap_or(0);
+    let decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("mp3 codec: {e}"))?;
+    Ok(DecodedTrack {
+        sample_rate,
+        channels: channels_count,
+        total_samples,
+        state: DecoderState::Mp3(Mp3State {
+            path: path.to_path_buf(),
+            format,
+            decoder,
+            track_id,
+            scratch: Vec::new(),
+            scratch_pos: 0,
+            eof: false,
+        }),
+    })
+}
+
+/// Dispatch by extension. Used by `MixerTrack::load`.
+fn open_decoded(path: &Path) -> Result<DecodedTrack, String> {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "wav" => open_wav(path),
+        "mp3" => open_mp3(path),
+        other => Err(format!("unsupported format: {other}")),
+    }
+}
+
+/// Drain one packet from symphonia, flattening planar channels into the
+/// interleaved scratch. Sets `eof` on terminal errors. Returns Ok(()) on
+/// success or recoverable skip; the caller re-checks scratch length.
+fn mp3_decode_next(state: &mut Mp3State) -> Result<(), String> {
+    if state.eof {
+        return Ok(());
+    }
+    loop {
+        let packet = match state.format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                state.eof = true;
+                return Ok(());
+            }
+            Err(SymphoniaError::ResetRequired) => {
+                state.eof = true;
+                return Ok(());
+            }
+            Err(e) => return Err(format!("mp3 next_packet: {e}")),
+        };
+        if packet.track_id() != state.track_id {
+            continue;
+        }
+        let decoded = match state.decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(SymphoniaError::DecodeError(_)) => continue, // skip bad frame
+            Err(SymphoniaError::IoError(_)) => {
+                state.eof = true;
+                return Ok(());
+            }
+            Err(e) => return Err(format!("mp3 decode: {e}")),
+        };
+        // Flatten planar -> interleaved f32. Match on the concrete
+        // AudioBufferRef so each numeric format can be normalised before
+        // the cast (i16/i32/u8 differ in midpoint and range).
+        let frames = decoded.frames();
+        let spec = *decoded.spec();
+        let ch = spec.channels.count();
+        state.scratch.clear();
+        state.scratch_pos = 0;
+        state.scratch.reserve(frames * ch);
+        match decoded {
+            AudioBufferRef::F32(buf) => {
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f]);
+                    }
+                }
+            }
+            AudioBufferRef::S16(buf) => {
+                let inv = 1.0f32 / i16::MAX as f32;
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f] as f32 * inv);
+                    }
+                }
+            }
+            AudioBufferRef::S32(buf) => {
+                let inv = 1.0f32 / i32::MAX as f32;
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f] as f32 * inv);
+                    }
+                }
+            }
+            AudioBufferRef::U8(buf) => {
+                for f in 0..frames {
+                    for c in 0..ch {
+                        let v = buf.chan(c)[f] as f32;
+                        state.scratch.push((v - 128.0) / 128.0);
+                    }
+                }
+            }
+            AudioBufferRef::S8(buf) => {
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f] as f32 / 128.0);
+                    }
+                }
+            }
+            AudioBufferRef::S24(buf) => {
+                let inv = 1.0f32 / ((1i32 << 23) - 1) as f32;
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f].inner() as f32 * inv);
+                    }
+                }
+            }
+            AudioBufferRef::U16(buf) => {
+                for f in 0..frames {
+                    for c in 0..ch {
+                        let v = buf.chan(c)[f] as f32;
+                        state.scratch.push((v - 32768.0) / 32768.0);
+                    }
+                }
+            }
+            AudioBufferRef::U24(buf) => {
+                let mid = (1u32 << 23) as f32;
+                for f in 0..frames {
+                    for c in 0..ch {
+                        let v = buf.chan(c)[f].inner() as f32;
+                        state.scratch.push((v - mid) / mid);
+                    }
+                }
+            }
+            AudioBufferRef::U32(buf) => {
+                let mid = (1u64 << 31) as f32;
+                for f in 0..frames {
+                    for c in 0..ch {
+                        let v = buf.chan(c)[f] as f32;
+                        state.scratch.push((v - mid) / mid);
+                    }
+                }
+            }
+            AudioBufferRef::F64(buf) => {
+                for f in 0..frames {
+                    for c in 0..ch {
+                        state.scratch.push(buf.chan(c)[f] as f32);
+                    }
+                }
+            }
+        }
+        if state.scratch.is_empty() {
+            // Empty packet (rare); pull another.
+            continue;
+        }
+        return Ok(());
+    }
 }
 
 /// One slot in the multi-track mixer. Owns its own hound reader (with a
@@ -220,11 +524,12 @@ impl MixerTrack {
         }
     }
 
-    /// Load a fresh hound reader for `path`. Replaces any previous
-    /// loaded reader; cursor is reset to 0 and `is_playing` is left
-    /// false until the user hits play_all.
+    /// Load a fresh decoder for `path`. Format is detected from the file
+    /// extension (`.wav` → hound, `.mp3` → symphonia). Replaces any
+    /// previous loaded reader; cursor is reset to 0 and `is_playing` is
+    /// left false until the user hits play_all.
     fn load(&mut self, path: &Path, label: String) -> Result<(), String> {
-        let dec = open_wav(path)?;
+        let dec = open_decoded(path)?;
         self.file_path = path.to_path_buf();
         self.file_label = label;
         self.decoded = Some(dec);
@@ -245,29 +550,82 @@ impl MixerTrack {
         self.vu_rms_r = 0.0;
     }
 
-    /// Rewind hound reader to sample 0. Returns Err if reader missing.
+    /// Rewind decoder to sample 0. For WAV this is a cheap hound seek;
+    /// for MP3 we re-open the file (symphonia's seek API is per-format
+    /// flaky and end-of-file rewinds are rare enough that the extra
+    /// fopen is not measurable). Returns Err if reader missing.
     fn seek_start(&mut self) -> Result<(), String> {
         let dec = self.decoded.as_mut().ok_or("no decoded track")?;
-        dec.reader
-            .seek(0)
-            .map_err(|e| format!("hound seek: {e}"))?;
+        match &mut dec.state {
+            DecoderState::Wav { reader, .. } => {
+                reader.seek(0).map_err(|e| format!("hound seek: {e}"))?;
+            }
+            DecoderState::Mp3(_) => {
+                let path = self.file_path.clone();
+                let fresh = open_mp3(&path)?;
+                *dec = fresh;
+            }
+        }
         self.cursor_frames = 0;
         Ok(())
     }
 }
 
-/// Read one f32 sample from the hound reader honouring its sample
-/// format. Returns None at EOF.
-fn read_one_sample(dec: &mut DecodedTrack) -> Option<f32> {
-    match dec.sample_format {
-        WavSampleFormat::Int => {
-            let s: i32 = dec.reader.samples::<i32>().next()?.ok()?;
-            // Normalise by max int magnitude for the bit depth.
-            let max = ((1u32 << (dec.bits_per_sample as u32 - 1)) - 1) as f32;
-            Some(s as f32 / max)
+/// Rewind the decoder back to the first sample. Used by the audio
+/// callback when `loop_enabled` is true and the decoder reports EOF.
+/// Returns Err on failure (caller should give up looping).
+fn rewind_decoder(dec: &mut DecodedTrack) -> Result<(), String> {
+    match &mut dec.state {
+        DecoderState::Wav { reader, .. } => {
+            reader.seek(0).map_err(|e| format!("hound seek: {e}"))
         }
-        WavSampleFormat::Float => {
-            let s: f32 = dec.reader.samples::<f32>().next()?.ok()?;
+        DecoderState::Mp3(state) => {
+            let path = state.path.clone();
+            let fresh = open_mp3(&path)?;
+            *dec = fresh;
+            Ok(())
+        }
+    }
+}
+
+/// Read one f32 sample from the active decoder honouring its native
+/// sample format. Returns None at EOF.
+fn read_one_sample(dec: &mut DecodedTrack) -> Option<f32> {
+    match &mut dec.state {
+        DecoderState::Wav {
+            reader,
+            sample_format,
+            bits_per_sample,
+        } => match *sample_format {
+            WavSampleFormat::Int => {
+                let s: i32 = reader.samples::<i32>().next()?.ok()?;
+                // Normalise by max int magnitude for the bit depth.
+                let max = ((1u32 << (*bits_per_sample as u32 - 1)) - 1) as f32;
+                Some(s as f32 / max)
+            }
+            WavSampleFormat::Float => {
+                let s: f32 = reader.samples::<f32>().next()?.ok()?;
+                Some(s)
+            }
+        },
+        DecoderState::Mp3(state) => {
+            // Refill scratch when drained.
+            if state.scratch_pos >= state.scratch.len() {
+                if state.eof {
+                    return None;
+                }
+                if let Err(e) = mp3_decode_next(state) {
+                    eprintln!("jukebox mp3 decode: {e}");
+                    state.eof = true;
+                    return None;
+                }
+                if state.scratch_pos >= state.scratch.len() {
+                    // mp3_decode_next set eof or yielded nothing.
+                    return None;
+                }
+            }
+            let s = state.scratch[state.scratch_pos];
+            state.scratch_pos += 1;
             Some(s)
         }
     }
@@ -295,7 +653,7 @@ fn pull_frame(track: &mut MixerTrack, solo_active: bool) -> (f32, f32) {
                 Some(v) => v,
                 None => {
                     if track.loop_enabled {
-                        let _ = dec.reader.seek(0);
+                        let _ = rewind_decoder(dec);
                         track.cursor_frames = 0;
                         match read_one_sample(dec) {
                             Some(v) => v,
@@ -317,7 +675,7 @@ fn pull_frame(track: &mut MixerTrack, solo_active: bool) -> (f32, f32) {
                 Some(v) => v,
                 None => {
                     if track.loop_enabled {
-                        let _ = dec.reader.seek(0);
+                        let _ = rewind_decoder(dec);
                         track.cursor_frames = 0;
                         match read_one_sample(dec) {
                             Some(v) => v,
@@ -1449,4 +1807,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe: {e}").into() })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_from_extension() {
+        assert_eq!(Format::from_ext("wav"), Some(Format::Wav));
+        assert_eq!(Format::from_ext("WAV"), Some(Format::Wav));
+        assert_eq!(Format::from_ext("mp3"), Some(Format::Mp3));
+        assert_eq!(Format::from_ext("MP3"), Some(Format::Mp3));
+        assert_eq!(Format::from_ext("flac"), None);
+    }
+
+    #[test]
+    fn parse_track_assigns_format() {
+        let dir = std::env::temp_dir().join("keysynth_jukebox_parse_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join("piece_a_sfz.wav");
+        let mp3 = dir.join("piece_a_modal.mp3");
+        std::fs::write(&wav, b"RIFF").unwrap();
+        std::fs::write(&mp3, b"ID3").unwrap();
+        let tw = parse_track(&wav).unwrap();
+        let tm = parse_track(&mp3).unwrap();
+        assert_eq!(tw.format, Format::Wav);
+        assert_eq!(tw.engine, "sfz");
+        assert_eq!(tw.piece, "piece_a");
+        assert_eq!(tm.format, Format::Mp3);
+        assert_eq!(tm.engine, "modal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Verify the symphonia path actually decodes a real MP3 from
+    /// bench-out/songs/. Uses `twinkle_sfz.mp3` if present (skipped
+    /// otherwise so the test passes on a fresh checkout). Reads ~10
+    /// frames worth of samples and checks they're finite + non-zero.
+    #[test]
+    fn open_mp3_real_file_decodes_samples() {
+        let path = std::path::PathBuf::from("bench-out/songs/twinkle_sfz.mp3");
+        if !path.exists() {
+            eprintln!("skip: {} not present", path.display());
+            return;
+        }
+        let mut dec = open_mp3(&path).expect("open_mp3");
+        assert!(dec.sample_rate > 0);
+        assert!(dec.channels > 0);
+        let mut got_nonzero = false;
+        // Drain enough samples to span at least one MP3 frame (1152
+        // samples per channel) plus a margin.
+        for _ in 0..(1152 * dec.channels as usize * 2) {
+            match read_one_sample(&mut dec) {
+                Some(s) => {
+                    assert!(s.is_finite(), "sample {s} not finite");
+                    if s.abs() > 0.0 {
+                        got_nonzero = true;
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(got_nonzero, "MP3 decoded as silence — decoder broken");
+    }
+
+    #[test]
+    fn scan_dirs_prefers_mp3_over_same_stem_wav() {
+        let dir = std::env::temp_dir().join("keysynth_jukebox_dedup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Same stem as both wav and mp3 — mp3 should win.
+        let wav_dup = dir.join("twinkle_modal.wav");
+        let mp3_dup = dir.join("twinkle_modal.mp3");
+        // Wav-only stem should survive.
+        let wav_solo = dir.join("twinkle_sfz.wav");
+        // Mp3-only stem should survive.
+        let mp3_solo = dir.join("twinkle_piano.mp3");
+        std::fs::write(&wav_dup, b"RIFF").unwrap();
+        std::fs::write(&mp3_dup, b"ID3").unwrap();
+        std::fs::write(&wav_solo, b"RIFF").unwrap();
+        std::fs::write(&mp3_solo, b"ID3").unwrap();
+        let tracks = scan_dirs(&[dir.as_path()]);
+        // Expect 3 tracks: dup as MP3, wav-solo as WAV, mp3-solo as MP3.
+        assert_eq!(tracks.len(), 3, "tracks: {tracks:#?}");
+        let dup = tracks
+            .iter()
+            .find(|t| t.label == "twinkle_modal")
+            .expect("twinkle_modal present");
+        assert_eq!(dup.format, Format::Mp3, "mp3 should beat wav for same stem");
+        let solo_wav = tracks
+            .iter()
+            .find(|t| t.label == "twinkle_sfz")
+            .expect("twinkle_sfz present");
+        assert_eq!(solo_wav.format, Format::Wav);
+        let solo_mp3 = tracks
+            .iter()
+            .find(|t| t.label == "twinkle_piano")
+            .expect("twinkle_piano present");
+        assert_eq!(solo_mp3.format, Format::Mp3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
