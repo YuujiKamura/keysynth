@@ -169,11 +169,7 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
-fn write_wav_stereo(
-    path: &std::path::Path,
-    left: &[f32],
-    right: &[f32],
-) -> Result<(), String> {
+fn write_wav_stereo(path: &std::path::Path, left: &[f32], right: &[f32]) -> Result<(), String> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all {}: {e}", p.display()))?;
     }
@@ -214,8 +210,8 @@ fn render_sfz(args: &Args) -> Result<(Vec<f32>, Vec<f32>), String> {
         .sfz_path
         .as_ref()
         .ok_or("--sfz PATH required for engine sfz-piano")?;
-    let mut player = SfzPlayer::load(sfz_path, SR as f32)
-        .map_err(|e| format!("SfzPlayer::load: {e}"))?;
+    let mut player =
+        SfzPlayer::load(sfz_path, SR as f32).map_err(|e| format!("SfzPlayer::load: {e}"))?;
     let total_samples = (args.duration_sec * SR as f32) as usize;
     let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);
     let jitter_samples = (args.onset_jitter_ms * SR as f32 / 1000.0) as usize;
@@ -247,7 +243,10 @@ fn render_sfz(args: &Args) -> Result<(Vec<f32>, Vec<f32>), String> {
         player.note_on(0, note, args.velocity);
     }
     if cursor < release_at {
-        player.render(&mut left[cursor..release_at], &mut right[cursor..release_at]);
+        player.render(
+            &mut left[cursor..release_at],
+            &mut right[cursor..release_at],
+        );
     }
     for &note in &args.notes {
         player.note_off(0, note);

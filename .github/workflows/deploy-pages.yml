@@ -1,0 +1,80 @@
+name: Deploy keysynth web demo to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Single concurrent deploy; cancel in-flight runs on new pushes. PR runs
+# from the same branch are also coalesced under their own group key so
+# repeated pushes to a PR don't queue stale builds.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: web-build
+
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Install wasm-bindgen-cli
+        uses: jetli/wasm-bindgen-action@v0.2.0
+        with:
+          version: latest
+
+      - name: Build (release)
+        # Cargo features (`--no-default-features --features web`) and the
+        # target bin (`keysynth-web`) are declared inline in
+        # `web/index.html`. `--public-url` rewrites asset URLs to the
+        # GitHub Pages subpath: https://<user>.github.io/<repo>/  →
+        # /<repo>/.
+        run: |
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          trunk build --release --public-url "/${REPO_NAME}/"
+
+      - name: Upload Pages artifact
+        # Only upload on push to main/master (or workflow_dispatch). PR
+        # runs are validate-only — uploading would require Pages write
+        # permission from a fork PR which GitHub denies anyway.
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    # Skip deploy on PR runs — those are build-only validation. Deploy
+    # only fires when the workflow runs from a push to main/master.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

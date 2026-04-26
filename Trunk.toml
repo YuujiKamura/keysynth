@@ -1,0 +1,32 @@
+# Trunk config for the GitHub Pages demo build.
+#
+# Build:
+#   trunk build --release
+# Serve locally:
+#   trunk serve --release
+# Output:
+#   dist/  — static site (index.html + wasm + JS glue) suitable for any
+#            static host (GitHub Pages, Netlify, etc.).
+#
+# Cargo features (`--no-default-features --features web`) and the target
+# bin (`keysynth-web`) are declared in `web/index.html` via the
+# `data-cargo-*` and `data-bin` attributes on the trunk rust link, so
+# `trunk build` works with no extra flags.
+
+[build]
+target = "web/index.html"
+dist = "dist"
+# `--public-url /<repo>/` is appended in CI for the GitHub Pages subpath
+# (https://<user>.github.io/<repo>/). Local `trunk serve` leaves it as `/`.
+public_url = "/"
+
+[serve]
+addresses = ["0.0.0.0"]
+port = 8080
+open = false
+
+[tools]
+# wasm-bindgen-cli MUST match the wasm-bindgen library version cargo
+# resolved; otherwise the generated JS glue panics with a schema
+# mismatch. Bump together when upgrading eframe / web-sys.
+wasm_bindgen = "0.2.118"
