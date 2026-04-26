@@ -887,6 +887,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         port_name,
         out_name,
         sr_hz,
+        startup_sfz_path: args.sfz.clone(),
+        startup_sf2_path: args.sf2.clone(),
+        startup_engine: args.engine,
     })?;
 
     eprintln!("keysynth: stopping");

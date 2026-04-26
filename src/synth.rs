@@ -37,7 +37,7 @@ pub use crate::voices::placeholder::SfPianoPlaceholder;
 pub use crate::voices::square::SquareVoice;
 pub use crate::voices::sub::SubVoice;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Engine {
     /// NES-style pulse + linear AR envelope. Cheap reference tone.
     Square,
@@ -346,7 +346,7 @@ pub struct LiveParams {
 /// block so it tracks the slider in real-time even on a held note;
 /// the others are snapshot at voice construction (changes apply
 /// only to subsequent notes).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ModalParams {
     /// Sub-mode detune split, ± cents around the LUT centre. 0
     /// disables the detune layer entirely (3 sub-modes → 1).
@@ -423,25 +423,46 @@ pub fn set_modal_params(p: ModalParams) {
     *modal_params_cell().lock().unwrap() = p;
 }
 
+/// Process-wide flag that selects the pure-physics path
+/// (`ModalPianoVoice::from_physics`) for `Engine::PianoModal`. Mirrors
+/// the env var `KS_PHYSICS=1` checked by `make_voice` for offline
+/// renders; the GUI sets this directly so the live synth doesn't need
+/// a restart to swap into the analytical-mode synthesis path.
+static MODAL_PHYSICS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn modal_physics_enabled() -> bool {
+    MODAL_PHYSICS.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("KS_PHYSICS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+pub fn set_modal_physics(on: bool) {
+    MODAL_PHYSICS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Live-selectable presets for `Engine::PianoModal`. Picking one in
-/// the GUI calls `set_modal_params(preset.params())` so subsequent
-/// note_ons run with the new tuning. The preset values mirror the
-/// env-var override sets that have been validated in
-/// `bin/render_chord.rs` / `bin/render_song.rs`; promoting them here
-/// gives the live synth the same reach without rebuilds.
+/// the GUI calls `apply()` which (a) writes preset params into the
+/// global `ModalParams` cell, and (b) toggles the pure-physics path
+/// for `Physics`. Subsequent note_ons run with the new tuning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModalPreset {
     /// `ModalParams::default()` — current shipping baseline.
     Default,
     /// "Round-16" CDPAM-optimal preset (KS_DETUNE=2.0 KS_POL_H=0.6
     /// KS_T60_CAP=6.0 KS_STAGE_B=0.4 KS_OUT_GAIN=45.0
-    /// KS_RESIDUAL=0.10). Subjectively muffled but spectrally close
-    /// to Salamander reference.
+    /// KS_RESIDUAL=0.10). Validated against `chord_headroom_audit`;
+    /// spectrally close to the Salamander reference, subjectively
+    /// muffled but clean under polyphony.
     Round16,
-    /// "Arch-1 / physics" preset: residual layer engaged, longer T60
-    /// ceiling, modest detune. Hammer transient + body color via the
-    /// commuted-synthesis residual bank.
-    Arch1,
+    /// Pure-physics path: routes `make_voice` through
+    /// `ModalPianoVoice::from_physics` (Stulov hammer + Fletcher /
+    /// Valimaki mode generation, no LUT, no commuted residual). The
+    /// `params` returned by this preset are minimal — physics derives
+    /// its own modes, so detune / polarisation / residual_amp are
+    /// reset to clean defaults to avoid stacking on top.
+    Physics,
     /// Bright lead variant: minimal detune / polarisation so the
     /// fundamental dominates; useful when soloing over a chord bed.
     Bright,
@@ -452,7 +473,7 @@ impl ModalPreset {
         match self {
             ModalPreset::Default => "default",
             ModalPreset::Round16 => "round-16",
-            ModalPreset::Arch1 => "arch-1",
+            ModalPreset::Physics => "physics",
             ModalPreset::Bright => "bright",
         }
     }
@@ -460,7 +481,7 @@ impl ModalPreset {
     pub const ALL: &'static [ModalPreset] = &[
         ModalPreset::Default,
         ModalPreset::Round16,
-        ModalPreset::Arch1,
+        ModalPreset::Physics,
         ModalPreset::Bright,
     ];
 
@@ -475,13 +496,19 @@ impl ModalPreset {
                 output_gain: 45.0,
                 residual_amp: 0.10,
             },
-            ModalPreset::Arch1 => ModalParams {
-                detune_cents: 1.5,
-                pol_h_weight: 0.35,
+            // Physics path bypasses LUT + residual entirely; the
+            // analytical mode generator already produces a clean
+            // bank, so we only need the gain tier set sensibly and
+            // leave detune / polarisation / residual at zero so they
+            // don't overlay extra sub-modes on top of what the
+            // physics generator already built.
+            ModalPreset::Physics => ModalParams {
+                detune_cents: 0.0,
+                pol_h_weight: 0.0,
                 t60_cap_sec: 12.0,
-                stage_b_gain: 0.20,
-                output_gain: 60.0,
-                residual_amp: 0.55,
+                stage_b_gain: 0.0,
+                output_gain: 80.0,
+                residual_amp: 0.0,
             },
             ModalPreset::Bright => ModalParams {
                 detune_cents: 0.3,
@@ -496,6 +523,7 @@ impl ModalPreset {
 
     pub fn apply(self) {
         set_modal_params(self.params());
+        set_modal_physics(matches!(self, ModalPreset::Physics));
     }
 }
 
@@ -1053,15 +1081,12 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
             // so even unit tests / harnesses that don't call
             // `MODAL_LUT.set(...)` produce sound.
             // Pure-physics path (`from_physics`) bypasses LUT + residual
-            // entirely. Activated by env var KS_PHYSICS=1 / "true".
+            // entirely. Activated either by env var KS_PHYSICS=1 (offline
+            // renders set it programmatically before each variant) or by
+            // the GUI flag flipped via `ModalPreset::Physics`.
             // Reads on every voice spawn: cheap (~ns) compared to voice
-            // construction, and avoids capturing the env at process init
-            // when render_song / render_chord etc. set it programmatically
-            // before each variant.
-            let use_physics = std::env::var("KS_PHYSICS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if use_physics {
+            // construction.
+            if modal_physics_enabled() {
                 Box::new(ModalPianoVoice::from_physics(sr, midi_note, velocity))
             } else if let Some(lut) = MODAL_LUT.get() {
                 Box::new(ModalPianoVoice::from_lut(lut, sr, midi_note, velocity))
