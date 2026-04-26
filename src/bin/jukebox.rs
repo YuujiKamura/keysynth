@@ -69,8 +69,11 @@ const ENGINE_SUFFIXES: &[&str] = &[
     // Order matters: longer / more specific suffixes are listed first so the
     // matcher catches them before shorter prefixes (e.g. "modal-r16" before
     // "modal"). 2026-04-26 presets:
-    //   modal-r16    = round-16 (CDPAM-optimal but "muffled")
-    //   modal-arch1  = Arch-1 (Hertzian hammer LPF + commuted residual)
+    //   modal-r16     = round-16 (CDPAM-optimal but "muffled")
+    //   modal-arch1   = Arch-1 (Hertzian hammer LPF + commuted residual)
+    //   modal-physics = pure analytic physics (Stulov hammer + missing
+    //                   modes + Valimaki T60, no LUT, no residual)
+    "modal-physics",
     "modal-arch1",
     "modal-r16",
     "sfz", "modal", "square", "ks", "ks-rich", "sub", "fm", "piano", "piano-thick",

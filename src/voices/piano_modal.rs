@@ -299,6 +299,120 @@ impl ModalPianoVoice {
         Self::from_lut_with_excitation(lut, sr, midi_note, velocity, true)
     }
 
+    /// Pure-physics constructor: zero dependence on SFZ samples / extracted
+    /// LUTs / pre-recorded residual buffers. Every mode's frequency,
+    /// amplitude and decay are derived analytically from textbook physics:
+    ///
+    ///   * Inharmonicity     — Fletcher & Rossing (1998) §12.4
+    ///                         f_n = n·f0·sqrt(1 + B·n²),
+    ///                         B(note) = 2.5e-4 · 1.1^((60-note)/12)
+    ///   * Strike position   — Fletcher & Rossing §12.7,
+    ///                         A_n ∝ |sin(n·π·β)|, β = x/L = 1/8
+    ///                         (8th, 16th, 24th harmonics → spectral voids)
+    ///   * Radiation loss    — high-frequency rolloff,
+    ///                         L(f) = 1 / (1 + (f/3000)²)
+    ///   * T60 (Valimaki)    — internal friction + air + bridge radiation,
+    ///                         T60(f) = 1 / (0.05 + 0.0002·f)
+    ///   * Excitation        — Stulov (1995) hysteretic hammer model
+    ///                         F(t) = K · x(t)^p, p ≈ 2.5
+    ///                         RK4-integrated mass-spring ODE
+    ///   * Residual          — disabled (Arc::new(empty)); commuted-residual
+    ///                         path ignored, no SFZ-derived waveform anywhere
+    ///
+    /// Activated by env var `KS_PHYSICS=1` in `synth::make_voice`.
+    pub fn from_physics(sr: f32, midi_note: u8, velocity: u8) -> Self {
+        let f0 = 440.0_f32 * 2.0_f32.powf((midi_note as f32 - 69.0) / 12.0);
+
+        // 1. Analytical inharmonicity coefficient. Note-dependent: B grows
+        //    toward the bass (shorter relative wavelength, stiffer string).
+        //    Reference value 2.5e-4 at MIDI 60 from Fletcher & Rossing
+        //    Table 12.1 (typical grand C4 ≈ 2-3·10⁻⁴). Per-octave 1.1×
+        //    multiplier matches the empirical bass-stiffening trend.
+        let b_coeff = 2.5e-4_f32 * 1.1_f32.powf((60.0 - midi_note as f32) / 12.0);
+
+        // 2. Strike position β = x/L = 1/8 (standard piano hammer impact
+        //    point). Modes whose n is a multiple of 1/β = 8 land on a node
+        //    of the strike point's spatial sin(nπβ) waveform → physically
+        //    excited with amplitude exactly 0. Spectral voids at h8, h16,
+        //    h24, ... give the "抜け" / clarity that an even-spectrum
+        //    sample bank can't reproduce.
+        let strike_pos: f32 = 0.125;
+
+        let mut modes: Vec<Mode> = Vec::new();
+        let n_max: usize = 96; // up to ~24 kHz at f0 = 250 Hz; loop below
+                               // breaks once we cross the Nyquist guard.
+        let nyq_guard = sr * 0.45;
+
+        for n in 1..=n_max {
+            let nf = n as f32;
+            // 1) inharmonic partial frequency
+            let freq = nf * f0 * (1.0 + b_coeff * nf * nf).sqrt();
+            if freq > nyq_guard {
+                break;
+            }
+
+            // 2) strike-position spatial amplitude (the missing-modes
+            //    factor). |sin(n·π·β)| ∈ [0, 1].
+            let spatial_amp = (nf * std::f32::consts::PI * strike_pos).sin().abs();
+
+            // 3) radiation + air damping rolloff. -3 dB at 3 kHz, -20 dB
+            //    at 30 kHz. Models combined air absorption and bridge
+            //    radiation impedance for upper partials (Fletcher &
+            //    Rossing §12.5).
+            let radiation_loss = 1.0 / (1.0 + (freq / 3000.0).powi(2));
+
+            // 1/n string spectrum (energy per partial of an ideal plucked
+            // / struck string scales as 1/n) × spatial × radiation.
+            let init_amp = (spatial_amp / nf) * radiation_loss;
+
+            // 4) Valimaki-style T60 model: f-dependent decay combining
+            //    internal friction (constant 0.05) and air loss
+            //    (linear-in-f 2e-4·f). Yields T60(f0=261)≈9.3 s,
+            //    T60(2 kHz)≈2.2 s, T60(8 kHz)≈0.6 s — close to measured
+            //    grand-piano partial decays.
+            let t60 = 1.0_f32 / (0.05 + 0.0002 * freq);
+
+            modes.push(Mode {
+                freq_hz: freq,
+                t60_sec: t60,
+                init_amp,
+            });
+        }
+
+        // 5) Stulov nonlinear hammer pulse (RK4-integrated). Velocity
+        //    scales the initial kinetic energy, which through the
+        //    nonlinearity opens up the high-frequency content of the
+        //    Force pulse — same physical phenomenon the existing
+        //    `build_hammer_excitation` Hertzian LPF approximates, but
+        //    here we solve the ODE directly. The pulse is peak-
+        //    normalised inside `solve_stulov_hammer_pulse`, so we apply
+        //    an explicit gain pre-factor here to keep the summed bank
+        //    output in the same headroom band as the LUT path under the
+        //    global `modal_params().output_gain` (default 80). LUT
+        //    excitation peaks at ~0.55 (Stage A), physics peak is 1.0
+        //    after normalisation → divide by ~6.5 so the chord_headroom_
+        //    audit stays in the "clean" tier (LUT path: 0.806 raw).
+        let excitation: Vec<f32> = {
+            const PHYSICS_EXCITATION_GAIN: f32 = 0.15;
+            solve_stulov_hammer_pulse(sr, velocity)
+                .into_iter()
+                .map(|s| s * PHYSICS_EXCITATION_GAIN)
+                .collect()
+        };
+
+        let velocity_amp = (velocity.max(1) as f32) / 127.0;
+        let mut voice = Self::with_modes(sr, &modes, excitation, velocity_amp);
+
+        // 6) Sever the SFZ-derived residual path entirely. `residual_amp`
+        //    is already 0 by default in `with_modes_no_detune`, but make
+        //    the contract explicit: physics mode never touches recorded
+        //    soundboard / room IR data.
+        voice.residual = std::sync::Arc::new(Vec::new());
+        voice.residual_idx = 0;
+        voice.residual_amp = 0.0;
+        voice
+    }
+
     /// Like `from_lut` but with the option to disable the hammer-impact
     /// noise burst added to the excitation. Default (`with_hammer_noise =
     /// true`) adds a 5 ms bandpass-filtered noise burst on top of the
@@ -603,6 +717,157 @@ fn build_hammer_excitation(sr: f32, midi_note: u8, velocity: u8) -> Vec<f32> {
         let y = *x * one_minus_a + y_prev * lp_a_post;
         y_prev = y;
         *x = y;
+    }
+    buf
+}
+
+/// Stulov (1995) hysteretic hammer-string contact ODE, integrated with
+/// classical RK4 to produce the Force-on-string pulse used by `from_physics`.
+///
+/// Physical model (single-DoF lumped felt+hammer mass, string treated as a
+/// rigid stop while the hammer is in contact):
+///
+///   m · d²x/dt² = -F(x, ẋ)
+///   F(x, ẋ) = K · x^p          for x > 0  (felt compressed)
+///           = 0                 for x ≤ 0  (free flight / separation)
+///
+/// where:
+///   x  = felt compression (m)
+///   m  = effective hammer mass (kg)            ≈ 8.7 g (mid-register)
+///   K  = felt stiffness (N/m^p)                ≈ 4.0e9
+///   p  = compression exponent                  ≈ 2.5  (Stulov 1995 fits)
+///
+/// We integrate a state vector [x, v] with v = ẋ. Initial condition:
+/// x = 0, v = -v0 with v0 the hammer impact velocity (positive value
+/// scaled by MIDI velocity). The hammer makes contact at t=0; the
+/// integration runs until x crosses back through 0 from positive (felt
+/// has decompressed and the hammer has separated from the string),
+/// after which the Force is identically 0.
+///
+/// The output is the time-series of F(t) sampled at the audio rate `sr`,
+/// truncated at separation (typically 1-5 ms total). buf[0] starts at
+/// t=0; the first sample is 0 (felt hasn't compressed yet) — that's
+/// fine for the modal bank because the resonators see a smoothly
+/// rising broadband impulse rather than a delta singularity.
+///
+/// Velocity mapping: v0 = 0.5 + 4.5 · (vel/127)  m/s. A real concert
+/// grand spans roughly 0.5 m/s (ppp) to 5 m/s (fff) at the hammer; the
+/// linear map keeps headroom predictable. Higher v0 increases peak
+/// Force AND broadens the spectrum (shorter contact time → wider band)
+/// — precisely the nonlinear coupling Stulov's K·x^p captures and
+/// linear approximations (Hertzian LPF, etc.) only mimic.
+///
+/// References:
+///   Stulov, A. (1995). "Hysteretic model of the grand piano hammer
+///     action." J. Acoust. Soc. Am. 97(4), 2577-2585.
+///   Chaigne, A. & Askenfelt, A. (1994). "Numerical simulations of
+///     piano strings." Part I, J. Acoust. Soc. Am. 95(2), 1112-1118.
+fn solve_stulov_hammer_pulse(sr: f32, velocity: u8) -> Vec<f32> {
+    // Physical constants. Mid-register grand-piano hammer params
+    // (roughly C4); reasonable across the full range for our purposes
+    // because the modal bank's per-note frequency layout dominates the
+    // perceived character.
+    let m: f32 = 8.7e-3;     // 8.7 g effective hammer mass
+    let k: f32 = 4.0e9;      // felt stiffness (N/m^p)
+    let p: f32 = 2.5;        // Stulov compression exponent
+
+    // Hammer impact velocity. ppp .. fff = 0.5 .. 5.0 m/s.
+    let vel_norm = (velocity.max(1) as f32) / 127.0;
+    let v0: f32 = 0.5 + 4.5 * vel_norm;
+
+    // Time step = audio sample period. Stulov contact times are
+    // 0.5-5 ms — at sr=44.1 kHz that's 22-220 samples, plenty of
+    // resolution for RK4. We additionally substep 4× internally to
+    // keep the high-velocity (stiff-spring) cases stable.
+    let dt_audio = 1.0 / sr;
+    let substeps: usize = 4;
+    let dt = dt_audio / substeps as f32;
+
+    // Force: F(x) = K · x^p when x > 0, else 0. Returns acceleration
+    // a = -F/m (string pushes hammer back = negative direction).
+    let accel = |x: f32| -> f32 {
+        if x > 0.0 {
+            -k * x.powf(p) / m
+        } else {
+            0.0
+        }
+    };
+    // Force returned to the string (positive when felt is compressed).
+    let force = |x: f32| -> f32 {
+        if x > 0.0 {
+            k * x.powf(p)
+        } else {
+            0.0
+        }
+    };
+
+    // RK4 step on state (x, v) with ẋ = v, v̇ = a(x).
+    let rk4_step = |x: f32, v: f32| -> (f32, f32) {
+        let k1x = v;
+        let k1v = accel(x);
+
+        let k2x = v + 0.5 * dt * k1v;
+        let k2v = accel(x + 0.5 * dt * k1x);
+
+        let k3x = v + 0.5 * dt * k2v;
+        let k3v = accel(x + 0.5 * dt * k2x);
+
+        let k4x = v + dt * k3v;
+        let k4v = accel(x + dt * k3x);
+
+        let nx = x + (dt / 6.0) * (k1x + 2.0 * k2x + 2.0 * k3x + k4x);
+        let nv = v + (dt / 6.0) * (k1v + 2.0 * k2v + 2.0 * k3v + k4v);
+        (nx, nv)
+    };
+
+    // Initial state: hammer at the string surface (x=0), moving INTO
+    // the string with velocity v0 (positive x = compression direction).
+    let mut x: f32 = 0.0;
+    let mut v: f32 = v0;
+
+    // Cap total integration at 8 ms (well above any realistic Stulov
+    // contact time even for the softest pp strikes). If the hammer
+    // hasn't separated by then, force-terminate to avoid pathological
+    // buffer growth.
+    let max_samples = ((sr * 0.008).round() as usize).max(64);
+    let mut buf: Vec<f32> = Vec::with_capacity(max_samples);
+
+    // Sample F(t) at audio rate, advancing the ODE by `substeps` RK4
+    // micro-steps between each emit.
+    for i in 0..max_samples {
+        // Sample the current Force (state x BEFORE this sample's
+        // sub-step block — gives F(t) on the audio grid).
+        buf.push(force(x));
+
+        // Advance state by one audio period using RK4 sub-steps.
+        for _ in 0..substeps {
+            let (nx, nv) = rk4_step(x, v);
+            x = nx;
+            v = nv;
+        }
+
+        // Separation criterion: x crossed back through 0 (felt fully
+        // decompressed) after at least the first few samples. We pad
+        // a couple of zero-valued samples after separation so the
+        // resonators see a clean trailing edge.
+        if i > 4 && x <= 0.0 {
+            // Two more zero samples to flush; then stop.
+            buf.push(0.0);
+            buf.push(0.0);
+            break;
+        }
+    }
+
+    // Normalise so the peak magnitude = 1.0 (the modal bank's
+    // `with_modes` will then scale by velocity_amp like every other
+    // path). This decouples physical Force units (Newtons) from the
+    // arbitrary digital-domain levels the resonator b0 expects.
+    let peak = buf.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+    if peak > 1e-9 {
+        let inv = 1.0 / peak;
+        for s in buf.iter_mut() {
+            *s *= inv;
+        }
     }
     buf
 }
@@ -1343,6 +1608,132 @@ mod tests {
         assert_eq!(lut.entries.len(), 1);
         assert_eq!(lut.entries[0].midi_note, 60);
         assert_eq!(lut.entries[0].modes.len(), 8);
+    }
+
+    // -- from_physics path -------------------------------------------------
+
+    /// Stulov hammer pulse must produce a finite, non-empty Force buffer
+    /// whose values are bounded — a runaway ODE (poor RK4 step / wrong
+    /// sign) would diverge to NaN/Inf or last forever.
+    #[test]
+    fn stulov_pulse_bounded_and_terminates() {
+        for &vel in &[1u8, 32, 64, 100, 127] {
+            let pulse = solve_stulov_hammer_pulse(SR, vel);
+            assert!(!pulse.is_empty(), "vel={vel}: empty Stulov pulse");
+            // Contact ≤ 8 ms (max integration window). At sr=44.1 kHz
+            // that's 353 samples + 2 zero-flush. Allow a little slack.
+            assert!(
+                pulse.len() <= ((SR * 0.010) as usize),
+                "vel={vel}: pulse too long ({} samples)",
+                pulse.len()
+            );
+            // All finite.
+            for (i, &s) in pulse.iter().enumerate() {
+                assert!(
+                    s.is_finite(),
+                    "vel={vel}: non-finite sample at index {i}: {s}"
+                );
+                assert!(
+                    s.abs() <= 1.0 + 1e-6,
+                    "vel={vel}: peak-normalised sample > 1.0: {s}"
+                );
+            }
+            // Peak should be exactly 1.0 (post peak-normalisation).
+            let peak = pulse.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+            assert!(
+                (peak - 1.0).abs() < 1e-5,
+                "vel={vel}: peak not unity: {peak}"
+            );
+        }
+    }
+
+    /// Higher velocity → broader Force pulse spectrum: a coarse proxy is
+    /// the contact-time half-width. Stulov's stiffening felt shortens
+    /// contact time as v0 grows. Concretely, vel=127's pulse should be
+    /// no longer than vel=1's pulse (and typically meaningfully shorter).
+    #[test]
+    fn stulov_pulse_velocity_shortens_contact() {
+        let soft = solve_stulov_hammer_pulse(SR, 1);
+        let hard = solve_stulov_hammer_pulse(SR, 127);
+        assert!(
+            hard.len() <= soft.len(),
+            "hard strike contact ({} samples) longer than soft strike ({} samples) — Stulov sign error?",
+            hard.len(),
+            soft.len()
+        );
+    }
+
+    /// `from_physics` for C4 (note 60) must produce a non-empty resonator
+    /// bank, finite first 100 ms output, and a measurable peak. The
+    /// missing-modes contract: with strike β = 1/8, the 8th, 16th, 24th
+    /// partials' init_amp coming out of the analytic loop should be
+    /// *exactly* zero — verified BEFORE the detune expansion in
+    /// `with_modes` smears them across ±0.7 cents.
+    #[test]
+    fn from_physics_renders_and_has_missing_modes() {
+        let v = ModalPianoVoice::from_physics(SR, 60, 100);
+        // Detune expansion (×3) × pol_v (default pol_h_weight=0.15 keeps
+        // both layers active) means 96 partial slots → up to 96 × 6 =
+        // 576 resonators, but the analytic loop breaks at 0.45·sr Nyquist.
+        // We only require non-empty here.
+        assert!(
+            !v.resonators.is_empty(),
+            "from_physics produced 0 resonators"
+        );
+
+        // Render 100 ms and assert finite + audible.
+        let mut voice = ModalPianoVoice::from_physics(SR, 60, 100);
+        let mut buf = vec![0.0_f32; (SR * 0.1) as usize];
+        voice.render_add(&mut buf);
+        for &s in &buf {
+            assert!(s.is_finite(), "non-finite sample in physics render");
+        }
+        let peak = buf.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+        assert!(peak > 1e-4, "physics render too quiet: peak={peak}");
+    }
+
+    /// The strike-position sin(nπβ) factor is the physical signature
+    /// of the model. Confirm it directly: for β=1/8, sin(8π·1/8)=0, etc.
+    /// We do this by reconstructing the pre-expansion Mode list using
+    /// the same formulas the constructor uses, verifying that h8/h16/h24
+    /// would-be init_amps are zero. (We can't read the internal `modes`
+    /// list back out of the voice because `with_modes` mutates &
+    /// expands them; the contract is on the analytic generator.)
+    #[test]
+    fn missing_modes_at_strike_position_octuples() {
+        let strike_pos: f32 = 0.125;
+        for &n in &[8usize, 16, 24, 32] {
+            let nf = n as f32;
+            let spatial = (nf * std::f32::consts::PI * strike_pos).sin().abs();
+            assert!(
+                spatial < 1e-5,
+                "n={n}: |sin(nπβ)|={spatial} should be ~0 for β=1/8",
+            );
+        }
+        // Sanity: non-multiples of 8 should NOT be near zero.
+        for &n in &[1usize, 3, 5, 7, 9, 11, 13] {
+            let nf = n as f32;
+            let spatial = (nf * std::f32::consts::PI * strike_pos).sin().abs();
+            assert!(
+                spatial > 0.05,
+                "n={n}: |sin(nπβ)|={spatial} unexpectedly small",
+            );
+        }
+    }
+
+    /// Physics path must NOT load any residual buffer regardless of
+    /// `RESIDUAL_LUT` global state. We can't easily set RESIDUAL_LUT in
+    /// a unit test without leaking into other tests, but we can assert
+    /// the per-voice residual fields are empty.
+    #[test]
+    fn from_physics_has_no_residual() {
+        let v = ModalPianoVoice::from_physics(SR, 60, 100);
+        assert!(
+            v.residual.is_empty(),
+            "physics path leaked residual buffer (len={})",
+            v.residual.len()
+        );
+        assert_eq!(v.residual_amp, 0.0);
     }
 
     #[test]

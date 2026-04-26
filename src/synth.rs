@@ -1052,7 +1052,18 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
             // host binary; otherwise fall back to the hardcoded C4 entry
             // so even unit tests / harnesses that don't call
             // `MODAL_LUT.set(...)` produce sound.
-            if let Some(lut) = MODAL_LUT.get() {
+            // Pure-physics path (`from_physics`) bypasses LUT + residual
+            // entirely. Activated by env var KS_PHYSICS=1 / "true".
+            // Reads on every voice spawn: cheap (~ns) compared to voice
+            // construction, and avoids capturing the env at process init
+            // when render_song / render_chord etc. set it programmatically
+            // before each variant.
+            let use_physics = std::env::var("KS_PHYSICS")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if use_physics {
+                Box::new(ModalPianoVoice::from_physics(sr, midi_note, velocity))
+            } else if let Some(lut) = MODAL_LUT.get() {
                 Box::new(ModalPianoVoice::from_lut(lut, sr, midi_note, velocity))
             } else {
                 let fallback = ModalLut::fallback_c4();
