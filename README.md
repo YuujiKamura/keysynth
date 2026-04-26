@@ -29,6 +29,30 @@ cargo run --release -- --list
 Defaults to MPK mini 3 (or first available MIDI input port) and the system
 default audio output device.
 
+## Web demo (GitHub Pages)
+
+A trimmed wasm32 build of the modelling engines runs in the browser. No
+SF2/SFZ samples, no live MIDI controller — input is the on-screen keyboard
+or PC keyboard (`zsxdcvgbhnjm` lower octave, `qwerty…` upper octave).
+
+```bash
+# One-off prerequisites
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+
+# Local dev server at http://localhost:8080
+trunk serve --release
+
+# Static build under dist/  (what GitHub Actions deploys to gh-pages)
+trunk build --release
+```
+
+The Cargo features and bin selection live in `web/index.html` via the
+`data-cargo-*` / `data-bin` attributes on the trunk rust link. CI is at
+`.github/workflows/deploy-pages.yml`; enable Pages once in repo settings
+(Source: GitHub Actions) and pushes to `main`/`master` will auto-deploy
+to `https://<user>.github.io/keysynth/`.
+
 ### CLI
 
 ```

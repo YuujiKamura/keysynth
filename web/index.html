@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta name="description" content="keysynth — pure-Rust real-time modelling synth, running in the browser via WebAssembly + Web Audio." />
+    <title>keysynth (web)</title>
+
+    <!-- Trunk picks up this <link> and emits the wasm/JS glue beside it.
+         data-cargo-no-default-features + data-cargo-features="web" select
+         the trimmed wasm build that drops midir / SF2 / SFZ / offline bins. -->
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="keysynth-web"
+      data-cargo-no-default-features
+      data-cargo-features="web"
+    />
+
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html, body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: #1a1a1f;
+        color: #ddd;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+      }
+      #keysynth-canvas {
+        width: 100%;
+        height: 100%;
+        outline: none;
+        touch-action: none;
+      }
+      #loading {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 18px;
+        color: #888;
+      }
+      noscript {
+        padding: 1em;
+        text-align: center;
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>
+      keysynth needs JavaScript + WebAssembly. Please enable both.
+    </noscript>
+    <div id="loading">loading keysynth …</div>
+    <canvas id="keysynth-canvas"></canvas>
+
+    <script type="module">
+      // Hide the "loading" splash once the wasm module is fetched + the
+      // egui canvas has had a frame to paint. Trunk's snippet resolves
+      // when wasm-bindgen `init()` returns, which is before the first
+      // egui frame, so wait one rAF tick more.
+      const loading = document.getElementById("loading");
+      const observer = new MutationObserver(() => {
+        const canvas = document.getElementById("keysynth-canvas");
+        if (canvas && canvas.width > 0 && loading) {
+          requestAnimationFrame(() => {
+            loading.style.display = "none";
+          });
+          observer.disconnect();
+        }
+      });
+      observer.observe(document.getElementById("keysynth-canvas"), {
+        attributes: true,
+        attributeFilter: ["width", "height"],
+      });
+    </script>
+  </body>
+</html>
