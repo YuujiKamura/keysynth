@@ -449,7 +449,7 @@ impl ModalPianoVoice {
         // a pure modal bank can't produce — visible in spectrograms as
         // the "warmth gap" between modal and SFZ.
         let excitation = if with_hammer_noise {
-            build_hammer_excitation(sr, midi_note)
+            build_hammer_excitation(sr, midi_note, velocity)
         } else {
             vec![1.0_f32]
         };
@@ -499,7 +499,18 @@ impl ModalPianoVoice {
 ///     are missing)
 ///
 /// First sample is the delta (amplitude 1.0).
-fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
+///
+/// Arch-1 (2026-04-26): velocity is consumed for the post-pass Hertzian
+/// hammer LPF — strong keystrokes compress the felt and shorten the
+/// hammer-string contact time, which in real pianos opens the high-end
+/// of the impact spectrum (Stulov 1995). We approximate this with a
+/// 1-pole low-pass whose cutoff scales `1 kHz + 9 kHz · (vel/127)²`
+/// applied to the entire generated excitation vector AFTER the existing
+/// Stage A/B noise-shaping. The delta at buf[0] is also passed through
+/// the LPF — that's intended: a delta into a 1-pole IIR becomes the
+/// LPF's impulse response, which is exactly what a soft hammer should
+/// look like (broadband attack rolled off above its cutoff).
+fn build_hammer_excitation(sr: f32, midi_note: u8, velocity: u8) -> Vec<f32> {
     let n_a = ((sr * 0.012).round() as usize).max(16);
     let n_b = ((sr * 0.250).round() as usize).max(64);
     let total = n_a + n_b;
@@ -572,6 +583,26 @@ fn build_hammer_excitation(sr: f32, midi_note: u8) -> Vec<f32> {
             0.5 * (1.0 + (std::f32::consts::PI * t).cos()) * stage_b_gain
         };
         buf[i + 1] = lp_prev * env;
+    }
+
+    // Arch-1: Hertzian hammer LPF post-pass. Velocity-dependent 1-pole
+    // low-pass, applied to the FULL buffer (delta + Stage A + Stage B).
+    //   cutoff_hz = 1000 + 9000 · (vel/127)²
+    //   a = exp(-2π · cutoff / sr)
+    //   y[n] = x[n]·(1-a) + y[n-1]·a
+    // Soft (vel=1) → ~1 kHz LPF, strong (vel=127) → ~10 kHz LPF.
+    // Mirrors Stulov's felt-compression model: harder strikes shorten
+    // the contact time, opening the high-frequency content of the
+    // hammer impulse non-linearly with velocity.
+    let vel_norm = (velocity as f32) / 127.0;
+    let cutoff_hz = 1000.0 + 9000.0 * vel_norm * vel_norm;
+    let lp_a_post = (-2.0 * std::f32::consts::PI * cutoff_hz / sr).exp();
+    let one_minus_a = 1.0 - lp_a_post;
+    let mut y_prev = 0.0_f32;
+    for x in buf.iter_mut() {
+        let y = *x * one_minus_a + y_prev * lp_a_post;
+        y_prev = y;
+        *x = y;
     }
     buf
 }
@@ -985,29 +1016,39 @@ impl VoiceImpl for ModalPianoVoice {
             }
             // Pull next excitation sample (or 0 once the impulse runs
             // out — the resonators carry the sound from there).
-            let x = if self.excitation_idx < self.excitation.len() {
+            let mut x = if self.excitation_idx < self.excitation.len() {
                 let v = self.excitation[self.excitation_idx];
                 self.excitation_idx += 1;
                 v
             } else {
                 0.0
             };
+            // Arch-1 commuted residual (Smith): residual is fed into
+            // the resonator excitation x[n] rather than added to the
+            // output bus. Physical justification: the SFZ - modal
+            // residual carries the soundboard / body / room IR, which
+            // is one big LTI filter shared across all strings. The
+            // previous direct-add layered every note's residual on top
+            // of the bus, so chords stacked N copies of the
+            // soundboard IR (linear and phase-incoherent), producing
+            // the perceived "curtain-over" muddiness. Routing residual
+            // through the per-note resonator bank means the noise
+            // content gets filtered by the same modes the hammer is
+            // exciting — fused with the partials, no longer a
+            // detached layer that scales with polyphony.
+            if self.residual_idx < self.residual.len() {
+                x += self.residual[self.residual_idx] * self.residual_amp;
+                self.residual_idx += 1;
+            }
             let mut sum = 0.0_f32;
             for r in &mut self.resonators {
                 sum += r.step(x);
             }
             let env = self.release.step();
             // Modal partial sum (biquad bank output * envelope * gain).
+            // Residual is no longer added directly here — it's already
+            // baked into `sum` via the commuted excitation path above.
             *sample += sum * env * modal_output_gain;
-            // Smith commuted-synthesis residual layer. Adds the pre-
-            // recorded SFZ - modal difference for the duration of the
-            // residual buffer (~0.5 s); note-on captures the recorded
-            // hammer-felt transient + soundboard / body / room
-            // characteristics that the partial bank can't produce.
-            if self.residual_idx < self.residual.len() {
-                *sample += self.residual[self.residual_idx] * self.residual_amp;
-                self.residual_idx += 1;
-            }
         }
     }
     fn trigger_release(&mut self) {
