@@ -16,6 +16,7 @@
 //! ~150 ms (~6600 samples @ 44.1 kHz) so the per-callback cost stays
 //! bounded and we don't need an FFT path.
 
+#[cfg(feature = "native")]
 use std::path::Path;
 
 /// Hard cap on IR length in samples. ~150 ms at 44.1 kHz; the tail of a
@@ -152,6 +153,7 @@ pub fn synthetic_body_ir(sr: u32) -> Vec<f32> {
 /// Load an impulse response from a WAV file. Accepts mono or stereo,
 /// 16/24/32-bit Int or 32-bit Float. Stereo is downmixed to mono (L+R)/2.
 /// Result is normalised to peak ~1.0 and truncated to `MAX_IR_SAMPLES`.
+#[cfg(feature = "native")]
 pub fn load_ir_wav(path: &Path) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let mut reader =
         hound::WavReader::open(path).map_err(|e| format!("opening IR WAV {:?}: {e}", path))?;

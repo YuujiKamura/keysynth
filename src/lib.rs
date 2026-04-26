@@ -4,18 +4,29 @@
 //! `synth` holds the engines, voices, ADSR, hammer/pluck excitations, and
 //! MIDI math. `ui` is the egui dashboard, kept here so both bins (or
 //! future tools) can re-skin or embed it.
+//!
+//! Native-only modules (offline analysis, SFZ sampler, IR-WAV reverb
+//! loader, midir-driven dashboard) are gated behind the `native` Cargo
+//! feature so the wasm32 build for the GitHub Pages demo doesn't try to
+//! pull in midir / hound / rustfft / image / rustysynth.
 
-pub mod analysis;
-pub mod extract;
 pub mod gm;
 pub mod reverb;
-pub mod score;
-pub mod sfz;
 pub mod soundboard;
 pub mod sympathetic;
 pub mod synth;
-pub mod ui;
 pub mod voices;
+
+#[cfg(feature = "native")]
+pub mod analysis;
+#[cfg(feature = "native")]
+pub mod extract;
+#[cfg(feature = "native")]
+pub mod score;
+#[cfg(feature = "native")]
+pub mod sfz;
+#[cfg(feature = "native")]
+pub mod ui;
 
 // Re-export the dashboard-facing types at the crate root so older callers
 // that imported them via `crate::{LiveParams, DashState, Engine}` keep

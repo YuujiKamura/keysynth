@@ -4,84 +4,142 @@ version = "0.1.0"
 edition = "2021"
 description = "Real-time MIDI keyboard -> speaker synth (square / Karplus-Strong)."
 
+[features]
+# Default = full native build (live MIDI in, native audio out, SF2/SFZ playback,
+# offline analysis bins). Disable default features and pass `--features web` to
+# get the trimmed wasm32 build for the GitHub Pages demo.
+default = ["native"]
+
+native = [
+    "dep:midir",
+    "dep:ctrlc",
+    "dep:rustysynth",
+    "dep:hound",
+    "dep:rustfft",
+    "dep:image",
+]
+
+# Web build: stripped to the modelling engines + on-screen keyboard. Drops
+# midir / rustysynth / hound / rustfft / image / sfz so the wasm bundle stays
+# small and so we don't try to compile native-only crates against
+# wasm32-unknown-unknown.
+web = [
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+    "dep:js-sys",
+    "cpal/wasm-bindgen",
+]
+
 [dependencies]
-midir = "0.10"
+# DSP / GUI core — shared between native and web builds.
 cpal = "0.15"
-ctrlc = "3.4"
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.29"
-
-# bench binary deps (SoundFont reference comparison harness)
-rustysynth = "1.3"
-hound = "3.5"
-
-# analyse binary: STFT, harmonic decay, spectrogram PNG, JSON report
-rustfft = "6"
-image = { version = "0.25", default-features = false, features = ["png"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native-only (gated via `native` feature).
+midir = { version = "0.10", optional = true }
+ctrlc = { version = "3.4", optional = true }
+rustysynth = { version = "1.3", optional = true }
+hound = { version = "3.5", optional = true }
+rustfft = { version = "6", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+
+# Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+web-sys = { version = "0.3", optional = true, features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "Navigator",
+    "MidiAccess",
+    "MidiInput",
+    "MidiInputMap",
+    "MidiMessageEvent",
+    "MidiOptions",
+    "MidiPort",
+] }
 
 [profile.release]
 opt-level = 3
 lto = "thin"
 
+# Smaller wasm bundle: tighter inlining + size-aware codegen. opt-level = "s"
+# (size) keeps DSP hot loops vectorised in practice but trims dead code more
+# aggressively than "3". LTO already on from the shared profile.release above.
+[profile.release.package."*"]
+opt-level = 3
+
+# ---------------------------------------------------------------------------
+# Binaries.
+#
+# `keysynth` is the live native synth.
+# `keysynth-web` is the wasm32 entry point built by trunk.
+# Everything else is an offline harness (bench / analyse / extract dump /
+# render / score / build_modal_lut). All offline tools require the `native`
+# feature so `cargo build --no-default-features --features web --target
+# wasm32-unknown-unknown` only sees `keysynth-web`.
+# ---------------------------------------------------------------------------
+
 [[bin]]
 name = "keysynth"
 path = "src/main.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "keysynth-web"
+path = "src/bin/web.rs"
+required-features = ["web"]
 
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
+required-features = ["native"]
 
 [[bin]]
 name = "analyse"
 path = "src/bin/analyse.rs"
+required-features = ["native"]
 
-# cpubench binary: 32-voice sustained polyphony cost per engine.
-# Tracks issue #2 per-voice CPU budget.
 [[bin]]
 name = "cpubench"
 path = "src/bin/cpubench.rs"
+required-features = ["native"]
 
-# extract_dump binary: dump the issue #3 extractors' output for a WAV.
-# Used to pin / re-pin golden values when an extractor's algorithm changes.
 [[bin]]
 name = "extract_dump"
 path = "src/bin/extract_dump.rs"
+required-features = ["native"]
 
-# render_modal binary: modal-synthesis piano voice C4 pilot (issue #3 alt path).
-# Extracts modes from a reference WAV via src/extract/* and renders them back
-# through ModalPianoVoice (parallel bandpass resonator bank).
 [[bin]]
 name = "render_modal"
 path = "src/bin/render_modal.rs"
+required-features = ["native"]
 
-# score binary: weighted multi-metric loss between a reference and a
-# candidate WAV. Combines MR-STFT, T60 vector, onset envelope, centroid
-# trajectory, and inharmonicity-coefficient residual into one scalar.
 [[bin]]
 name = "score"
 path = "src/bin/score.rs"
+required-features = ["native"]
 
-# build_modal_lut binary: extract per-note modal LUT (decompose + t60 +
-# attack) from SFZ Salamander reference WAVs. Output is consumed by
-# voices::piano_modal::ModalPianoVoice (issue #3 A2 supervised path).
 [[bin]]
 name = "build_modal_lut"
 path = "src/bin/build_modal_lut.rs"
+required-features = ["native"]
 
-# render_chord binary: render N-note chord through any engine for
-# chord-level GT comparison. Single-note evaluation hides the polyphony
-# stacking artifact, so chord-level renders are needed for issue #3
-# realism evaluation.
 [[bin]]
 name = "render_chord"
 path = "src/bin/render_chord.rs"
+required-features = ["native"]
 
-# render_song binary: render short multi-note phrases (chord
-# progressions, melody+bass, two-voice imitation) through any engine
-# for musical-context realism evaluation. Multi-event timeline
-# scheduling, per-event velocity/duration.
 [[bin]]
 name = "render_song"
 path = "src/bin/render_song.rs"
+required-features = ["native"]

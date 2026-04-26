@@ -627,7 +627,14 @@ impl ModalLut {
     /// modal pipeline (`Mode::init_amp` is always linear).
     pub fn from_json_path(path: &Path) -> Result<Self, ModalLutError> {
         let raw = std::fs::read(path)?;
-        let json: ModalLutJson = serde_json::from_slice(&raw)?;
+        Self::from_json_bytes(&raw)
+    }
+
+    /// Same as `from_json_path` but parses already-loaded bytes. Used by
+    /// the wasm32 build to consume `include_bytes!`-embedded LUTs without
+    /// touching the filesystem (which is empty on wasm32-unknown-unknown).
+    pub fn from_json_bytes(raw: &[u8]) -> Result<Self, ModalLutError> {
+        let json: ModalLutJson = serde_json::from_slice(raw)?;
         if json.schema_version != 1 {
             return Err(ModalLutError::SchemaVersion(json.schema_version));
         }
@@ -708,20 +715,44 @@ impl ModalLut {
     /// caller can log which path was actually used (real JSON vs C4
     /// fallback).
     pub fn auto_load(explicit: Option<&Path>) -> (Self, String) {
-        let default_path = Path::new("bench-out/REF/sfz_salamander_multi/modal_lut.json");
-        let candidate = explicit.unwrap_or(default_path);
-        match Self::from_json_path(candidate) {
-            Ok(lut) => {
-                let n = lut.entries.len();
-                (lut, format!("{} ({n} entries)", candidate.display()))
-            }
-            Err(e) => (
-                Self::fallback_c4(),
-                format!(
-                    "hardcoded C4 fallback (loading {} failed: {e})",
-                    candidate.display()
+        // Wasm32 has no filesystem on GitHub Pages — `std::fs::read` always
+        // returns NotFound. Skip the disk probe entirely and parse the LUT
+        // bytes baked in at compile time. Path argument is accepted for
+        // API parity with the native build but is ignored on wasm32.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = explicit;
+            const EMBEDDED: &[u8] =
+                include_bytes!("../../bench-out/REF/sfz_salamander_multi/modal_lut.json");
+            return match Self::from_json_bytes(EMBEDDED) {
+                Ok(lut) => {
+                    let n = lut.entries.len();
+                    (lut, format!("embedded modal_lut.json ({n} entries)"))
+                }
+                Err(e) => (
+                    Self::fallback_c4(),
+                    format!("hardcoded C4 fallback (embedded LUT parse failed: {e})"),
                 ),
-            ),
+            };
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let default_path = Path::new("bench-out/REF/sfz_salamander_multi/modal_lut.json");
+            let candidate = explicit.unwrap_or(default_path);
+            match Self::from_json_path(candidate) {
+                Ok(lut) => {
+                    let n = lut.entries.len();
+                    (lut, format!("{} ({n} entries)", candidate.display()))
+                }
+                Err(e) => (
+                    Self::fallback_c4(),
+                    format!(
+                        "hardcoded C4 fallback (loading {} failed: {e})",
+                        candidate.display()
+                    ),
+                ),
+            }
         }
     }
 
