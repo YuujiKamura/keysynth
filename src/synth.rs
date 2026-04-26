@@ -377,6 +377,23 @@ pub struct ModalParams {
 
 impl Default for ModalParams {
     fn default() -> Self {
+        // ──────────────────────────────────────────────────────────────────
+        // PRESET candidate (2026-04-26, env-var only — see render_chord):
+        //   KS_DETUNE=2.0 KS_POL_H=0.6 KS_T60_CAP=6.0
+        //   KS_STAGE_B=0.4 KS_OUT_GAIN=45.0 KS_RESIDUAL=0.10
+        //
+        // Tuned via Gemini audio-modality loop + CDPAM + VLM cross-check
+        // on Salamander Grand C4. Single-note CDPAM 0.4420 → 0.1519
+        // (subtle band). Three-note C major peak at master=1.0: 0.832 ≤ 0.95.
+        //
+        // NOT promoted to default yet because piano_modal voice tests
+        // (from_lut_*, release_lifecycle) snapshot resonator counts
+        // that depend on detune × polarization × residual sub-mode
+        // multiplicities — those tests need to be retuned together
+        // with the defaults. See log_chord.md round 16. Use the preset
+        // via env vars in the meantime; chord_headroom_audit already
+        // passes with these values.
+        // ──────────────────────────────────────────────────────────────────
         Self {
             detune_cents: 0.7,
             pol_h_weight: 0.15,
