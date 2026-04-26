@@ -3,11 +3,15 @@ name: Deploy keysynth web demo to GitHub Pages
 on:
   push:
     branches: [main, master]
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
 
-# Single concurrent deploy; cancel in-flight runs on new pushes.
+# Single concurrent deploy; cancel in-flight runs on new pushes. PR runs
+# from the same branch are also coalesced under their own group key so
+# repeated pushes to a PR don't queue stale builds.
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -53,11 +57,18 @@ jobs:
           trunk build --release --public-url "/${REPO_NAME}/"
 
       - name: Upload Pages artifact
+        # Only upload on push to main/master (or workflow_dispatch). PR
+        # runs are validate-only — uploading would require Pages write
+        # permission from a fork PR which GitHub denies anyway.
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: dist
 
   deploy:
+    # Skip deploy on PR runs — those are build-only validation. Deploy
+    # only fires when the workflow runs from a push to main/master.
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
