@@ -910,7 +910,12 @@ mod tests {
         assert!(!v.is_releasing());
         v.trigger_release();
         assert!(v.is_releasing());
-        let _ = render(&mut v, (SR * 0.7) as usize);
+        // ReleaseEnvelope is constructed with release_sec = 0.8 s
+        // (line ~213) and the default done_threshold = 1e-4. The
+        // multiplicative decay reaches 1e-3 at exactly release_sec, so
+        // is_done() (rel_mul ≤ 1e-4) lands at t = 0.8 · ln(1e-4)/ln(1e-3)
+        // = 0.8 · 4/3 ≈ 1.067 s. Render slightly past that with margin.
+        let _ = render(&mut v, (SR * 1.2) as usize);
         assert!(v.is_done());
     }
 
@@ -963,10 +968,18 @@ mod tests {
             ],
         );
         let v = ModalPianoVoice::from_lut(&lut, SR, 60, 100);
-        // 2 modes × 3 detune sub-modes = 6 resonators, frequency-ordered
-        // around their centres. Recover each centre frequency from the
-        // resonator's `cos_omega` and compare against the LUT.
-        assert_eq!(v.resonators.len(), 6);
+        // `from_lut` runs through `from_lut_with_excitation`, which
+        // since 469ba90 also extrapolates higher partials when the
+        // last measured partial sits below ~3 kHz (bass-fill toward
+        // TARGET_MAX_PARTIALS = 32, halting once the projected freq
+        // exceeds 8 kHz). For these two LUT modes (261.6 / 523.1 Hz),
+        // f1 = 261.6 drives the extrapolation and adds 28 partials →
+        // 30 modes total, then `with_modes` triples each into ±0.7-cent
+        // detune sub-modes → 30 × 3 = 90 resonators. The first 6
+        // (resonators[0..6]) are the 3-sub-mode expansions of the
+        // original f1 and f2 modes, so the bracket asserts below
+        // remain valid.
+        assert_eq!(v.resonators.len(), 90);
         let recovered: Vec<f32> = v
             .resonators
             .iter()
@@ -1016,7 +1029,12 @@ mod tests {
             ],
         );
         let v = ModalPianoVoice::from_lut(&lut, SR, 72, 100);
-        assert_eq!(v.resonators.len(), 6);
+        // Same expansion as `from_lut_exact_match_uses_lut_directly`:
+        // 2 input modes → +13 extrapolated → 15 → ×3 detune = 45
+        // resonators. The note-72 query just rescales every freq by
+        // ratio ≈ 2.0 before the resonator bank is built; the count
+        // is identical.
+        assert_eq!(v.resonators.len(), 45);
         // Recover sub-mode centres and check they scale by 2.0 (with
         // ratio = 440·2^((72-69)/12) / 261.63 = 523.25 / 261.63 ≈ 2.0).
         let recovered: Vec<f32> = v
@@ -1053,7 +1071,13 @@ mod tests {
             }],
         );
         let v = ModalPianoVoice::from_lut(&lut, SR, 60, 100);
-        assert_eq!(v.resonators.len(), 3);
+        // 1 LUT mode at 261.6 Hz — bass-fill extrapolation adds 26
+        // more partials (n=2..27, capped when projected freq passes
+        // 8 kHz) → 27 modes → ×3 detune = 81 resonators. The
+        // sentinel-T60 substitution downstream still applies to every
+        // resonator (incl. extrapolated ones) so the a2 > 0.999 check
+        // below remains the right invariant.
+        assert_eq!(v.resonators.len(), 81);
         // Pole radius for 12 s T60 at 44100 Hz: r ≈ 0.99987.
         // r² should be > 0.999.
         for r in &v.resonators {
