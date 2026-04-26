@@ -1,6 +1,8 @@
 /target
+/dist
 
 # CARGO_TARGET_DIR may point elsewhere; keep the default rule too.
+# /dist is trunk's default output for the web demo.
 
 # OS / editor noise
 .DS_Store
