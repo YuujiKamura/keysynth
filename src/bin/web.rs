@@ -895,7 +895,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         ui.label(
                             egui::RichText::new(
                                 "No MIDI keyboard? Use the on-screen piano (mouse) or PC keys\n\
-                                 zsxdcvgbhnjm = lower octave, qwertyu... = upper octave",
+                                 zsxdcvgbhnjm = lower octave, qwertyui = upper octave",
                             )
                             .size(12.0)
                             .color(egui::Color32::from_gray(150)),
@@ -1066,7 +1066,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         self.base_note += 12;
                     }
                     ui.separator();
-                    ui.label("PC keyboard: zsxdcvgbhnjm = lower octave, qweryt... = upper");
+                    ui.label("PC keyboard: zsxdcvgbhnjm = lower octave, qwertyui = upper");
                 });
             });
 
