@@ -450,85 +450,76 @@ mod imp {
     // 16384 frames ≈ 372 ms at 44.1 kHz) the main thread can stall
     // for 100+ ms without the worklet ever running dry.
     const WORKLET_PROCESSOR_JS: &str = r#"
-class KeysynthProcessor extends AudioWorkletProcessor {
+class KeysynthInline extends AudioWorkletProcessor {
   constructor(options) {
     super();
-    const opts = (options && options.processorOptions) || {};
-    this.cap = opts.ringCapacity || 16384;
-    this.ring = new Float32Array(this.cap);
-    this.read = 0;
-    this.write = 0;
-    this.size = 0;
-    this.requesting = false;
-    this.lowWatermark = Math.floor(this.cap / 2);
-    this.port.onmessage = (e) => {
-      // Reset the request flag at the very top so a malformed or
-      // unexpected message can't permanently hang the request loop.
-      this.requesting = false;
-      const msg = e.data;
-      if (!msg || msg.type !== 'fill' || !msg.samples) return;
-      const s = msg.samples;
-      const n = s.length;
-      // Drop overflow rather than overwrite — caller respects watermark.
-      const room = this.cap - this.size;
-      const copy = n < room ? n : room;
-      if (copy <= 0) return;
-      // typed-array `.set()` is a memcpy; faster than a per-sample
-      // loop and cheaper for v8's GC.
-      if (this.write + copy <= this.cap) {
-        this.ring.set(s.subarray(0, copy), this.write);
-      } else {
-        const first = this.cap - this.write;
-        this.ring.set(s.subarray(0, first), this.write);
-        this.ring.set(s.subarray(first, copy), 0);
+    const { wasmBytes, sampleRate: sr } = options.processorOptions;
+    this.ready = false;
+    this.exports = null;
+    this.statePtr = null;
+
+    // wasm-bindgen 0.2.x minimal shims
+    const imports = {
+      wbg: {
+        __wbindgen_throw: (ptr, len) => {
+          throw new Error('WASM throw');
+        },
       }
-      this.write = (this.write + copy) % this.cap;
-      this.size += copy;
     };
-    // Kick the main thread for the first fill so process() doesn't
-    // start emitting silence before the first chunk arrives.
-    this.port.postMessage({ type: 'need', want: this.cap });
-    this.requesting = true;
+
+    WebAssembly.instantiate(wasmBytes, imports).then(({ instance }) => {
+      this.exports = instance.exports;
+      // WorkletState::new(sr)
+      this.statePtr = this.exports.workletstate_new(sr);
+      this.ready = true;
+    }).catch(err => {
+      console.error("keysynth-inline: wasm instantiation failed", err);
+    });
+
+    this.port.onmessage = (e) => {
+      if (!this.ready) return;
+      const m = e.data;
+      switch (m.kind) {
+        case 'noteOn':
+          this.exports.workletstate_note_on(this.statePtr, m.note, m.velocity);
+          break;
+        case 'noteOff':
+          this.exports.workletstate_note_off(this.statePtr, m.note);
+          break;
+      }
+    };
   }
-  process(inputs, outputs, parameters) {
-    const channels = outputs[0];
-    const out0 = channels[0];
-    const n = out0.length;
-    if (this.size >= n) {
-      // Fast path: fully drain n samples in one go via subarray + set.
-      if (this.read + n <= this.cap) {
-        out0.set(this.ring.subarray(this.read, this.read + n));
-      } else {
-        const first = this.cap - this.read;
-        out0.set(this.ring.subarray(this.read, this.cap));
-        out0.set(this.ring.subarray(0, n - first), first);
-      }
-      this.read = (this.read + n) % this.cap;
-      this.size -= n;
-    } else {
-      const have = this.size;
-      if (have > 0) {
-        if (this.read + have <= this.cap) {
-          out0.set(this.ring.subarray(this.read, this.read + have));
-        } else {
-          const first = this.cap - this.read;
-          out0.set(this.ring.subarray(this.read, this.cap));
-          out0.set(this.ring.subarray(0, have - first), first);
-        }
-        this.read = (this.read + have) % this.cap;
-      }
-      out0.fill(0, have);
-      this.size = 0;
+
+  process(inputs, outputs) {
+    if (!this.ready) return true;
+    const out = outputs[0];
+    if (!out || out.length === 0) return true;
+    const left = out[0];
+    const n = left.length;
+
+    // Temporary buffer allocation in WASM memory for the render slice.
+    if (!this.tmpPtr || this.tmpLen < n) {
+      if (this.tmpPtr) this.exports.__wbindgen_free(this.tmpPtr, this.tmpLen * 4);
+      this.tmpLen = n;
+      // malloc(size, align)
+      this.tmpPtr = this.exports.__wbindgen_malloc(n * 4, 4);
     }
-    for (let c = 1; c < channels.length; c++) channels[c].set(out0);
-    if (this.size < this.lowWatermark && !this.requesting) {
-      this.requesting = true;
-      this.port.postMessage({ type: 'need', want: this.cap - this.size });
+
+    // render(&mut self, out: &mut [f32]) -> workletstate_render(ptr, out_ptr, out_len)
+    this.exports.workletstate_render(this.statePtr, this.tmpPtr, n);
+
+    const mem = new Float32Array(this.exports.memory.buffer, this.tmpPtr, n);
+    left.set(mem);
+
+    // Mirror to other channels
+    for (let c = 1; c < out.length; c++) {
+      out[c].set(left);
     }
+
     return true;
   }
 }
-registerProcessor('keysynth-processor', KeysynthProcessor);
+registerProcessor('keysynth-inline', KeysynthInline);
 "#;
 
     /// Live audio output handle. Holds the AudioContext + worklet node
@@ -669,6 +660,9 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// closure — using a separate Rc avoids re-entering `&mut
         /// self` during update().
         recent_events: Rc<RefCell<VecDeque<String>>>,
+        /// If true, DSP runs inside the AudioWorkletProcessor directly.
+        /// Main thread only sends commands (noteOn/noteOff) via port.
+        use_inline_dsp: bool,
     }
 
     impl Default for WebApp {
@@ -720,6 +714,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 // `Engine::PianoModal` default in `LiveParams` above.
                 current_voice_idx: Rc::new(std::cell::Cell::new(0)),
                 recent_events: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
+                use_inline_dsp: true,
             }
         }
     }
@@ -893,6 +888,19 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             let engine = self.live.lock().unwrap().engine;
             self.push_event(format!("noteOn  ch=0 note={note:>3} vel={velocity:>3}"));
 
+            if self.use_inline_dsp && engine == Engine::Square {
+                if let Some(handle) = self.audio.borrow().as_ref() {
+                    let msg = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("kind"), &JsValue::from_str("noteOn"));
+                    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("note"), &JsValue::from_f64(note as f64));
+                    let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("velocity"), &JsValue::from_f64(velocity as f64));
+                    if let Ok(port) = handle._node.port() {
+                        let _ = port.post_message(&msg);
+                    }
+                }
+                return;
+            }
+
             // SfPiano routes the note straight into the rustysynth
             // shared synth — the modelling-engine voice pool is bypassed
             // entirely (the synth holds its own internal voice state and
@@ -929,6 +937,22 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
 
         fn note_off(&mut self, note: u8) {
             self.push_event(format!("noteOff ch=0 note={note:>3}"));
+
+            if self.use_inline_dsp {
+                let engine = self.live.lock().unwrap().engine;
+                if engine == Engine::Square {
+                    if let Some(handle) = self.audio.borrow().as_ref() {
+                        let msg = js_sys::Object::new();
+                        let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("kind"), &JsValue::from_str("noteOff"));
+                        let _ = js_sys::Reflect::set(&msg, &JsValue::from_str("note"), &JsValue::from_f64(note as f64));
+                        if let Ok(port) = handle._node.port() {
+                            let _ = port.post_message(&msg);
+                        }
+                    }
+                    return;
+                }
+            }
+
             // Always forward note_off to the synth so SF2 keys release
             // even after the user has switched away from SfPiano while
             // a note was held — leaving rustysynth's internal envelope
@@ -1791,10 +1815,10 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             .map_err(|e| format!("addModule: {e:?}"))?;
 
         let ctx_clone = ctx.clone();
-        let voices_cb = voices.clone();
-        let live_cb = live.clone();
-        let synth_cb = synth.clone();
-        let render_state_cb = render_state.clone();
+        let _voices_cb = voices.clone();
+        let _live_cb = live.clone();
+        let _synth_cb = synth.clone();
+        let _render_state_cb = render_state.clone();
         let slot_cb = slot.clone();
         let err_cb = err_slot.clone();
         let starting_cb = starting.clone();
@@ -1808,24 +1832,60 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             // Free the blob URL once the module is parsed.
             let _ = web_sys::Url::revoke_object_url(&url);
 
+            // Fetch the wasm bytes for the worklet.
+            // Trunk projects link the wasm via a preload link in the document.
+            let window = web_sys::window().expect("no window");
+            let document = window.document().expect("no document");
+            let wasm_url = if let Some(link) = document
+                .query_selector("link[rel='preload'][as='fetch']")
+                .ok()
+                .flatten()
+            {
+                link.dyn_into::<web_sys::HtmlLinkElement>().unwrap().href()
+            } else {
+                // Fallback for dev / non-hashed trunk
+                "keysynth-web_bg.wasm".to_string()
+            };
+
+            let wasm_bytes = match wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(&wasm_url)).await {
+                Ok(resp_value) => {
+                    let resp: web_sys::Response = resp_value.dyn_into().unwrap();
+                    if !resp.ok() {
+                        *err_cb.borrow_mut() = Some(format!("WASM fetch failed: HTTP {}", resp.status()));
+                        starting_cb.set(false);
+                        return;
+                    }
+                    let ab_promise = resp.array_buffer().unwrap();
+                    wasm_bindgen_futures::JsFuture::from(ab_promise).await.unwrap()
+                }
+                Err(e) => {
+                    *err_cb.borrow_mut() = Some(format!("WASM fetch failed: {e:?}"));
+                    starting_cb.set(false);
+                    return;
+                }
+            };
+
             let node_opts = web_sys::AudioWorkletNodeOptions::new();
             // Stereo output (mirrored from mono inside the worklet so
             // both ears get the same signal).
             node_opts.set_output_channel_count(&js_sys::Array::of1(&JsValue::from_f64(2.0)));
-            // Pass a generous ring capacity via processor options so the
-            // worklet can buffer ~370 ms at 44.1 kHz, absorbing main-
-            // thread stalls without underrunning.
+            
             let proc_opts = js_sys::Object::new();
             let _ = js_sys::Reflect::set(
                 &proc_opts,
-                &JsValue::from_str("ringCapacity"),
-                &JsValue::from_f64(16384.0),
+                &JsValue::from_str("wasmBytes"),
+                &wasm_bytes,
+            );
+            let _ = js_sys::Reflect::set(
+                &proc_opts,
+                &JsValue::from_str("sampleRate"),
+                &JsValue::from_f64(ctx_clone.sample_rate() as f64),
             );
             node_opts.set_processor_options(Some(&proc_opts));
 
             let node = match web_sys::AudioWorkletNode::new_with_options(
                 &ctx_clone,
-                "keysynth-processor",
+                "keysynth-inline",
                 &node_opts,
             ) {
                 Ok(n) => n,
@@ -1841,10 +1901,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 return;
             }
 
-            // Wire the port: every `'need'` request triggers a render
-            // pass on the main thread that produces `want` mono samples
-            // and posts them straight back. The worklet's ring buffer
-            // absorbs the postMessage round-trip latency.
+            // In the new inline-DSP path, we don't need the fill-request loop.
+            // But we keep the port handles alive if we want to send commands.
             let port = match node.port() {
                 Ok(p) => p,
                 Err(e) => {
@@ -1853,56 +1911,11 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     return;
                 }
             };
-            let port_for_cb = port.clone();
-            let voices_h = voices_cb;
-            let live_h = live_cb;
-            let synth_h = synth_cb;
-            let render_h = render_state_cb;
+
+            // dummy on_message to keep the structure similar or for logging.
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                 move |ev: web_sys::MessageEvent| {
-                    let msg = ev.data();
-                    let kind = js_sys::Reflect::get(&msg, &JsValue::from_str("type"))
-                        .ok()
-                        .and_then(|v| v.as_string());
-                    if kind.as_deref() != Some("need") {
-                        return;
-                    }
-                    let want = js_sys::Reflect::get(&msg, &JsValue::from_str("want"))
-                        .ok()
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(1024.0) as usize;
-                    // Cap one render pass at 4096 frames so a huge
-                    // initial fill request doesn't stall the main
-                    // thread for tens of ms; the worklet will just ask
-                    // again next process() until full.
-                    let chunk = want.min(4096);
-                    let (master, wet, engine, mix_mode) = {
-                        let lp = live_h.lock().unwrap();
-                        (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
-                    };
-                    // Render directly into `state.mono` so the per-
-                    // request `Vec<f32>` allocation goes away —
-                    // `state.mono` is reused across requests and only
-                    // resizes when the chunk size changes. The
-                    // Float32Array copy below is the unavoidable
-                    // wasm→JS heap hop.
-                    let arr = {
-                        let mut state = render_h.borrow_mut();
-                        render_mono_chunk(
-                            &voices_h, &synth_h, master, wet, engine, mix_mode, &mut state, chunk,
-                        );
-                        let a = js_sys::Float32Array::new_with_length(chunk as u32);
-                        a.copy_from(&state.mono);
-                        a
-                    };
-                    let out_msg = js_sys::Object::new();
-                    let _ = js_sys::Reflect::set(
-                        &out_msg,
-                        &JsValue::from_str("type"),
-                        &JsValue::from_str("fill"),
-                    );
-                    let _ = js_sys::Reflect::set(&out_msg, &JsValue::from_str("samples"), &arr);
-                    let _ = port_for_cb.post_message(&out_msg);
+                    web_sys::console::log_1(&format!("keysynth-inline: msg from worklet: {:?}", ev.data()).into());
                 },
             );
             port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -1944,6 +1957,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     /// Per-stream DSP state owned by the audio render closure. Lives
     /// behind `Rc<RefCell<…>>` so the JS-thread `onmessage` Closure can
     /// hold it without `&mut self` plumbing.
+    #[allow(dead_code)]
     struct RenderState {
         reverb: Reverb,
         sympathetic: SympatheticBank,
@@ -1965,6 +1979,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     /// mirroring that the worklet does on the JS side. Caller reads
     /// the result from `state.mono` after this returns; no per-
     /// request `Vec` allocation.
+    #[allow(dead_code)]
     fn render_mono_chunk(
         voices: &Arc<Mutex<Vec<Voice>>>,
         synth: &SharedSynth,
@@ -2327,5 +2342,72 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             .unwrap_or_else(|| panic!("missing <canvas id=\"{id}\">"))
             .dyn_into::<web_sys::HtmlCanvasElement>()
             .expect("element is not a canvas")
+    }
+
+    // ---------------------------------------------------------------------
+    // AudioWorklet Inline DSP
+    // ---------------------------------------------------------------------
+
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen]
+    pub struct WorkletState {
+        sr: f32,
+        voices: Vec<Voice>,
+        engine: Engine,
+    }
+
+    #[wasm_bindgen]
+    impl WorkletState {
+        #[wasm_bindgen(constructor)]
+        pub fn new(sr: f32) -> WorkletState {
+            WorkletState {
+                sr,
+                voices: Vec::with_capacity(32),
+                engine: Engine::Square,
+            }
+        }
+
+        pub fn note_on(&mut self, note: u8, velocity: u8) {
+            let freq = midi_to_freq(note);
+            let inner = make_voice(self.engine, self.sr, freq, velocity);
+            let v = Voice {
+                key: (0, note),
+                inner,
+            };
+            const MAX_VOICES: usize = 24;
+            if let Some(slot) = self.voices.iter_mut().find(|x| x.key == (0, note)) {
+                *slot = v;
+            } else {
+                if self.voices.len() >= MAX_VOICES {
+                    let evict = self.voices
+                        .iter()
+                        .position(|x| x.inner.is_done() || x.inner.is_releasing())
+                        .unwrap_or(0);
+                    self.voices.remove(evict);
+                }
+                self.voices.push(v);
+            }
+        }
+
+        pub fn note_off(&mut self, note: u8) {
+            if let Some(slot) = self.voices.iter_mut().find(|x| x.key == (0, note)) {
+                slot.inner.trigger_release();
+            }
+        }
+
+        /// Render mono samples into the supplied Float32Array view.
+        pub fn render(&mut self, out: &mut [f32]) {
+            out.fill(0.0);
+            for v in self.voices.iter_mut() {
+                v.inner.render_add(out);
+            }
+            self.voices.retain(|v| !v.inner.is_done());
+
+            // Simple tanh for basic output protection.
+            for s in out.iter_mut() {
+                *s = s.tanh();
+            }
+        }
     }
 } // mod imp
