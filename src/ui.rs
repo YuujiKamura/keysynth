@@ -24,6 +24,7 @@ use midir::MidiInputConnection;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
+use crate::live_reload::{Reloader, Status as LiveStatus};
 use crate::sfz::SfzPlayer;
 use crate::synth::{
     make_voice, midi_to_freq, modal_params, set_modal_params, set_modal_physics, DashState, Engine,
@@ -50,6 +51,11 @@ pub struct AppContext {
     pub startup_sfz_path: Option<PathBuf>,
     pub startup_sf2_path: Option<PathBuf>,
     pub startup_engine: Engine,
+    /// Voice hot-reload handle. `None` if `main()` couldn't find a
+    /// `voices_live/` crate to watch (release tarball without it,
+    /// running outside the repo, etc.). When None, the "Live (hot edit)"
+    /// browser entry is hidden and `Engine::Live` falls back to silence.
+    pub live_reloader: Option<Reloader>,
 }
 
 pub fn run_app(ctx: AppContext) -> Result<(), Box<dyn std::error::Error>> {
@@ -618,7 +624,72 @@ impl eframe::App for KeysynthApp {
                                 });
                         }
                     });
+
+                // ─── Live-reload status (bottom of voice browser) ────
+                //
+                // Surfaces dll path, last reload timestamp, build errors
+                // verbatim. The brief flags silent reload failure as the
+                // single worst-case UX outcome — errors render in red,
+                // monospaced, and stick around until the next successful
+                // reload. The Ctrl+R / "Rebuild now" button lets the
+                // user kick a build manually if the watcher missed an
+                // event (rare on Windows under some editors).
+                if let Some(reloader) = self.ctx.live_reloader.as_ref() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("Live voice")
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 220, 255)),
+                    );
+                    let status = reloader.status_snapshot();
+                    let (color, text) = match &status {
+                        LiveStatus::Idle => {
+                            (egui::Color32::from_rgb(180, 180, 180), "idle".to_string())
+                        }
+                        LiveStatus::Building { reason, .. } => (
+                            egui::Color32::from_rgb(220, 200, 100),
+                            format!("building... ({reason})"),
+                        ),
+                        LiveStatus::Ok { duration, .. } => (
+                            egui::Color32::from_rgb(120, 220, 120),
+                            format!("loaded in {} ms", duration.as_millis()),
+                        ),
+                        LiveStatus::Err { message, .. } => (
+                            egui::Color32::from_rgb(255, 110, 110),
+                            format!("ERR\n{message}"),
+                        ),
+                    };
+                    ui.colored_label(color, &text);
+                    if let Some((dll, _)) = reloader.current_meta() {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "dll: {}",
+                                dll.file_name().and_then(|s| s.to_str()).unwrap_or("<?>")
+                            ))
+                            .small()
+                            .monospace(),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("src: {}", reloader.crate_root.display()))
+                            .small(),
+                    );
+                    if ui.small_button("Rebuild now").clicked() {
+                        reloader.request_rebuild("manual");
+                    }
+                }
             });
+
+        // Ctrl+R also triggers a rebuild — handy when keeping focus
+        // on the keyboard while iterating on a voice.
+        if let Some(reloader) = self.ctx.live_reloader.as_ref() {
+            ctx.input(|i| {
+                if i.modifiers.command_only() && i.key_pressed(egui::Key::R) {
+                    reloader.request_rebuild("Ctrl+R");
+                }
+            });
+        }
 
         // ─── Right side panel: MIDI log ───────────────────────────────
         egui::SidePanel::right("log")

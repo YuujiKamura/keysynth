@@ -131,6 +131,28 @@ impl VoiceSlot {
         }
     }
 
+    /// Hot-edit slot: routes through `Engine::Live`, which calls into
+    /// the registered `live_reload::Reloader`. `voice_lib` doesn't depend
+    /// on the reloader directly — it just emits a slot whose engine is
+    /// `Engine::Live`. Status (current dll path, last reload, errors)
+    /// is rendered by the side panel from the `Reloader` handle stashed
+    /// on `AppContext`.
+    pub fn live(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            // Custom category so it sits next to user-saved presets and
+            // doesn't clutter the Piano family with a synth-style entry.
+            category: Category::Custom,
+            engine: Engine::Live,
+            params: None,
+            asset_path: None,
+            sf_program: None,
+            sf_bank: None,
+            modal_physics: false,
+            builtin: true,
+        }
+    }
+
     pub fn custom(label: &str, params: ModalParams, physics: bool) -> Self {
         Self {
             label: label.to_string(),
@@ -220,6 +242,12 @@ impl VoiceLibrary {
             };
             v.push(VoiceSlot::sf2(&label, p.to_path_buf(), 0, 0, true));
         }
+
+        // Hot-reload edit slot. Lives in the Custom column so it's
+        // visually separated from the static synth/piano entries; the
+        // user can toggle in and out of it the same way as their saved
+        // presets.
+        v.push(VoiceSlot::live("Live (hot edit)"));
 
         // Synth family.
         v.push(VoiceSlot::synth("Square", Engine::Square));
