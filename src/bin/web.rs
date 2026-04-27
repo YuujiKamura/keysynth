@@ -914,9 +914,11 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     .unwrap_or(("?", ""));
                 ui.horizontal(|ui| {
                     ui.label("engine:");
+                    // Drop the fixed-width hint so narrow viewports
+                    // (mobile, split panes) aren't forced to overflow.
+                    // egui auto-sizes to the longest label.
                     egui::ComboBox::from_id_salt("engine")
                         .selected_text(current_label)
-                        .width(260.0)
                         .show_ui(ui, |ui| {
                             for (eng, label, _desc) in ENGINES_FOR_WEB {
                                 ui.selectable_value(&mut live.engine, *eng, *label);
@@ -943,15 +945,25 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 });
                 drop(live);
 
-                // One-line description of the currently-selected
-                // engine, dimmed so it doesn't compete with the
-                // dropdown label visually but is reachable for users
-                // who don't recognise the names.
+                // Description of the currently-selected engine,
+                // rendered on its own row as a wrapping `Label` so
+                // long sentences break cleanly on narrow viewports.
+                // (`horizontal_wrapped` + `add_space` would only indent
+                // the first wrapped line and break alignment on every
+                // subsequent line — Gemini medium thread on this
+                // diff.) Plain dim text, no faked column indent — the
+                // description is a description of the row above, not a
+                // column under the dropdown.
                 if !current_desc.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.add_space(56.0); // align under the dropdown
-                        ui.colored_label(egui::Color32::from_gray(160), current_desc);
-                    });
+                    ui.add_space(2.0);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(current_desc)
+                                .color(egui::Color32::from_gray(160))
+                                .small(),
+                        )
+                        .wrap(),
+                    );
                 }
 
                 ui.horizontal(|ui| {
