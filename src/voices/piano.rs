@@ -13,6 +13,7 @@ use super::super::synth::{
     piano_hammer_excitation, piano_hammer_width, KsString, ReleaseEnvelope, VoiceImpl,
 };
 use super::hammer_stulov::{self, HammerParams};
+use super::longitudinal::LongitudinalString;
 
 // ---------------------------------------------------------------------------
 // Piano preset container (issue #2 transition: unify Piano/PianoThick/PianoLite
@@ -51,6 +52,8 @@ pub struct PianoPreset {
     pub dry_gain: f32,
     /// Wet soundboard-output gain in the final mix.
     pub wet_gain: f32,
+    /// Longitudinal-mode gain in the final mix.
+    pub long_gain: f32,
     /// Voice release time (seconds) handed to the shared ReleaseEnvelope.
     pub release_sec: f32,
     /// Use Stulov non-linear hammer model instead of linear-rise + exp-decay.
@@ -71,6 +74,7 @@ impl PianoPreset {
         coupling_per_string: 0.012 / 7.0,
         dry_gain: 0.5,
         wet_gain: 0.35,
+        long_gain: 0.0,
         release_sec: 0.300,
         use_stulov: false,
         hammer_params: HammerParams {
@@ -93,6 +97,7 @@ impl PianoPreset {
         coupling_per_string: 0.015 / 7.0,
         dry_gain: 0.7,
         wet_gain: 0.20,
+        long_gain: 0.0,
         release_sec: 0.300,
         use_stulov: false,
         hammer_params: HammerParams {
@@ -115,6 +120,28 @@ impl PianoPreset {
         coupling_per_string: 0.015,
         dry_gain: 0.5,
         wet_gain: 0.35,
+        long_gain: 0.0,
+        release_sec: 0.300,
+        use_stulov: false,
+        hammer_params: HammerParams {
+            mass_kg: 8.7e-3,
+            k_stiffness: 4.5e9,
+            p_exponent: 2.5,
+            eps_hysteresis: 1e-4,
+        },
+    };
+    /// `PianoLong`: T1.2 longitudinal coupling preset. 7 strings, full
+    /// body, plus longitudinal phantom partials at sum-frequencies.
+    pub const PIANO_LONG: Self = Self {
+        string_count: 7,
+        detune_cents_half_spread: 3.0,
+        soundboard: SoundboardKind::ConcertGrand,
+        decay_base: 0.9985,
+        decay_slope: 0.0035,
+        coupling_per_string: 0.012 / 7.0,
+        dry_gain: 0.5,
+        wet_gain: 0.35,
+        long_gain: 0.15,
         release_sec: 0.300,
         use_stulov: false,
         hammer_params: HammerParams {
@@ -165,6 +192,8 @@ pub struct PianoVoice {
     /// `Vec` rather than a fixed array so a single struct serves all
     /// presets — this is the issue #2 transition fix.
     strings: Vec<KsString>,
+    /// Optional longitudinal mode per transverse string.
+    longitudinal: Vec<LongitudinalString>,
     release: ReleaseEnvelope,
     /// Modal soundboard resonator bank. Receives the summed string output
     /// every sample and feeds back into the strings via `coupling_per_string`
@@ -173,6 +202,7 @@ pub struct PianoVoice {
     coupling_per_string: f32,
     dry_gain: f32,
     wet_gain: f32,
+    long_gain: f32,
     /// 1.0 / string_count — applied to the string sum so the in-phase
     /// attack peak stays bounded regardless of preset.
     string_norm: f32,
@@ -189,7 +219,13 @@ impl PianoVoice {
     /// Construct a piano voice using an arbitrary preset. This is the
     /// canonical entry point — `Engine::Piano`/`PianoThick`/`PianoLite`
     /// all dispatch here with different presets.
-    pub fn with_preset(preset: PianoPreset, sr: f32, freq: f32, velocity: u8) -> Self {
+    pub fn with_preset(mut preset: PianoPreset, sr: f32, freq: f32, velocity: u8) -> Self {
+        if std::env::var("KS_PIANO_LONG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            preset = PianoPreset::PIANO_LONG;
+        }
         let amp = (velocity.max(1) as f32) / 127.0;
         let detunes = piano_detunes(preset.string_count, preset.detune_cents_half_spread);
         // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; the
@@ -216,6 +252,17 @@ impl PianoVoice {
                 .with_attack_lpf(sr, 0.0, 0.97, 0.97)
         };
         let strings: Vec<KsString> = detunes.iter().map(|d| mk(freq * *d)).collect();
+
+        // Longitudinal strings (same count and tuning as transverse)
+        let mut longitudinal = Vec::with_capacity(strings.len());
+        if preset.long_gain > 0.0 {
+            for d in &detunes {
+                let f_s = freq * d;
+                // Steel piano string longitudinal speed c_long ≈ 14× c_trans
+                longitudinal.push(LongitudinalString::new(sr, f_s, 14.0, decay_for(f_s)));
+            }
+        }
+
         let soundboard = match preset.soundboard {
             SoundboardKind::ConcertGrand => crate::soundboard::Soundboard::new_concert_grand(sr),
             SoundboardKind::Lite => crate::soundboard::Soundboard::new_concert_grand_lite(sr),
@@ -227,11 +274,13 @@ impl PianoVoice {
         };
         Self {
             strings,
+            longitudinal,
             release: ReleaseEnvelope::new(preset.release_sec, sr),
             soundboard,
             coupling_per_string: preset.coupling_per_string,
             dry_gain: preset.dry_gain,
             wet_gain: preset.wet_gain,
+            long_gain: preset.long_gain,
             string_norm,
         }
     }
@@ -241,6 +290,7 @@ impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         let dry_gain = self.dry_gain;
         let wet_gain = self.wet_gain;
+        let long_gain = self.long_gain;
         let string_norm = self.string_norm;
         for sample in buf.iter_mut() {
             // 1. Inject the previous-sample soundboard output back into
@@ -254,15 +304,20 @@ impl VoiceImpl for PianoVoice {
             }
             // 2. Step the strings (consumes the feedback we just queued).
             let mut s_sum = 0.0_f32;
-            for s in &mut self.strings {
-                s_sum += s.step();
+            let mut s_long_total = 0.0_f32;
+            for i in 0..self.strings.len() {
+                let s_trans = self.strings[i].step();
+                s_sum += s_trans;
+                if !self.longitudinal.is_empty() {
+                    s_long_total += self.longitudinal[i].step(s_trans);
+                }
             }
             let s_avg = s_sum * string_norm;
             // 3. Drive the soundboard with the averaged string output.
             let board_out = self.soundboard.process(s_avg);
-            // 4. Mix dry strings + wet soundboard into the audio bus.
+            // 4. Mix dry strings + wet soundboard + longitudinal into the audio bus.
             let env = self.release.step();
-            *sample += (s_avg * dry_gain + board_out * wet_gain) * env;
+            *sample += (s_avg * dry_gain + board_out * wet_gain + s_long_total * long_gain) * env;
         }
     }
     fn release_env(&self) -> Option<&ReleaseEnvelope> {
