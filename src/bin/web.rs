@@ -47,21 +47,41 @@ mod imp {
         make_voice, midi_to_freq, Engine, LiveParams, MixMode, ModalLut, Voice, MODAL_LUT,
     };
 
-    /// Embedded GM SoundFont used by `Engine::SfPiano`. ~32 MB; baked
-    /// into the wasm bundle at build time so Pages can play sample-based
-    /// piano without a separate runtime fetch. Source matches the
-    /// auto-discovered `GeneralUser-GS.sf2` the native build picks up
-    /// from CWD.
-    const EMBEDDED_SF2: &[u8] = include_bytes!("../../web/GeneralUser-GS.sf2");
+    /// Path of the GM SoundFont served alongside the wasm bundle. Trunk
+    /// copies `web/GeneralUser-GS.sf2` to the dist root via the
+    /// `rel="copy-file"` link in `web/index.html`, so the relative URL
+    /// works regardless of the Pages subpath (`/keysynth/` on prod,
+    /// `/` under `trunk serve`).
+    const SF2_URL: &str = "GeneralUser-GS.sf2";
 
-    /// Process-wide shared `rustysynth::Synthesizer` populated once the
-    /// AudioContext is alive (the Synthesizer takes the actual
-    /// `ctx.sample_rate()` for its internal interpolation). `None`
-    /// before audio start; `Some` for the rest of the page lifetime.
+    /// Process-wide shared `rustysynth::Synthesizer` populated by an
+    /// async fetch that runs after the AudioContext is alive (the
+    /// Synthesizer takes the actual `ctx.sample_rate()` for its
+    /// interpolation, and we need the AudioContext sample rate before
+    /// kicking off the load). `None` before fetch + parse complete;
+    /// `Some` for the rest of the page lifetime once the bytes arrive.
     /// `Mutex` mirrors the native `SharedSynth` pattern even though
     /// wasm32 is single-threaded — the lock is uncontended and lets the
     /// MIDI / render paths share the same reference shape as `main.rs`.
     type SharedSynth = Arc<Mutex<Option<Synthesizer>>>;
+
+    /// Lifecycle of the SF2 asset fetch + parse, surfaced in the UI so
+    /// the user can tell whether picking `SfPiano` will actually make
+    /// sound or silently no-op while the bytes are still en route.
+    /// Held as `Rc<RefCell<…>>` because the async fetch closure mutates
+    /// it from outside any `&mut self` borrow.
+    #[derive(Clone, Debug)]
+    enum SfStatus {
+        /// Pre-`build_audio`. No fetch issued yet.
+        Idle,
+        /// Fetch (or fetch + parse) in flight.
+        Loading,
+        /// Synthesizer ready in `WebApp::synth`.
+        Ready,
+        /// Fetch or parse failed. Carries the error text so the UI can
+        /// surface it to the user.
+        Failed(String),
+    }
 
     /// Engines exposed to the web UI. Three columns:
     ///
@@ -82,7 +102,9 @@ mod imp {
     /// SfzPiano deliberately omitted — it needs the multi-GB Salamander
     /// Grand V3 SFZ library on disk that we can't ship to Pages.
     /// `SfPiano` ships because the GM SoundFont is small enough (~32 MB)
-    /// to bake into the wasm bundle via `EMBEDDED_SF2`.
+    /// to ship as a static asset alongside the wasm and fetch on
+    /// demand (see `fetch_and_load_sf2`); the wasm itself stays small
+    /// (~5 MB) so first-paint isn't blocked by the SF2 download.
     const ENGINES_FOR_WEB: &[(Engine, &str, &str)] = &[
         // ── Piano family ────────────────────────────────────────────
         (
@@ -434,14 +456,15 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// "Disconnect MIDI" path has somewhere to drop from.
         midi_handles: Rc<RefCell<Option<MidiHandles>>>,
         /// Shared `rustysynth::Synthesizer` for `Engine::SfPiano`. Filled
-        /// in synchronously by `build_audio` once the AudioContext sample
-        /// rate is known — Synthesizer is parameterised on sample rate
-        /// for sample interpolation, so we can't construct it earlier.
-        /// `None` until then; engine selection on the splash gate UI is
-        /// available before the synth lands but `note_on` / render just
-        /// no-op (silent) until `Some` arrives, which happens in the
-        /// same JS task as the audio start success.
+        /// in by an async fetch task that runs after `build_audio`
+        /// completes (Synthesizer needs `ctx.sample_rate()`). `None`
+        /// until the SF2 download + parse completes; SfPiano is silent
+        /// while loading. Other engines work normally throughout.
         synth: SharedSynth,
+        /// Lifecycle of the SF2 fetch + parse, displayed in the UI so
+        /// `Engine::SfPiano` selection isn't a silent no-op while
+        /// loading.
+        synth_status: Rc<RefCell<SfStatus>>,
     }
 
     impl Default for WebApp {
@@ -485,6 +508,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 midi_requested: Rc::new(std::cell::Cell::new(false)),
                 midi_handles: Rc::new(RefCell::new(None)),
                 synth: Arc::new(Mutex::new(None)),
+                synth_status: Rc::new(RefCell::new(SfStatus::Idle)),
             }
         }
     }
@@ -523,6 +547,12 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     // `midi_status` and resets `midi_requested` so the
                     // dedicated Retry button still appears below.
                     self.request_midi();
+                    // Kick off the SF2 fetch + parse async. The page is
+                    // already responsive at this point (modelling
+                    // engines work immediately); SfPiano stays silent
+                    // until the bytes arrive and `synth_status` flips
+                    // to `Ready`.
+                    self.start_sf2_load();
                 }
                 Err(e) => {
                     web_sys::console::error_1(
@@ -556,6 +586,46 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     MidiMsg::NoteOff { note } => self.note_off(note),
                 }
             }
+        }
+
+        /// Spawn the async SF2 fetch + parse. Caller (`start_audio`)
+        /// only invokes this AFTER `build_audio` succeeded so we know
+        /// `self.sample_rate` is valid. The fetch happens in the
+        /// background — the page is fully interactive while the bytes
+        /// download and rustysynth parses them. Engine selection and
+        /// modelling-voice playback work throughout; only `SfPiano`
+        /// stays silent until the synth lands in `self.synth`.
+        fn start_sf2_load(&self) {
+            if !matches!(
+                *self.synth_status.borrow(),
+                SfStatus::Idle | SfStatus::Failed(_)
+            ) {
+                return;
+            }
+            let synth = self.synth.clone();
+            let status = self.synth_status.clone();
+            let sr = self.sample_rate;
+            *status.borrow_mut() = SfStatus::Loading;
+            wasm_bindgen_futures::spawn_local(async move {
+                let outcome = fetch_and_load_sf2(synth, sr).await;
+                match outcome {
+                    Ok(bytes_len) => {
+                        web_sys::console::log_1(
+                            &format!(
+                                "keysynth-web: SF2 ready ({bytes_len} bytes fetched, sr={sr} Hz)"
+                            )
+                            .into(),
+                        );
+                        *status.borrow_mut() = SfStatus::Ready;
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("keysynth-web: SF2 load failed: {e}").into(),
+                        );
+                        *status.borrow_mut() = SfStatus::Failed(e);
+                    }
+                }
+            });
         }
 
         /// Kick off the Web MIDI handshake. `navigator.requestMIDIAccess()`
@@ -1041,6 +1111,37 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                             }
                         });
 
+                    // Surface the SF2 fetch lifecycle so SfPiano isn't
+                    // a silent no-op while the bytes are still en
+                    // route. Idle = pre-audio-start (don't draw), Ready
+                    // = quiet OK label, Loading / Failed = visible
+                    // status with colour.
+                    let status = self.synth_status.borrow().clone();
+                    match status {
+                        SfStatus::Idle => {}
+                        SfStatus::Loading => {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 180, 90),
+                                "SF2: loading…",
+                            );
+                        }
+                        SfStatus::Ready => {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_gray(150),
+                                "SF2: ready",
+                            );
+                        }
+                        SfStatus::Failed(msg) => {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 90),
+                                format!("SF2 failed: {msg}"),
+                            );
+                        }
+                    }
+
                     ui.separator();
                     ui.label("master:");
                     ui.add(egui::Slider::new(&mut live.master, 0.0..=4.0).step_by(0.05));
@@ -1191,49 +1292,6 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             })?;
         let sr = ctx.sample_rate() as u32;
         web_sys::console::log_1(&format!("keysynth-web: AudioContext sampleRate = {sr} Hz").into());
-
-        // Initialise the embedded GM SoundFont synth now that we know
-        // the actual sample rate. SF2 bytes were baked in at compile
-        // time via `EMBEDDED_SF2`, so this is just a parse + Synthesizer
-        // construction — no fetch, no async. Polyphony cap mirrors the
-        // native build (256) so chord runs don't steal still-decaying
-        // notes. If the parse fails we log + continue: SfPiano will be
-        // silent (every other engine still works), surfacing the error
-        // to console rather than blocking audio start.
-        match SoundFont::new(&mut Cursor::new(EMBEDDED_SF2)) {
-            Ok(sf) => {
-                let mut settings = SynthesizerSettings::new(sr as i32);
-                settings.maximum_polyphony = 256;
-                match Synthesizer::new(&Arc::new(sf), &settings) {
-                    Ok(mut s) => {
-                        // Default to GM program 0 = Acoustic Grand Piano
-                        // on channel 0. `process_midi_message(.., 0xC0,
-                        // program, 0)` is rustysynth's program-change
-                        // entry point; bank stays 0 (the only bank
-                        // GeneralUser-GS ships piano on by default).
-                        s.process_midi_message(0, 0xC0, 0, 0);
-                        *synth.lock().unwrap() = Some(s);
-                        web_sys::console::log_1(
-                            &format!(
-                                "keysynth-web: SF2 ready ({} bytes embedded, sr={sr} Hz)",
-                                EMBEDDED_SF2.len()
-                            )
-                            .into(),
-                        );
-                    }
-                    Err(e) => {
-                        web_sys::console::warn_1(
-                            &format!("keysynth-web: Synthesizer::new failed: {e:?}").into(),
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                web_sys::console::warn_1(
-                    &format!("keysynth-web: SoundFont parse failed: {e:?}").into(),
-                );
-            }
-        }
 
         // Inline the worklet processor source as a Blob URL so we don't
         // need to ship a separate JS file via Trunk. The browser caches
@@ -1604,6 +1662,47 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     // ---------------------------------------------------------------------
     // Web MIDI handshake
     // ---------------------------------------------------------------------
+
+    /// Fetch the SF2 bytes from `SF2_URL` (a static asset trunk copies
+    /// next to the wasm), parse with rustysynth at `sr` Hz, set the
+    /// default GM program, and install the resulting `Synthesizer`
+    /// into the shared `synth` slot. All async + non-blocking, so the
+    /// page remains responsive across the multi-second download.
+    /// Returns the byte length on success so the caller can log a
+    /// confirmation; on failure returns a stringified error.
+    async fn fetch_and_load_sf2(synth: SharedSynth, sr: u32) -> Result<usize, String> {
+        let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+        let resp_value = wasm_bindgen_futures::JsFuture::from(window.fetch_with_str(SF2_URL))
+            .await
+            .map_err(|e| format!("fetch({SF2_URL}): {e:?}"))?;
+        let resp: web_sys::Response = resp_value
+            .dyn_into()
+            .map_err(|_| "fetch result was not a Response".to_string())?;
+        if !resp.ok() {
+            return Err(format!("HTTP {}", resp.status()));
+        }
+        let buffer_promise = resp
+            .array_buffer()
+            .map_err(|e| format!("response.array_buffer: {e:?}"))?;
+        let buffer = wasm_bindgen_futures::JsFuture::from(buffer_promise)
+            .await
+            .map_err(|e| format!("array_buffer await: {e:?}"))?;
+        let array = js_sys::Uint8Array::new(&buffer);
+        let bytes: Vec<u8> = array.to_vec();
+        let n = bytes.len();
+        let sf = SoundFont::new(&mut Cursor::new(&bytes[..]))
+            .map_err(|e| format!("SoundFont parse: {e:?}"))?;
+        let mut settings = SynthesizerSettings::new(sr as i32);
+        settings.maximum_polyphony = 256;
+        let mut s = Synthesizer::new(&Arc::new(sf), &settings)
+            .map_err(|e| format!("Synthesizer::new: {e:?}"))?;
+        // Default to GM program 0 (Acoustic Grand Piano), bank 0. Same
+        // initial state the native `--engine sf-piano` lands in when
+        // `--sf2-program`/`--sf2-bank` are left at their defaults.
+        s.process_midi_message(0, 0xC0, 0, 0);
+        *synth.lock().unwrap() = Some(s);
+        Ok(n)
+    }
 
     /// Request MIDI access from the browser, attach an `onmidimessage`
     /// handler to every input port, and set up `onstatechange` on the

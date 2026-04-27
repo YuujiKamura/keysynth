@@ -8,7 +8,9 @@
 
     <!-- Trunk picks up this <link> and emits the wasm/JS glue beside it.
          data-cargo-no-default-features + data-cargo-features="web" select
-         the trimmed wasm build that drops midir / SF2 / SFZ / offline bins. -->
+         the trimmed wasm build that drops midir / SFZ / offline bins.
+         (SF2 is enabled and the bytes are fetched at runtime — see the
+         copy-file link below.) -->
     <link
       data-trunk
       rel="rust"
@@ -17,6 +19,14 @@
       data-cargo-no-default-features
       data-cargo-features="web"
     />
+
+    <!-- GM SoundFont served as a static asset alongside the wasm. The
+         Rust side fetches this via `web_sys::fetch` after the
+         AudioContext is up so the page becomes interactive instantly
+         (modelling engines work) and the user only waits for the SF2
+         download if they actually pick `SfPiano`. trunk copies the
+         file from `web/GeneralUser-GS.sf2` into `dist/` verbatim. -->
+    <link data-trunk rel="copy-file" href="GeneralUser-GS.sf2" />
 
     <style>
       :root {
