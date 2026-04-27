@@ -683,21 +683,24 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             Self {
                 voices: Arc::new(Mutex::new(Vec::with_capacity(32))),
                 live: Arc::new(Mutex::new(LiveParams {
-                    // Match native defaults (main.rs::Args::default). 1.5
-                    // was too low for `Engine::PianoModal`, whose 3-detune
-                    // resonator bank produces per-sample peaks ~10x smaller
-                    // than KS / square / sub voices; under master=1.5 +
-                    // ParallelComp the PianoModal bus sat below audibility
-                    // while every other engine still saturated tanh.
-                    master: 3.0,
+                    // Mirror `main.rs::Args::default` exactly. The
+                    // earlier 3.0 / Plain combo dated from when
+                    // PianoModal was ~300× quieter than KS / square
+                    // and master had to compensate; ModalPianoVoice
+                    // now ships an internal 50× output_gain that
+                    // level-matches the bus, so master=1.0 reaches
+                    // tanh(1.0) ≈ 0.76 (subtle warmth) on single
+                    // notes and ParallelComp catches chord peaks
+                    // without crushing transients. Plain tanh at
+                    // master=3 was hard-clipping the live-hotswap
+                    // DSP into harsh saturation — root cause of
+                    // "Web の音質が悪すぎる" vs native parity.
+                    master: 1.0,
                     engine: Engine::PianoModal,
-                    reverb_wet: 0.25,
+                    reverb_wet: 0.3,
                     sf_program: 0,
                     sf_bank: 0,
-                    // Plain tanh matches native default and avoids the
-                    // ParallelComp limiter swallowing PianoModal's already
-                    // low-amplitude bus into silence on the first hit.
-                    mix_mode: MixMode::Plain,
+                    mix_mode: MixMode::ParallelComp,
                 })),
                 sample_rate: 0,
                 audio: Rc::new(RefCell::new(None)),
