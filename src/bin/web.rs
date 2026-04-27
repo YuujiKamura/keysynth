@@ -247,6 +247,14 @@ mod imp {
                     web_sys::console::log_1(
                         &format!("keysynth-web: audio started @ {sr} Hz").into(),
                     );
+                    // Same user-gesture context — request MIDI access in
+                    // the same click so the user doesn't have to hunt
+                    // for a second button. If the browser doesn't
+                    // support Web MIDI or the user denies the prompt,
+                    // `request_midi` writes the error into
+                    // `midi_status` and resets `midi_requested` so the
+                    // dedicated Retry button still appears below.
+                    self.request_midi();
                 }
                 Err(e) => {
                     web_sys::console::error_1(
@@ -525,9 +533,16 @@ mod imp {
 
     impl eframe::App for WebApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Continuous repaint so the on-screen keyboard reflects PC-key
-            // and audio state immediately.
-            ctx.request_repaint();
+            // Repaint at 30 fps rather than the implicit 60 fps from a
+            // bare `request_repaint()`. The cpal webaudio backend on
+            // wasm32 polls `setTimeout` for the next AudioBufferSource
+            // schedule on the same JS event loop egui paints from, so
+            // a busy 60 fps repaint loop directly steals scheduling
+            // slack from the audio thread → audible clicks at buffer
+            // boundaries. 30 fps is more than enough for the on-screen
+            // keyboard's "active" highlight while leaving roughly half
+            // the main-thread budget for cpal's polling.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
             if self.audio.is_some() {
                 self.handle_pc_keyboard(ctx);
@@ -541,30 +556,128 @@ mod imp {
             // burst of every key they pressed during setup.
             self.drain_midi_inbox();
 
+            // Splash gate: until the user has started audio there's
+            // nothing useful to interact with — engine selector,
+            // master gain, keyboard all want a running stream. Show
+            // a single fullscreen overlay with a big centered Start
+            // button so the required first click is impossible to
+            // miss. Once audio is running, fall through to the normal
+            // 3-panel layout below.
+            //
+            // `start_audio()` also fires `request_midi()` in the same
+            // gesture so the same click satisfies both browser
+            // permissions (autoplay → AudioContext, Web MIDI →
+            // requestMIDIAccess). On retry / error the smaller "🎹
+            // Retry MIDI" button lives inside the running UI.
+            if self.audio.is_none() {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.heading(egui::RichText::new("keysynth (web)").size(28.0).strong());
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Pure-Rust real-time modelling synth.\n\
+                                 Click below to start audio + connect any USB-MIDI keyboard.",
+                            )
+                            .size(15.0)
+                            .color(egui::Color32::from_gray(190)),
+                        );
+                        ui.add_space(40.0);
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("▶ Start")
+                                    .size(28.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(40, 120, 200))
+                            .min_size(egui::vec2(220.0, 56.0)),
+                        );
+                        if resp.clicked() {
+                            self.start_audio();
+                        }
+                        if let Some(err) = &self.audio_err {
+                            ui.add_space(20.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 90),
+                                format!("audio error: {err}"),
+                            );
+                            ui.label(
+                                egui::RichText::new("クリックでもう一度試す")
+                                    .size(13.0)
+                                    .color(egui::Color32::from_gray(170)),
+                            );
+                        }
+                        ui.add_space(40.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "MIDI keyboard ない場合はクリック後に画面の鍵盤 / PC キー\n\
+                                 (zsxdcvgbhnjm = lower octave, qweryt... = upper) で演奏",
+                            )
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                    });
+                });
+                return;
+            }
+
             egui::TopBottomPanel::top("top").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("keysynth (web)");
                     ui.separator();
-                    if self.audio.is_some() {
-                        ui.label(format!("audio @ {} Hz", self.sample_rate));
-                    } else if let Some(err) = &self.audio_err {
-                        ui.colored_label(egui::Color32::RED, format!("audio error: {err}"));
-                        if ui.button("retry").clicked() {
-                            self.start_audio();
-                        }
-                    } else if ui.button("Start audio").clicked() {
-                        self.start_audio();
-                    }
+                    // Audio is already running here (the splash gate
+                    // above early-returns until it is), so we just show
+                    // the sample rate.
+                    ui.label(format!("audio @ {} Hz", self.sample_rate));
                     ui.separator();
-                    ui.label(format!("MIDI: {}", self.midi_status.borrow()));
-                    if !self.midi_requested.get() && ui.button("Connect MIDI").clicked() {
-                        // Browser autoplay-style gating: requestMIDIAccess
-                        // also wants a user gesture to surface the
-                        // permission prompt, so bind it to a button click
-                        // rather than auto-firing on page load.
-                        self.request_midi();
+                    // Status label is always shown so the previous
+                    // outcome (success / error / not requested) stays
+                    // visible even after `midi_requested` resets to
+                    // false on a permission-denied retry path.
+                    let status_owned = self.midi_status.borrow().clone();
+                    let is_error = status_owned.starts_with("error");
+                    if is_error {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 90, 90),
+                            format!("MIDI: {status_owned}"),
+                        );
+                    } else {
+                        ui.label(format!("MIDI: {status_owned}"));
+                    }
+                    if !self.midi_requested.get() {
+                        // Only reachable if Start failed to grant MIDI
+                        // (denied / Web MIDI unsupported). Recover via
+                        // an explicit retry click.
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("🎹 Retry MIDI")
+                                    .size(15.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(180, 90, 40))
+                            .min_size(egui::vec2(140.0, 24.0)),
+                        );
+                        if resp.clicked() {
+                            self.request_midi();
+                        }
                     }
                 });
+                // Hint row only shows when the user is in a recoverable
+                // MIDI failure state — once MIDI is connected (or even
+                // mid-handshake) the hint disappears so the chrome
+                // doesn't waste vertical space.
+                if !self.midi_requested.get() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.colored_label(
+                            egui::Color32::from_gray(170),
+                            "「🎹 Retry MIDI」で USB-MIDI 鍵盤入力を再要求できます",
+                        );
+                    });
+                }
             });
 
             egui::TopBottomPanel::top("controls").show(ctx, |ui| {
@@ -960,6 +1073,17 @@ mod imp {
         inbox: MidiInbox,
         closures: &MessageClosures,
     ) {
+        // Diagnostic: log the port name once at attach time so we can
+        // confirm the handler actually got bound to a real input. Cheap
+        // — fires only when a port is added.
+        web_sys::console::log_1(
+            &format!(
+                "keysynth-web: attach_midi_handler port='{}' state={:?}",
+                port.name().unwrap_or_default(),
+                port.state()
+            )
+            .into(),
+        );
         let on_message = Closure::<dyn FnMut(web_sys::MidiMessageEvent)>::new(
             move |ev: web_sys::MidiMessageEvent| {
                 let Ok(data) = ev.data() else { return };
@@ -972,6 +1096,20 @@ mod imp {
                 // Velocity is data[2] for note_on/off; absent on some
                 // status types but we only branch on 0x80 / 0x90 below.
                 let velocity = if data.len() >= 3 { data[2] } else { 0 };
+                // Diagnostic: log raw bytes ONLY for note_on / note_off.
+                // Logging every inbound message swamps the browser
+                // console with MIDI clock (24 msg/quarter ≈ 48 msg/s
+                // at 120 BPM) and active-sensing chatter from
+                // sequencer-style controllers, jankifying the UI even
+                // though the audio thread is unaffected. Keep the
+                // signal-of-interest visible without spam. Strip once
+                // we've confirmed MIDI is wired end-to-end on the live
+                // demo across enough device models.
+                if matches!(kind, 0x80 | 0x90) {
+                    web_sys::console::log_1(
+                        &format!("keysynth-web: midi raw={:02X?}", data.as_slice()).into(),
+                    );
+                }
                 let msg = match kind {
                     0x90 if velocity > 0 => MidiMsg::NoteOn { note, velocity },
                     0x80 | 0x90 => MidiMsg::NoteOff { note },
