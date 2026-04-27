@@ -960,9 +960,27 @@ mod imp {
         inbox: MidiInbox,
         closures: &MessageClosures,
     ) {
+        // Diagnostic: log the port name once at attach time so we can
+        // confirm the handler actually got bound to a real input. Cheap
+        // — fires only when a port is added.
+        web_sys::console::log_1(
+            &format!(
+                "keysynth-web: attach_midi_handler port='{}' state={:?}",
+                port.name().unwrap_or_default(),
+                port.state()
+            )
+            .into(),
+        );
         let on_message = Closure::<dyn FnMut(web_sys::MidiMessageEvent)>::new(
             move |ev: web_sys::MidiMessageEvent| {
                 let Ok(data) = ev.data() else { return };
+                // Diagnostic: log every raw 3-byte status message. UI
+                // thread, not audio callback, so format! + console::log
+                // are safe. Strip once we confirm MIDI is wired
+                // end-to-end on the live demo.
+                web_sys::console::log_1(
+                    &format!("keysynth-web: midi raw={:02X?}", data.as_slice()).into(),
+                );
                 if data.len() < 2 {
                     return;
                 }
