@@ -176,10 +176,13 @@ mod imp {
         /// handlers (`onmidimessage`), consumer = `WebApp::update` once
         /// per frame.
         midi_inbox: MidiInbox,
-        /// True once `request_midi()` has fired its async handshake. Stops
-        /// us re-requesting on every UI button click while the browser is
-        /// still resolving the first promise.
-        midi_requested: bool,
+        /// Tracks whether a MIDI handshake is currently in-flight or has
+        /// succeeded. Held in `Rc<Cell<bool>>` so the async resolution
+        /// path can clear it on error (letting the user re-click "Connect
+        /// MIDI" without reloading the page) without needing a `&mut self`
+        /// reference. Set true synchronously in `request_midi()`, cleared
+        /// in the async error branch, kept true on success.
+        midi_requested: Rc<std::cell::Cell<bool>>,
     }
 
     impl Default for WebApp {
@@ -226,7 +229,7 @@ mod imp {
                 base_note: 48, // C3
                 midi_status: Rc::new(RefCell::new("not requested".to_string())),
                 midi_inbox: Rc::new(RefCell::new(Vec::new())),
-                midi_requested: false,
+                midi_requested: Rc::new(std::cell::Cell::new(false)),
             }
         }
     }
@@ -289,22 +292,29 @@ mod imp {
         /// practice and it spares us a channel dance to ship the handles
         /// back through a `&mut self` boundary.
         fn request_midi(&mut self) {
-            if self.midi_requested {
+            if self.midi_requested.get() {
                 return;
             }
-            self.midi_requested = true;
+            self.midi_requested.set(true);
             *self.midi_status.borrow_mut() = "requesting...".to_string();
             let inbox = self.midi_inbox.clone();
             let status = self.midi_status.clone();
+            let requested_flag = self.midi_requested.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match request_midi_access(inbox).await {
                     Ok(handles) => {
                         let n = handles._on_message_closures.len();
                         *status.borrow_mut() = format!("{n} input(s) connected");
                         Box::leak(Box::new(handles));
+                        // Leave `requested_flag` true on success so the
+                        // Connect button stays out of the way.
                     }
                     Err(e) => {
                         *status.borrow_mut() = format!("error: {e}");
+                        // Reset on failure so the user can press Connect
+                        // again — permission-denial is recoverable on a
+                        // second click that re-prompts the browser.
+                        requested_flag.set(false);
                     }
                 }
             });
@@ -528,8 +538,15 @@ mod imp {
 
             if self.audio.is_some() {
                 self.handle_pc_keyboard(ctx);
-                self.drain_midi_inbox();
             }
+            // Drain the MIDI inbox every frame regardless of audio state.
+            // If audio isn't started yet `note_on` early-returns, so the
+            // queued events get consumed silently — the alternative
+            // (gating drain on audio_started) lets the queue grow
+            // unbounded between page load and the first click on
+            // "Start audio", and on resumption the user hears a stale
+            // burst of every key they pressed during setup.
+            self.drain_midi_inbox();
 
             // Diagnostic: every ~30 frames (~0.5 s @ 60 fps) log the
             // most recent audio-callback bus peak. Lets us verify on
@@ -565,7 +582,7 @@ mod imp {
                     }
                     ui.separator();
                     ui.label(format!("MIDI: {}", self.midi_status.borrow()));
-                    if !self.midi_requested && ui.button("Connect MIDI").clicked() {
+                    if !self.midi_requested.get() && ui.button("Connect MIDI").clicked() {
                         // Browser autoplay-style gating: requestMIDIAccess
                         // also wants a user gesture to surface the
                         // permission prompt, so bind it to a button click
