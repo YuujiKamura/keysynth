@@ -247,6 +247,14 @@ mod imp {
                     web_sys::console::log_1(
                         &format!("keysynth-web: audio started @ {sr} Hz").into(),
                     );
+                    // Same user-gesture context — request MIDI access in
+                    // the same click so the user doesn't have to hunt
+                    // for a second button. If the browser doesn't
+                    // support Web MIDI or the user denies the prompt,
+                    // `request_midi` writes the error into
+                    // `midi_status` and resets `midi_requested` so the
+                    // dedicated Retry button still appears below.
+                    self.request_midi();
                 }
                 Err(e) => {
                     web_sys::console::error_1(
@@ -623,10 +631,14 @@ mod imp {
                         ui.add_space(4.0);
                         let mut hints: Vec<&str> = Vec::new();
                         if self.audio.is_none() {
-                            hints.push("①「▶ Start audio」を押すと音が出ます");
+                            hints.push(
+                                "「▶ Start audio」を押すと音が出ます（USB-MIDI 鍵盤も同時に有効化されます）",
+                            );
                         }
-                        if !self.midi_requested.get() {
-                            hints.push("②「🎹 Connect MIDI keyboard」で USB-MIDI 鍵盤入力を有効化");
+                        if !self.midi_requested.get() && self.audio.is_some() {
+                            hints.push(
+                                "「🎹 Retry MIDI」で USB-MIDI 鍵盤入力を再要求",
+                            );
                         }
                         ui.colored_label(egui::Color32::from_gray(170), hints.join("　／　"));
                     });
