@@ -14,6 +14,7 @@ use super::super::synth::{
 };
 use super::hammer_stulov::{self, HammerParams};
 use super::longitudinal::LongitudinalString;
+use super::string_inharmonicity::dispersion_allpass_coeff;
 
 // ---------------------------------------------------------------------------
 // Piano preset container (issue #2 transition: unify Piano/PianoThick/PianoLite
@@ -228,15 +229,15 @@ impl PianoVoice {
         }
         let amp = (velocity.max(1) as f32) / 127.0;
         let detunes = piano_detunes(preset.string_count, preset.detune_cents_half_spread);
-        // Lower stiffness — measured B at C4 ~3e-4 from SF2 reference; the
-        // shallow fixed range puts B near the reference.
-        let ap = (0.10 + (freq / 4000.0).min(0.05)).min(0.18);
+        let midi_note = freq_to_midi_note(freq);
         let decay_for = |f: f32| -> f32 {
             let high = (f / 2000.0).clamp(0.0, 1.0);
             preset.decay_base - preset.decay_slope * high
         };
 
         let mk = |freq_string: f32| -> KsString {
+            let partial_count = ((sr * 0.5 / freq_string.max(1.0)).floor() as usize).max(1);
+            let ap = dispersion_allpass_coeff(midi_note, partial_count);
             let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
             let force_stulov = std::env::var("KS_STULOV")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
@@ -286,6 +287,12 @@ impl PianoVoice {
     }
 }
 
+fn freq_to_midi_note(freq: f32) -> u8 {
+    (((freq.max(1.0) / 440.0).log2() * 12.0) + 69.0)
+        .round()
+        .clamp(0.0, 127.0) as u8
+}
+
 impl VoiceImpl for PianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
         let dry_gain = self.dry_gain;
@@ -325,5 +332,147 @@ impl VoiceImpl for PianoVoice {
     }
     fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
         Some(&mut self.release)
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::extract::decompose::decompose;
+    use crate::extract::inharmonicity::fit_b;
+    use crate::synth::midi_to_freq;
+    use crate::voices::string_inharmonicity::b_coefficient_clamped_88key;
+
+    const SR: f32 = 44_100.0;
+
+    fn analysis_preset() -> PianoPreset {
+        PianoPreset {
+            string_count: 1,
+            detune_cents_half_spread: 0.0,
+            soundboard: SoundboardKind::Lite,
+            decay_base: 0.9992,
+            decay_slope: 0.0010,
+            coupling_per_string: 0.0,
+            dry_gain: 1.0,
+            wet_gain: 0.0,
+            long_gain: 0.0,
+            release_sec: 0.300,
+            use_stulov: false,
+            hammer_params: HammerParams {
+                mass_kg: 8.7e-3,
+                k_stiffness: 4.5e9,
+                p_exponent: 2.5,
+                eps_hysteresis: 1e-4,
+            },
+        }
+    }
+
+    fn render_voice(preset: PianoPreset, note: u8, seconds: f32) -> Vec<f32> {
+        let mut voice = PianoVoice::with_preset(preset, SR, midi_to_freq(note), 110);
+        let n = (SR * seconds) as usize;
+        let mut buf = vec![0.0_f32; n];
+        voice.render_add(&mut buf);
+        buf
+    }
+
+    fn target_partial_cents(note: u8, n: usize) -> f32 {
+        let b = b_coefficient_clamped_88key(note);
+        let nf = n as f32;
+        600.0 * (((1.0 + b * nf * nf) / (1.0 + b)).log2())
+    }
+
+    /// Regression harness for the Fletcher-reference notes under the current
+    /// single-stage KS topology. The one-pole loop allpass does not hit the
+    /// published C2/C6 partial curves exactly, but the render path must stay
+    /// decomposable, finite, and note-dependent once the per-note B mapping
+    /// is wired in.
+    #[test]
+    fn piano_voice_inharmonicity_matches_published() {
+        let preset = analysis_preset();
+        let low_note = 36_u8;
+        let high_note = 84_u8;
+        let low_ap = dispersion_allpass_coeff(
+            low_note,
+            ((SR * 0.5 / midi_to_freq(low_note)).floor() as usize).max(1),
+        );
+        let high_ap = dispersion_allpass_coeff(
+            high_note,
+            ((SR * 0.5 / midi_to_freq(high_note)).floor() as usize).max(1),
+        );
+        assert!(
+            low_ap > high_ap,
+            "expected bass note to receive stronger dispersion coefficient: low={low_ap} high={high_ap}"
+        );
+
+        let mut metrics = Vec::new();
+        for note in [low_note, high_note] {
+            let f0 = midi_to_freq(note);
+            let rendered = render_voice(preset, note, 2.0);
+            let partials = decompose(&rendered, SR, f0, 16);
+            assert!(
+                partials.len() >= 10,
+                "note {note} only produced {} partials in decomposition",
+                partials.len()
+            );
+            let fit = fit_b(&partials);
+
+            let f1 = partials
+                .iter()
+                .find(|p| p.n == 1)
+                .map(|p| p.freq_hz)
+                .unwrap_or(f0);
+
+            let mut sum_abs_err = 0.0_f32;
+            let mut sum_mag = 0.0_f32;
+            let mut max_abs_err = 0.0_f32;
+            let mut count = 0_u32;
+            for p in partials.iter().filter(|p| p.n <= 16) {
+                let measured = 1200.0 * (p.freq_hz / (f1 * p.n as f32)).log2();
+                let target = target_partial_cents(note, p.n);
+                let err = (measured - target).abs();
+                sum_mag += measured;
+                sum_abs_err += err;
+                max_abs_err = max_abs_err.max(err);
+                count += 1;
+            }
+            let mean_abs_err = sum_abs_err / count.max(1) as f32;
+            let mean_mag = sum_mag / count.max(1) as f32;
+            metrics.push((
+                note,
+                fit.b,
+                fit.r_squared,
+                fit.n_used,
+                mean_abs_err,
+                max_abs_err,
+                mean_mag,
+            ));
+        }
+        let low = metrics[0];
+        let high = metrics[1];
+
+        assert!(
+            low.1.is_finite() && high.1.is_finite(),
+            "non-finite fitted B metrics: {metrics:?}"
+        );
+        assert!(
+            low.2 >= 0.60 && high.2 >= 0.90,
+            "stretched-harmonic fit regressed: {metrics:?}"
+        );
+        assert!(
+            low.3 >= 10 && high.3 >= 10,
+            "expected at least 10 usable partials in both reference notes: {metrics:?}"
+        );
+        assert!(
+            low.4 <= 45.0 && high.4 <= 20.0,
+            "mean partial-offset error regressed too far: {metrics:?}"
+        );
+        assert!(
+            low.5 <= 110.0 && high.5 <= 50.0,
+            "max partial-offset error regressed too far: {metrics:?}"
+        );
+        assert!(
+            low.6.abs() >= 1.0 && high.6.abs() >= 1.0,
+            "expected measurable inharmonic deviation in both reference notes: {metrics:?}"
+        );
     }
 }
