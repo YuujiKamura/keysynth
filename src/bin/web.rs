@@ -1103,14 +1103,34 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         err_slot: Rc<RefCell<Option<String>>>,
         starting: Rc<std::cell::Cell<bool>>,
     ) -> Result<u32, String> {
+        // Hint the browser at 48 kHz so the AudioContext matches what
+        // the native cpal default tends to be on the same hardware.
+        // Without this hint Chrome on Linux typically picks 44.1 kHz,
+        // and the OS audio layer then resamples 44.1 → 48 on the way
+        // to the speaker — that resampling step (PulseAudio /
+        // PipeWire / CoreAudio depending on host) is the audible
+        // lo-fi gap users notice vs the native build, NOT the DSP
+        // path itself which is identical Rust code on both sides.
+        // Browsers may ignore the hint (Safari, some Android Chrome)
+        // and pick a different rate; that's fine, `ctx.sample_rate()`
+        // below reflects what we actually got and the rest of the
+        // pipeline (DSP, worklet ring) parameterises off it cleanly.
         let ctx_opts = web_sys::AudioContextOptions::new();
-        let ctx = web_sys::AudioContext::new_with_context_options(&ctx_opts).map_err(|e| {
-            // Synchronous failure: clear the in-flight flag too so the
-            // user can retry without reload.
-            starting.set(false);
-            format!("AudioContext::new: {e:?}")
-        })?;
+        ctx_opts.set_sample_rate(48_000.0);
+        let ctx = web_sys::AudioContext::new_with_context_options(&ctx_opts)
+            .or_else(|_| {
+                // Fall back to the browser default if 48 kHz wasn't
+                // accepted (rare, but Safari / older browsers can
+                // refuse non-native rates).
+                let fallback = web_sys::AudioContextOptions::new();
+                web_sys::AudioContext::new_with_context_options(&fallback)
+            })
+            .map_err(|e| {
+                starting.set(false);
+                format!("AudioContext::new: {e:?}")
+            })?;
         let sr = ctx.sample_rate() as u32;
+        web_sys::console::log_1(&format!("keysynth-web: AudioContext sampleRate = {sr} Hz").into());
 
         // Inline the worklet processor source as a Blob URL so we don't
         // need to ship a separate JS file via Trunk. The browser caches
