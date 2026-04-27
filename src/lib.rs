@@ -19,6 +19,12 @@ pub mod synth;
 pub mod voice_lib;
 pub mod voices;
 
+// Web-only audio engine using Kira. Gated behind the `web` Cargo
+// feature so the native binary's compile graph isn't pulled into
+// `kira` / cpal-wasm-bindgen / etc.
+#[cfg(feature = "web")]
+pub mod audio_kira;
+
 // Native-only modules: pull in midir / rustysynth / rustfft / hound /
 // game-music-emu / midly / symphonia which are gated out of the
 // wasm32 build via the `web` Cargo feature.
