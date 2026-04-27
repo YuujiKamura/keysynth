@@ -233,21 +233,53 @@ mod imp {
         sf_bank: u8,
     }
 
-    /// Built-in voice library shown in the left side panel. Mirrors
-    /// the native `VoiceLibrary::builtins` on the live-hotswap branch
-    /// minus the SFZ slot (no Salamander on Pages) and the modal
-    /// preset variants (those need the `MODAL_PHYSICS` atomic +
-    /// `ModalPreset` enum which only exist on live-hotswap; here a
-    /// single "Modal piano" slot covers `Engine::PianoModal`).
+    /// Built-in voice library shown in the left side panel. Slot
+    /// labels and order match the native `VoiceLibrary::builtins` on
+    /// the live-hotswap branch (`src/voice_lib.rs:186`) verbatim,
+    /// minus the SFZ Salamander slot (multi-GB, can't ship to Pages).
+    ///
+    /// CAVEAT: the four `Modal (…)` variants all currently route to
+    /// `Engine::PianoModal` with its compiled-in default params, so
+    /// the audio is identical across them on web — true preset
+    /// switching needs the `MODAL_PARAMS` cell + `ModalPreset::apply`
+    /// machinery from live-hotswap (`src/synth.rs::ModalPreset`),
+    /// which is not yet on `main`. Tracked as follow-up: porting that
+    /// stack is mechanical but touches `synth.rs` + `piano_modal.rs`,
+    /// own PR.
     const WEB_VOICE_SLOTS: &[WebVoiceSlot] = &[
         // ── Piano family ────────────────────────────────────────────
+        // Modal preset variants. Same Engine, same audio today; once
+        // ModalPreset.apply() lands on main, each will write a
+        // distinct ModalParams set into MODAL_PARAMS on click.
         WebVoiceSlot {
-            label: "Modal piano",
+            label: "Modal (default)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoModal,
             sf_program: 0,
             sf_bank: 0,
         },
+        WebVoiceSlot {
+            label: "Modal (Round-16)",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoModal,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "Modal (Physics)",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoModal,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "Modal (Bright)",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoModal,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        // KS-string-based piano variants.
         WebVoiceSlot {
             label: "KS Piano",
             category: VoiceCategory::Piano,
@@ -270,14 +302,18 @@ mod imp {
             sf_bank: 0,
         },
         WebVoiceSlot {
-            label: "KS Piano (5 AM)",
+            label: "KS Piano (5AM)",
             category: VoiceCategory::Piano,
             engine: Engine::Piano5AM,
             sf_program: 0,
             sf_bank: 0,
         },
+        // Sample-based: SF2 only on web (SFZ Salamander too big).
+        // Label format mirrors live-hotswap's auto-discover format
+        // ("<stem> (SF2 piano)") so the web build's slot is visually
+        // identical to native when the same file is auto-discovered.
         WebVoiceSlot {
-            label: "GeneralUser GS (SF2 piano)",
+            label: "GeneralUser-GS (SF2 piano)",
             category: VoiceCategory::Piano,
             engine: Engine::SfPiano,
             sf_program: 0,
@@ -285,7 +321,7 @@ mod imp {
         },
         // ── Synth family ────────────────────────────────────────────
         WebVoiceSlot {
-            label: "Square (NES)",
+            label: "Square",
             category: VoiceCategory::Synth,
             engine: Engine::Square,
             sf_program: 0,
@@ -595,6 +631,12 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// `Engine::SfPiano` selection isn't a silent no-op while
         /// loading.
         synth_status: Rc<RefCell<SfStatus>>,
+        /// Index into `WEB_VOICE_SLOTS` for the currently-selected
+        /// voice. Disambiguates the four `Modal (…)` variants which
+        /// share `Engine::PianoModal` — without this the active-row
+        /// marker would highlight all four. Mirrors `VoiceLibrary::
+        /// active` on the native (live-hotswap) build.
+        current_voice_idx: Rc<std::cell::Cell<usize>>,
         /// Rolling log of recent MIDI events drawn in the right side
         /// panel. Mirrors the native build's `DashState::recent` ring
         /// (newest at the back, capped at 64). `Rc<RefCell<…>>` because
@@ -647,6 +689,9 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 midi_handles: Rc::new(RefCell::new(None)),
                 synth: Arc::new(Mutex::new(None)),
                 synth_status: Rc::new(RefCell::new(SfStatus::Idle)),
+                // Default to slot 0 = "Modal (default)", matching the
+                // `Engine::PianoModal` default in `LiveParams` above.
+                current_voice_idx: Rc::new(std::cell::Cell::new(0)),
                 recent_events: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
             }
         }
@@ -970,7 +1015,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// the next keypress immediately sounds the new patch (no
         /// note-driven catch-up). Logs to the MIDI log so the user
         /// can see the swap reflected.
-        fn apply_voice_slot(&self, slot: &WebVoiceSlot) {
+        fn apply_voice_slot(&self, idx: usize, slot: &WebVoiceSlot) {
             {
                 let mut lp = self.live.lock().unwrap();
                 lp.engine = slot.engine;
@@ -988,6 +1033,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     s.process_midi_message(0, 0xC0, slot.sf_program as i32, 0);
                 }
             }
+            self.current_voice_idx.set(idx);
             self.push_event(format!("voice → {}", slot.label));
         }
 
@@ -1041,14 +1087,18 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                                 egui::CollapsingHeader::new(cat.label())
                                     .default_open(true)
                                     .show(ui, |ui| {
+                                        let active_idx = self.current_voice_idx.get();
                                         for (idx, slot) in WEB_VOICE_SLOTS.iter().enumerate() {
                                             if slot.category != *cat {
                                                 continue;
                                             }
-                                            let is_active = engine == slot.engine
-                                                && (slot.engine != Engine::SfPiano
-                                                    || (sf_program == slot.sf_program
-                                                        && sf_bank == slot.sf_bank));
+                                            // Match by slot index so the
+                                            // four `Modal (…)` variants
+                                            // (which all share
+                                            // `Engine::PianoModal`)
+                                            // don't all light up at
+                                            // once.
+                                            let is_active = idx == active_idx;
                                             ui.horizontal(|ui| {
                                                 ui.label(if is_active { "●" } else { "○" });
                                                 let rich = if is_active {
@@ -1136,7 +1186,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 });
 
             if let Some(idx) = clicked_slot {
-                self.apply_voice_slot(&WEB_VOICE_SLOTS[idx]);
+                self.apply_voice_slot(idx, &WEB_VOICE_SLOTS[idx]);
             }
             if let Some((p, b)) = clicked_patch {
                 self.apply_sf_patch(p, b);
