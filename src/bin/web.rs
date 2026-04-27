@@ -372,6 +372,14 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// Bitset over `HashSet<u8>` avoids per-frame heap traffic in
         /// the egui input loop.
         pc_held: u128,
+        /// Whether the page had focus on the previous frame. Browsers
+        /// sometimes drop the `keyup` event when the user Alt-Tabs /
+        /// switches tabs / triggers IME mid-key — leaving the egui key
+        /// state stuck as "pressed" forever and our `pc_held` bitset
+        /// holding phantom notes. On a true→false focus edge we
+        /// release every pc-held note; on the next focus regain the
+        /// user starts from a clean slate.
+        prev_focused: bool,
         /// Base MIDI note for the leftmost on-screen key. Defaults to C3 (48).
         base_note: u8,
         /// Status string for Web MIDI (e.g. "not requested" / "connected: ..."
@@ -433,6 +441,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 audio_err: Rc::new(RefCell::new(None)),
                 mouse_down_note: None,
                 pc_held: 0,
+                prev_focused: true,
                 base_note: 48, // C3
                 midi_status: Rc::new(RefCell::new("not requested".to_string())),
                 midi_inbox: Rc::new(RefCell::new(Vec::new())),
@@ -588,6 +597,41 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             let mut pool = self.voices.lock().unwrap();
             if let Some(slot) = pool.iter_mut().find(|x| x.key == (0, note)) {
                 slot.inner.trigger_release();
+            }
+        }
+
+        /// Force-release every voice the app currently thinks is held.
+        ///
+        /// Called automatically on a focus-lost edge (browsers don't
+        /// always deliver `keyup` when the page loses focus mid-press,
+        /// leaving egui's key state and our `pc_held` bitset stuck on
+        /// phantom notes) and from a manual "Panic" button. Three
+        /// passes:
+        ///
+        ///   1. Iterate the bits set in `pc_held`, fire `note_off` for
+        ///      each → matching pool voices enter their release tail.
+        ///   2. Clear `pc_held` and `mouse_down_note` so subsequent
+        ///      input edges are clean.
+        ///   3. As a belt-and-braces, walk the entire voice pool and
+        ///      `trigger_release` on every voice — even ones we've
+        ///      lost track of (stuck MIDI keys after a cable yank,
+        ///      etc.) get released here.
+        fn panic_release(&mut self) {
+            // Pass 1: drain pc_held bits.
+            let mut bits = self.pc_held;
+            while bits != 0 {
+                let note = bits.trailing_zeros() as u8;
+                self.note_off(note);
+                bits &= bits - 1;
+            }
+            self.pc_held = 0;
+            if let Some(n) = self.mouse_down_note.take() {
+                self.note_off(n);
+            }
+            // Pass 3: anything still sounding gets release.
+            let mut pool = self.voices.lock().unwrap();
+            for v in pool.iter_mut() {
+                v.inner.trigger_release();
             }
         }
 
@@ -769,6 +813,19 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             // the main-thread budget for cpal's polling.
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
+            // Focus-loss panic. Browsers don't reliably fire `keyup`
+            // when the page loses focus (Alt+Tab, tab switch, IME
+            // popup, OS-level screensaver, etc.) — so a key the user
+            // released while focus was elsewhere stays "down" in
+            // egui's input state forever and our `pc_held` bitset
+            // holds a phantom bit for it. Detect the focus true→false
+            // edge and force-release everything we think is held.
+            let focused_now = ctx.input(|i| i.focused);
+            if self.prev_focused && !focused_now {
+                self.panic_release();
+            }
+            self.prev_focused = focused_now;
+
             if self.audio.borrow().is_some() {
                 self.handle_pc_keyboard(ctx);
             }
@@ -944,6 +1001,35 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         });
                 });
                 drop(live);
+
+                // Manual panic / all-notes-off button. Always-visible
+                // recovery for any input state corruption — focus-loss
+                // missed `keyup` (handled automatically above too), a
+                // MIDI controller cable yank, anything we couldn't
+                // anticipate. One click silences everything currently
+                // held.
+                ui.horizontal(|ui| {
+                    let panic_btn = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("⏹ Panic / all notes off")
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(egui::Color32::from_rgb(170, 60, 60))
+                        .min_size(egui::vec2(180.0, 22.0)),
+                    );
+                    if panic_btn.clicked() {
+                        self.panic_release();
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "（鍵盤入力が残ったときはこれを押す。フォーカスを外したときは自動的に発火）",
+                        )
+                        .small()
+                        .color(egui::Color32::from_gray(160)),
+                    );
+                });
 
                 // Description of the currently-selected engine,
                 // rendered on its own row as a wrapping `Label` so
