@@ -114,11 +114,14 @@ mod imp {
         /// true on every browser KeyDown including auto-repeat, so we
         /// track our own edge state instead.
         mouse_down_note: Option<u8>,
-        /// MIDI notes the PC keyboard is currently holding down. Edge
-        /// transitions (added → note_on, removed → note_off) drive the
-        /// voice pool so a held key produces ONE voice, not a stream of
-        /// re-triggered voices on each browser auto-repeat event.
-        pc_held: std::collections::HashSet<u8>,
+        /// MIDI notes the PC keyboard is currently holding down, packed
+        /// as a 128-bit bitset (one bit per MIDI note 0..=127). Edge
+        /// transitions (bit set → note_on, bit cleared → note_off) drive
+        /// the voice pool so a held key produces ONE voice, not a stream
+        /// of re-triggered voices on each browser auto-repeat event.
+        /// Bitset over `HashSet<u8>` avoids per-frame heap traffic in
+        /// the egui input loop.
+        pc_held: u128,
         /// Base MIDI note for the leftmost on-screen key. Defaults to C3 (48).
         base_note: u8,
         /// Status string for Web MIDI (e.g. "not requested" / "connected: ..."
@@ -158,7 +161,7 @@ mod imp {
                 audio: None,
                 audio_err: None,
                 mouse_down_note: None,
-                pc_held: std::collections::HashSet::new(),
+                pc_held: 0,
                 base_note: 48, // C3
                 midi_status: "not requested".to_string(),
             }
@@ -222,43 +225,51 @@ mod imp {
             }
         }
 
-        /// Process PC keyboard input. Browsers fire repeated KeyDown events
-        /// for held keys (OS auto-repeat), and egui's `key_pressed` returns
-        /// true on every one of those — playing the same note as a fast
-        /// trill rather than a held tone. Snapshot the currently-down key
-        /// set from egui's modifier-style accessor and only fire note_on /
-        /// note_off on edge transitions against `pc_held`.
+        /// Process PC keyboard input. Two failure modes to dodge:
+        ///
+        ///   1. Browsers fire OS auto-repeat KeyDown events while a key is
+        ///      held, and `egui::InputState::key_pressed` returns true on
+        ///      each one — a held `z` plays as a fast trill instead of a
+        ///      sustained tone.
+        ///   2. A `keys_down` snapshot misses any tap that begins and ends
+        ///      between two UI frames (low-FPS spike or short stab) — the
+        ///      note never sounds at all.
+        ///
+        /// Stay event-based (`key_pressed` / `key_released`) so transient
+        /// taps survive, but filter via our own `pc_held` set: `note_on`
+        /// only fires when the note isn't already in the held-set, which
+        /// suppresses auto-repeat without dropping any genuine event.
         fn handle_pc_keyboard(&mut self, ctx: &egui::Context) {
-            // Build the "currently down" set this frame.
-            let down_now: std::collections::HashSet<u8> = ctx.input(|i| {
-                let mut set = std::collections::HashSet::new();
+            // Bounded by KEYBOARD_SPAN (=25) so a stack-sized smallvec
+            // would also work, but Vec::new() with no pushes doesn't
+            // allocate, and most frames push 0-1 entries.
+            let mut to_on: Vec<u8> = Vec::new();
+            let mut to_off: Vec<u8> = Vec::new();
+            ctx.input(|i| {
                 for &(key, semi) in PC_KEYMAP {
-                    if i.keys_down.contains(&key) {
-                        let note = (self.base_note as i32 + semi).clamp(0, 127) as u8;
-                        set.insert(note);
+                    let note = (self.base_note as i32 + semi).clamp(0, 127) as u8;
+                    let bit = 1u128 << note;
+                    if i.key_released(key) && (self.pc_held & bit) != 0 {
+                        self.pc_held &= !bit;
+                        to_off.push(note);
+                    }
+                    // `(self.pc_held & bit) == 0` — only fire note_on if
+                    // the bit isn't already set. Browser KeyDown
+                    // auto-repeats while a key is held arrive as
+                    // `key_pressed = true` on every frame, but the bit
+                    // is already set from the first press so we skip.
+                    if i.key_pressed(key) && (self.pc_held & bit) == 0 {
+                        self.pc_held |= bit;
+                        to_on.push(note);
                     }
                 }
-                set
             });
-
-            // Note off for keys released since last frame.
-            for note in self
-                .pc_held
-                .difference(&down_now)
-                .copied()
-                .collect::<Vec<_>>()
-            {
+            for note in to_off {
                 self.note_off(note);
             }
-            // Note on for keys newly pressed since last frame.
-            for note in down_now
-                .difference(&self.pc_held)
-                .copied()
-                .collect::<Vec<_>>()
-            {
+            for note in to_on {
                 self.note_on(note, 100);
             }
-            self.pc_held = down_now;
         }
 
         fn draw_on_screen_keyboard(&mut self, ui: &mut egui::Ui) {
