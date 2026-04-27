@@ -12,6 +12,7 @@
 use super::super::synth::{
     piano_hammer_excitation, piano_hammer_width, KsString, ReleaseEnvelope, VoiceImpl,
 };
+use super::hammer_stulov::{self, HammerParams};
 
 // ---------------------------------------------------------------------------
 // Piano preset container (issue #2 transition: unify Piano/PianoThick/PianoLite
@@ -52,6 +53,10 @@ pub struct PianoPreset {
     pub wet_gain: f32,
     /// Voice release time (seconds) handed to the shared ReleaseEnvelope.
     pub release_sec: f32,
+    /// Use Stulov non-linear hammer model instead of linear-rise + exp-decay.
+    pub use_stulov: bool,
+    /// Parameters for the Stulov hammer model.
+    pub hammer_params: HammerParams,
 }
 
 impl PianoPreset {
@@ -67,6 +72,13 @@ impl PianoPreset {
         dry_gain: 0.5,
         wet_gain: 0.35,
         release_sec: 0.300,
+        use_stulov: false,
+        hammer_params: HammerParams {
+            mass_kg: 8.7e-3,
+            k_stiffness: 4.5e9,
+            p_exponent: 2.5,
+            eps_hysteresis: 1e-4,
+        },
     };
     /// `PianoThick`: 7 strings + 12-mode lite body so the high-Q upper-band
     /// modes don't ring through the bridge loop. Decay base lifted to keep
@@ -82,6 +94,13 @@ impl PianoPreset {
         dry_gain: 0.7,
         wet_gain: 0.20,
         release_sec: 0.300,
+        use_stulov: false,
+        hammer_params: HammerParams {
+            mass_kg: 8.7e-3,
+            k_stiffness: 4.5e9,
+            p_exponent: 2.5,
+            eps_hysteresis: 1e-4,
+        },
     };
     /// `PianoLite`: 3 strings + 12-mode lite body. v4 tuning lands h1 T60
     /// within 8% of the SFZ Salamander C4 reference. Coupling is NOT
@@ -97,6 +116,13 @@ impl PianoPreset {
         dry_gain: 0.5,
         wet_gain: 0.35,
         release_sec: 0.300,
+        use_stulov: false,
+        hammer_params: HammerParams {
+            mass_kg: 8.7e-3,
+            k_stiffness: 4.5e9,
+            p_exponent: 2.5,
+            eps_hysteresis: 1e-4,
+        },
     };
 }
 
@@ -173,10 +199,19 @@ impl PianoVoice {
             let high = (f / 2000.0).clamp(0.0, 1.0);
             preset.decay_base - preset.decay_slope * high
         };
-        let hammer_w = piano_hammer_width(velocity);
+
         let mk = |freq_string: f32| -> KsString {
             let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
-            let buf = piano_hammer_excitation(n, hammer_w, amp);
+            let force_stulov = std::env::var("KS_STULOV")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            let buf = if preset.use_stulov || force_stulov {
+                let v_mps = 0.5 + (velocity as f32 / 127.0) * 4.5;
+                hammer_stulov::stulov_pulse(v_mps, sr, n, &preset.hammer_params)
+            } else {
+                let hammer_w = piano_hammer_width(velocity);
+                piano_hammer_excitation(n, hammer_w, amp)
+            };
             KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
                 .with_attack_lpf(sr, 0.0, 0.97, 0.97)
         };

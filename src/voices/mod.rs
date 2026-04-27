@@ -4,6 +4,7 @@
 //! `Adsr`) stay in `synth` and are imported here.
 
 pub mod fm;
+pub mod hammer_stulov;
 pub mod koto;
 pub mod ks;
 pub mod ks_rich;
