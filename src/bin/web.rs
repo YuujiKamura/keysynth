@@ -886,7 +886,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                                 format!("audio error: {err}"),
                             );
                             ui.label(
-                                egui::RichText::new("クリックでもう一度試す")
+                                egui::RichText::new("Click again to retry")
                                     .size(13.0)
                                     .color(egui::Color32::from_gray(170)),
                             );
@@ -894,8 +894,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         ui.add_space(40.0);
                         ui.label(
                             egui::RichText::new(
-                                "MIDI keyboard ない場合はクリック後に画面の鍵盤 / PC キー\n\
-                                 (zsxdcvgbhnjm = lower octave, qweryt... = upper) で演奏",
+                                "No MIDI keyboard? Use the on-screen piano (mouse) or PC keys\n\
+                                 zsxdcvgbhnjm = lower octave, qwertyu... = upper octave",
                             )
                             .size(12.0)
                             .color(egui::Color32::from_gray(150)),
@@ -956,7 +956,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         ui.add_space(4.0);
                         ui.colored_label(
                             egui::Color32::from_gray(170),
-                            "「🎹 Retry MIDI」で USB-MIDI 鍵盤入力を再要求できます",
+                            "Click \"🎹 Retry MIDI\" to request USB-MIDI keyboard access again.",
                         );
                     });
                 }
@@ -1024,7 +1024,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "（鍵盤入力が残ったときはこれを押す。フォーカスを外したときは自動的に発火）",
+                            "(Press if keys get stuck. Also fires automatically when the page loses focus.)",
                         )
                         .small()
                         .color(egui::Color32::from_gray(160)),
