@@ -102,7 +102,7 @@ struct CliArgs {
 fn parse_args() -> Result<CliArgs, String> {
     let mut input_dir = PathBuf::from("bench-out/REF/sfz_salamander_multi");
     let mut output: Option<PathBuf> = None;
-    let mut max_partials: usize = 48;
+    let mut max_partials: usize = 32;
 
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -149,7 +149,7 @@ fn print_help() {
          Defaults:\n\
            --input-dir     bench-out/REF/sfz_salamander_multi\n\
            --output        <input-dir>/modal_lut.json\n\
-           --max-partials  16"
+           --max-partials  32"
     );
 }
 
@@ -188,15 +188,30 @@ fn run(args: &CliArgs) -> Result<ModalLut, String> {
     for (midi_note, path) in &notes {
         let (sig, sr) = read_wav_mono(path)?;
         let f0 = midi_to_f0(*midi_note);
-        eprintln!(
-            "  note {:>3} f0={:>7.2} Hz  ({}, {:.2} s)",
-            midi_note,
-            f0,
-            path.display(),
-            sig.len() as f32 / sr
-        );
+        let nyquist = sr / 2.0;
 
         let partials = decompose(&sig, sr, f0, args.max_partials);
+
+        // Hard rules: No silent fallbacks. If extraction at max_partials
+        // produces fewer than expected for a note (e.g. spectral peak picker
+        // can't find stable peaks), log it loudly per-note. Don't pad with
+        // zeros.
+        // We only expect partials whose ideal frequency is below Nyquist.
+        let expected_count = (1..=args.max_partials)
+            .filter(|&n| (n as f32 * f0) < nyquist)
+            .count();
+
+        if partials.len() < expected_count {
+            eprintln!(
+                "WARNING: note {:>3}: only extracted {}/{} partials (f0={:.2} Hz, Nyquist={:.2} Hz)",
+                midi_note,
+                partials.len(),
+                expected_count,
+                f0,
+                nyquist
+            );
+        }
+
         let t60 = extract_t60(&sig, sr, &partials);
         let att = extract_attack(&sig, sr, 100.0);
 
@@ -220,6 +235,15 @@ fn run(args: &CliArgs) -> Result<ModalLut, String> {
                 post_peak_slope_db_s: att.post_peak_slope_db_s,
             },
         });
+
+        eprintln!(
+            "  note {:>3} f0={:>7.2} Hz  ({}, {:.2} s) -> {} modes",
+            midi_note,
+            f0,
+            path.display(),
+            sig.len() as f32 / sr,
+            lut.last().unwrap().modes.len()
+        );
     }
 
     let rendered_template = format!(
