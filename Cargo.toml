@@ -21,6 +21,7 @@ native = [
     "dep:symphonia",
     "dep:midly",
     "dep:game-music-emu",
+    "dep:rodio",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -62,6 +63,8 @@ midly = { version = "0.5", optional = true }
 # game-music-emu: NSF/etc. ground-truth renderer for render_nsf.
 # NSF-only feature set + skip vgm/gym which break under MSVC -W4.
 game-music-emu = { version = "0.3", default-features = false, features = ["nsf", "nsfe", "ay", "gbs", "hes", "kss", "sap", "spc"], optional = true }
+# rodio: WAV playback for the step-sequencer (seq_grid bin).
+rodio = { version = "0.19", optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
