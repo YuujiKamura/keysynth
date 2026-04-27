@@ -110,8 +110,15 @@ mod imp {
         audio: Option<AudioHandle>,
         audio_err: Option<String>,
         /// Notes currently held by mouse/touch. PC keyboard tracking is via
-        /// egui's per-frame key state, not this set.
+        /// the separate `pc_held` set below — egui's `key_pressed` returns
+        /// true on every browser KeyDown including auto-repeat, so we
+        /// track our own edge state instead.
         mouse_down_note: Option<u8>,
+        /// MIDI notes the PC keyboard is currently holding down. Edge
+        /// transitions (added → note_on, removed → note_off) drive the
+        /// voice pool so a held key produces ONE voice, not a stream of
+        /// re-triggered voices on each browser auto-repeat event.
+        pc_held: std::collections::HashSet<u8>,
         /// Base MIDI note for the leftmost on-screen key. Defaults to C3 (48).
         base_note: u8,
         /// Status string for Web MIDI (e.g. "not requested" / "connected: ..."
@@ -131,17 +138,27 @@ mod imp {
             Self {
                 voices: Arc::new(Mutex::new(Vec::with_capacity(32))),
                 live: Arc::new(Mutex::new(LiveParams {
-                    master: 1.5,
+                    // Match native defaults (main.rs::Args::default). 1.5
+                    // was too low for `Engine::PianoModal`, whose 3-detune
+                    // resonator bank produces per-sample peaks ~10x smaller
+                    // than KS / square / sub voices; under master=1.5 +
+                    // ParallelComp the PianoModal bus sat below audibility
+                    // while every other engine still saturated tanh.
+                    master: 3.0,
                     engine: Engine::PianoModal,
                     reverb_wet: 0.25,
                     sf_program: 0,
                     sf_bank: 0,
-                    mix_mode: MixMode::ParallelComp,
+                    // Plain tanh matches native default and avoids the
+                    // ParallelComp limiter swallowing PianoModal's already
+                    // low-amplitude bus into silence on the first hit.
+                    mix_mode: MixMode::Plain,
                 })),
                 sample_rate: 0,
                 audio: None,
                 audio_err: None,
                 mouse_down_note: None,
+                pc_held: std::collections::HashSet::new(),
                 base_note: 48, // C3
                 midi_status: "not requested".to_string(),
             }
@@ -205,20 +222,43 @@ mod imp {
             }
         }
 
-        /// Process PC keyboard input via egui's per-frame input snapshot.
-        /// Tracks key edges (just_pressed → note_on, just_released → note_off).
+        /// Process PC keyboard input. Browsers fire repeated KeyDown events
+        /// for held keys (OS auto-repeat), and egui's `key_pressed` returns
+        /// true on every one of those — playing the same note as a fast
+        /// trill rather than a held tone. Snapshot the currently-down key
+        /// set from egui's modifier-style accessor and only fire note_on /
+        /// note_off on edge transitions against `pc_held`.
         fn handle_pc_keyboard(&mut self, ctx: &egui::Context) {
-            ctx.input(|i| {
+            // Build the "currently down" set this frame.
+            let down_now: std::collections::HashSet<u8> = ctx.input(|i| {
+                let mut set = std::collections::HashSet::new();
                 for &(key, semi) in PC_KEYMAP {
-                    let note = (self.base_note as i32 + semi).clamp(0, 127) as u8;
-                    if i.key_pressed(key) {
-                        self.note_on(note, 100);
-                    }
-                    if i.key_released(key) {
-                        self.note_off(note);
+                    if i.keys_down.contains(&key) {
+                        let note = (self.base_note as i32 + semi).clamp(0, 127) as u8;
+                        set.insert(note);
                     }
                 }
+                set
             });
+
+            // Note off for keys released since last frame.
+            for note in self
+                .pc_held
+                .difference(&down_now)
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                self.note_off(note);
+            }
+            // Note on for keys newly pressed since last frame.
+            for note in down_now
+                .difference(&self.pc_held)
+                .copied()
+                .collect::<Vec<_>>()
+            {
+                self.note_on(note, 100);
+            }
+            self.pc_held = down_now;
         }
 
         fn draw_on_screen_keyboard(&mut self, ui: &mut egui::Ui) {
