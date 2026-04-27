@@ -136,6 +136,9 @@ class KeysynthProcessor extends AudioWorkletProcessor {
     this.requesting = false;
     this.lowWatermark = Math.floor(this.cap / 2);
     this.port.onmessage = (e) => {
+      // Reset the request flag at the very top so a malformed or
+      // unexpected message can't permanently hang the request loop.
+      this.requesting = false;
       const msg = e.data;
       if (!msg || msg.type !== 'fill' || !msg.samples) return;
       const s = msg.samples;
@@ -143,12 +146,18 @@ class KeysynthProcessor extends AudioWorkletProcessor {
       // Drop overflow rather than overwrite — caller respects watermark.
       const room = this.cap - this.size;
       const copy = n < room ? n : room;
-      for (let i = 0; i < copy; i++) {
-        this.ring[this.write] = s[i];
-        this.write = (this.write + 1) % this.cap;
+      if (copy <= 0) return;
+      // typed-array `.set()` is a memcpy; faster than a per-sample
+      // loop and cheaper for v8's GC.
+      if (this.write + copy <= this.cap) {
+        this.ring.set(s.subarray(0, copy), this.write);
+      } else {
+        const first = this.cap - this.write;
+        this.ring.set(s.subarray(0, first), this.write);
+        this.ring.set(s.subarray(first, copy), 0);
       }
+      this.write = (this.write + copy) % this.cap;
       this.size += copy;
-      this.requesting = false;
     };
     // Kick the main thread for the first fill so process() doesn't
     // start emitting silence before the first chunk arrives.
@@ -159,22 +168,31 @@ class KeysynthProcessor extends AudioWorkletProcessor {
     const channels = outputs[0];
     const out0 = channels[0];
     const n = out0.length;
-    let i = 0;
     if (this.size >= n) {
-      // Fast path: fully drain n samples in one go.
-      for (; i < n; i++) {
-        out0[i] = this.ring[this.read];
-        this.read = (this.read + 1) % this.cap;
+      // Fast path: fully drain n samples in one go via subarray + set.
+      if (this.read + n <= this.cap) {
+        out0.set(this.ring.subarray(this.read, this.read + n));
+      } else {
+        const first = this.cap - this.read;
+        out0.set(this.ring.subarray(this.read, this.cap));
+        out0.set(this.ring.subarray(0, n - first), first);
       }
+      this.read = (this.read + n) % this.cap;
       this.size -= n;
     } else {
       const have = this.size;
-      for (; i < have; i++) {
-        out0[i] = this.ring[this.read];
-        this.read = (this.read + 1) % this.cap;
+      if (have > 0) {
+        if (this.read + have <= this.cap) {
+          out0.set(this.ring.subarray(this.read, this.read + have));
+        } else {
+          const first = this.cap - this.read;
+          out0.set(this.ring.subarray(this.read, this.cap));
+          out0.set(this.ring.subarray(0, have - first), first);
+        }
+        this.read = (this.read + have) % this.cap;
       }
+      out0.fill(0, have);
       this.size = 0;
-      for (; i < n; i++) out0[i] = 0;
     }
     for (let c = 1; c < channels.length; c++) channels[c].set(out0);
     if (this.size < this.lowWatermark && !this.requesting) {
@@ -244,6 +262,13 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// (see `build_audio`) so the splash gate can flip from "Start"
         /// to the running UI as soon as the AudioContext is alive.
         audio: Rc<RefCell<Option<AudioHandle>>>,
+        /// Set true synchronously by `start_audio()` and cleared by the
+        /// async worklet handshake on success/failure. Stops a frantic
+        /// double-click on the splash button from spawning two parallel
+        /// `AudioContext` + `addModule` flows — the second one would
+        /// fight the first for the voice pool's render closures and
+        /// race on which `AudioHandle` lands in `audio`.
+        audio_starting: Rc<std::cell::Cell<bool>>,
         /// Async-populated error slot. `Rc<RefCell<…>>` because the
         /// `spawn_local` block writes after `start_audio()` has
         /// returned.
@@ -318,6 +343,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 })),
                 sample_rate: 0,
                 audio: Rc::new(RefCell::new(None)),
+                audio_starting: Rc::new(std::cell::Cell::new(false)),
                 audio_err: Rc::new(RefCell::new(None)),
                 mouse_down_note: None,
                 pc_held: 0,
@@ -332,9 +358,15 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
 
     impl WebApp {
         fn start_audio(&mut self) {
-            if self.audio.borrow().is_some() {
+            // Reject re-entry while a previous startup is still
+            // resolving. `audio.is_some()` only flips after the async
+            // worklet handshake completes, so a frantic double-click
+            // would otherwise spawn two parallel AudioContext + module
+            // loads racing on which `AudioHandle` lands in `audio`.
+            if self.audio.borrow().is_some() || self.audio_starting.get() {
                 return;
             }
+            self.audio_starting.set(true);
             // Clear any prior error so retries don't keep stale text.
             *self.audio_err.borrow_mut() = None;
             match build_audio(
@@ -342,6 +374,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 self.live.clone(),
                 self.audio.clone(),
                 self.audio_err.clone(),
+                self.audio_starting.clone(),
             ) {
                 Ok(sr) => {
                     self.sample_rate = sr;
@@ -362,6 +395,11 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         &format!("keysynth-web: audio start failed: {e}").into(),
                     );
                     *self.audio_err.borrow_mut() = Some(e);
+                    // `build_audio` already cleared `starting` on its
+                    // synchronous error path, but doing it here too is
+                    // a defence-in-depth so a future refactor that
+                    // forgets the inner reset still recovers.
+                    self.audio_starting.set(false);
                 }
             }
         }
@@ -867,10 +905,15 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         live: Arc<Mutex<LiveParams>>,
         slot: Rc<RefCell<Option<AudioHandle>>>,
         err_slot: Rc<RefCell<Option<String>>>,
+        starting: Rc<std::cell::Cell<bool>>,
     ) -> Result<u32, String> {
         let ctx_opts = web_sys::AudioContextOptions::new();
-        let ctx = web_sys::AudioContext::new_with_context_options(&ctx_opts)
-            .map_err(|e| format!("AudioContext::new: {e:?}"))?;
+        let ctx = web_sys::AudioContext::new_with_context_options(&ctx_opts).map_err(|e| {
+            // Synchronous failure: clear the in-flight flag too so the
+            // user can retry without reload.
+            starting.set(false);
+            format!("AudioContext::new: {e:?}")
+        })?;
         let sr = ctx.sample_rate() as u32;
 
         // Inline the worklet processor source as a Blob URL so we don't
@@ -909,10 +952,12 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         let render_state_cb = render_state.clone();
         let slot_cb = slot.clone();
         let err_cb = err_slot.clone();
+        let starting_cb = starting.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             if let Err(e) = wasm_bindgen_futures::JsFuture::from(module_promise).await {
                 *err_cb.borrow_mut() = Some(format!("worklet load failed: {e:?}"));
+                starting_cb.set(false);
                 return;
             }
             // Free the blob URL once the module is parsed.
@@ -941,11 +986,13 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 Ok(n) => n,
                 Err(e) => {
                     *err_cb.borrow_mut() = Some(format!("AudioWorkletNode::new: {e:?}"));
+                    starting_cb.set(false);
                     return;
                 }
             };
             if let Err(e) = node.connect_with_audio_node(ctx_clone.destination().as_ref()) {
                 *err_cb.borrow_mut() = Some(format!("node.connect: {e:?}"));
+                starting_cb.set(false);
                 return;
             }
 
@@ -957,6 +1004,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 Ok(p) => p,
                 Err(e) => {
                     *err_cb.borrow_mut() = Some(format!("port(): {e:?}"));
+                    starting_cb.set(false);
                     return;
                 }
             };
@@ -986,15 +1034,21 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         let lp = live_h.lock().unwrap();
                         (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
                     };
-                    let mut buf = vec![0.0_f32; chunk];
-                    {
+                    // Render directly into `state.mono` so the per-
+                    // request `Vec<f32>` allocation goes away —
+                    // `state.mono` is reused across requests and only
+                    // resizes when the chunk size changes. The
+                    // Float32Array copy below is the unavoidable
+                    // wasm→JS heap hop.
+                    let arr = {
                         let mut state = render_h.borrow_mut();
                         render_mono_chunk(
-                            &mut buf, &voices_h, master, wet, engine, mix_mode, &mut state,
+                            &voices_h, master, wet, engine, mix_mode, &mut state, chunk,
                         );
-                    }
-                    let arr = js_sys::Float32Array::new_with_length(chunk as u32);
-                    arr.copy_from(&buf);
+                        let a = js_sys::Float32Array::new_with_length(chunk as u32);
+                        a.copy_from(&state.mono);
+                        a
+                    };
                     let out_msg = js_sys::Object::new();
                     let _ = js_sys::Reflect::set(
                         &out_msg,
@@ -1007,15 +1061,35 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             );
             port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             // Some browsers leave the AudioContext suspended even after
-            // a user gesture; explicitly resume just in case.
-            if let Ok(p) = ctx_clone.resume() {
-                let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            // a user gesture; explicitly resume and treat a rejection
+            // as an audio start failure rather than silently marking
+            // the handle as ready (which would hide the splash gate
+            // and leave the user with a silent app, no recovery path
+            // short of a reload — Codex P1).
+            match ctx_clone.resume() {
+                Ok(p) => {
+                    if let Err(e) = wasm_bindgen_futures::JsFuture::from(p).await {
+                        *err_cb.borrow_mut() = Some(format!("AudioContext.resume rejected: {e:?}"));
+                        starting_cb.set(false);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    *err_cb.borrow_mut() = Some(format!("AudioContext.resume threw: {e:?}"));
+                    starting_cb.set(false);
+                    return;
+                }
             }
             *slot_cb.borrow_mut() = Some(AudioHandle {
                 _ctx: ctx_clone,
                 _node: node,
                 _on_message: on_message,
             });
+            // Clear the in-flight flag after the handle is published.
+            // Subsequent `start_audio()` calls early-return on
+            // `audio.is_some()` so the flag is just for the
+            // not-yet-resolved window.
+            starting_cb.set(false);
         });
 
         Ok(sr)
@@ -1032,20 +1106,21 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         limiter_gain: f32,
     }
 
-    /// Render `out.len()` mono samples into `out`. Same DSP graph as
-    /// the prior `audio_render` (voice mix → sym bank → denormal flush
-    /// → reverb → mix-mode tanh) minus the per-channel mirroring that
-    /// the worklet does on the JS side.
+    /// Render `frames` mono samples directly into `state.mono`. Same
+    /// DSP graph as the prior `audio_render` (voice mix → sym bank →
+    /// denormal flush → reverb → mix-mode tanh) minus the per-channel
+    /// mirroring that the worklet does on the JS side. Caller reads
+    /// the result from `state.mono` after this returns; no per-
+    /// request `Vec` allocation.
     fn render_mono_chunk(
-        out: &mut [f32],
         voices: &Arc<Mutex<Vec<Voice>>>,
         master: f32,
         reverb_wet: f32,
         engine: Engine,
         mix_mode: MixMode,
         state: &mut RenderState,
+        frames: usize,
     ) {
-        let frames = out.len();
         let mono = &mut state.mono;
         if mono.len() != frames {
             mono.resize(frames, 0.0);
@@ -1141,8 +1216,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 }
             }
         }
-
-        out.copy_from_slice(mono);
+        // Caller reads from `state.mono`; no copy back needed since we
+        // rendered in place.
     }
 
     // ===========================================================================
