@@ -45,21 +45,107 @@ mod imp {
         make_voice, midi_to_freq, Engine, LiveParams, MixMode, ModalLut, Voice, MODAL_LUT,
     };
 
-    // Engines exposed to the web UI. SfPiano / SfzPiano deliberately omitted —
-    // they need a real SoundFont / SFZ library on disk that we don't ship to
-    // GitHub Pages.
-    const ENGINES_FOR_WEB: &[(Engine, &str)] = &[
-        (Engine::PianoModal, "piano-modal"),
-        (Engine::PianoLite, "piano-lite"),
-        (Engine::PianoThick, "piano-thick"),
-        (Engine::Piano, "piano"),
-        (Engine::Piano5AM, "piano-5am"),
-        (Engine::Koto, "koto"),
-        (Engine::KsRich, "ks-rich"),
-        (Engine::Ks, "ks"),
-        (Engine::Sub, "sub"),
-        (Engine::Fm, "fm"),
-        (Engine::Square, "square"),
+    /// Engines exposed to the web UI. Three columns:
+    ///
+    ///   1. The `Engine` variant.
+    ///   2. A short user-facing label rendered in the dropdown / current
+    ///      selection. Friendlier than the CLI flag (`piano-modal` →
+    ///      `Piano (modal, SFZ-derived)`) so first-time visitors can
+    ///      pick a starting point without reading the source.
+    ///   3. A one-line description rendered under the dropdown to
+    ///      explain what the selected engine actually does.
+    ///
+    /// The order matters: the piano family lands at the top because
+    /// that's the demo's flagship and the web build defaults into the
+    /// first entry. Within each family we lead with the variant we
+    /// actively recommend (`PianoModal` for piano, `KsRich` for
+    /// plucked, etc.).
+    ///
+    /// SfPiano / SfzPiano deliberately omitted — they need a real
+    /// SoundFont / SFZ library on disk that we don't ship to GitHub
+    /// Pages.
+    const ENGINES_FOR_WEB: &[(Engine, &str, &str)] = &[
+        // ── Piano family ────────────────────────────────────────────
+        (
+            Engine::PianoModal,
+            "Piano (modal, SFZ-derived)",
+            "Parallel-bandpass projection: per-note partials + T60 + \
+             init_amp lifted from SFZ Salamander Grand recordings, \
+             32-mode bass extrapolation, 3-string ±0.7 cent detune, \
+             coloured-noise hammer impulse. Most reference-faithful.",
+        ),
+        (
+            Engine::PianoLite,
+            "Piano (light soundboard)",
+            "3-string KS + 12-mode 'lite' soundboard, no shared \
+             sympathetic bank. Tuned against SFZ Salamander C4 T60 \
+             vector — closest per-partial decay match across the \
+             physical-model variants.",
+        ),
+        (
+            Engine::PianoThick,
+            "Piano (thick soundboard)",
+            "7-string KS + 12-mode lite soundboard, fuller body \
+             radiation than `light`. Heavier but flabbier; nice for \
+             held chords.",
+        ),
+        (
+            Engine::Piano,
+            "Piano (KS-string base)",
+            "Original 3-string KS + asymmetric ms-scale hammer + \
+             frequency-dependent decay + sympathetic bank. The voice \
+             that all the variants above started from.",
+        ),
+        (
+            Engine::Piano5AM,
+            "Piano (5 AM snapshot)",
+            "Frozen snapshot of the perceptually-balanced state from \
+             commit 8f0df23 (3 strings, no soundboard, no sym bank). \
+             Kept reproducible so the morning's tone can be A/B'd \
+             against later builds.",
+        ),
+        // ── Plucked strings ─────────────────────────────────────────
+        (
+            Engine::Koto,
+            "Koto",
+            "Single-string KS with a sharp narrow plectrum injected \
+             at ~1/4 string length. Long sustain, minimal stiffness.",
+        ),
+        (
+            Engine::KsRich,
+            "Karplus-Strong (rich)",
+            "3-string unison detune + 1-pole allpass dispersion in the \
+             feedback loop. Stiffer, chorused — closer to a piano-ish \
+             sustain than the basic KS.",
+        ),
+        (
+            Engine::Ks,
+            "Karplus-Strong (basic)",
+            "Single string, white-noise-excited delay loop with a \
+             2-tap lowpass. Phase-1 physical model — thin plucked \
+             string.",
+        ),
+        // ── Classic synths ──────────────────────────────────────────
+        (
+            Engine::Sub,
+            "Subtractive (analog)",
+            "Sawtooth → state-variable lowpass with cutoff envelope + \
+             ADSR amp. Classic 1980s analog-synth voice.",
+        ),
+        (
+            Engine::Fm,
+            "FM (DX7-ish bell)",
+            "2-operator FM (sine carrier × sine modulator, ratio 14:1) \
+             with its own ADSR on the modulation index. Bell / \
+             e-piano flavour.",
+        ),
+        (
+            Engine::Square,
+            "Square wave (NES)",
+            "NES-style pulse + linear AR envelope. The cheapest \
+             reference tone — useful as a sanity check that the \
+             output path is alive.",
+        ),
     ];
 
     // PC keyboard → MIDI semitone offset within the current octave.
@@ -821,17 +907,18 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
 
             egui::TopBottomPanel::top("controls").show(ctx, |ui| {
                 let mut live = self.live.lock().unwrap();
+                let (current_label, current_desc) = ENGINES_FOR_WEB
+                    .iter()
+                    .find(|(e, _, _)| *e == live.engine)
+                    .map(|(_, l, d)| (*l, *d))
+                    .unwrap_or(("?", ""));
                 ui.horizontal(|ui| {
                     ui.label("engine:");
-                    let current_label = ENGINES_FOR_WEB
-                        .iter()
-                        .find(|(e, _)| *e == live.engine)
-                        .map(|(_, l)| *l)
-                        .unwrap_or("?");
                     egui::ComboBox::from_id_salt("engine")
                         .selected_text(current_label)
+                        .width(260.0)
                         .show_ui(ui, |ui| {
-                            for (eng, label) in ENGINES_FOR_WEB {
+                            for (eng, label, _desc) in ENGINES_FOR_WEB {
                                 ui.selectable_value(&mut live.engine, *eng, *label);
                             }
                         });
@@ -855,6 +942,17 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         });
                 });
                 drop(live);
+
+                // One-line description of the currently-selected
+                // engine, dimmed so it doesn't compete with the
+                // dropdown label visually but is reachable for users
+                // who don't recognise the names.
+                if !current_desc.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.add_space(56.0); // align under the dropdown
+                        ui.colored_label(egui::Color32::from_gray(160), current_desc);
+                    });
+                }
 
                 ui.horizontal(|ui| {
                     ui.label("octave:");
