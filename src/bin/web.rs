@@ -886,7 +886,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                                 format!("audio error: {err}"),
                             );
                             ui.label(
-                                egui::RichText::new("Click again to retry")
+                                egui::RichText::new("クリックでもう一度試す")
                                     .size(13.0)
                                     .color(egui::Color32::from_gray(170)),
                             );
@@ -894,8 +894,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         ui.add_space(40.0);
                         ui.label(
                             egui::RichText::new(
-                                "No MIDI keyboard? Use the on-screen piano (mouse) or PC keys\n\
-                                 zsxdcvgbhnjm = lower octave, qwertyui = upper octave",
+                                "MIDI鍵盤がない場合は画面の鍵盤 (マウス) または PCキー\n\
+                                 zsxdcvgbhnjm = 下のオクターブ, qwertyui = 上のオクターブ",
                             )
                             .size(12.0)
                             .color(egui::Color32::from_gray(150)),
@@ -956,7 +956,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         ui.add_space(4.0);
                         ui.colored_label(
                             egui::Color32::from_gray(170),
-                            "Click \"🎹 Retry MIDI\" to request USB-MIDI keyboard access again.",
+                            "「🎹 Retry MIDI」で USB-MIDI鍵盤入力を再要求できます",
                         );
                     });
                 }
@@ -1024,7 +1024,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "(Press if keys get stuck. Also fires automatically when the page loses focus.)",
+                            "（鍵盤入力が残ったときはこれを押す。フォーカスを外したときは自動的に発火）",
                         )
                         .small()
                         .color(egui::Color32::from_gray(160)),
@@ -1452,7 +1452,36 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 .start(
                     canvas,
                     eframe::WebOptions::default(),
-                    Box::new(|_cc| Ok(Box::new(WebApp::default()))),
+                    Box::new(|cc| {
+                        // egui's bundled `default_fonts` ships Latin
+                        // + emoji glyphs only; UI strings touched in
+                        // splash gate / MIDI hints / panic caption
+                        // include Japanese, so we register a small
+                        // subset of BIZ UDPGothic (~35 KB,
+                        // OFL-licensed) and prepend it to both font
+                        // families. That way Japanese chars find a
+                        // glyph in our font and Latin chars fall
+                        // through to egui's defaults — no missing-
+                        // glyph boxes, no bundle bloat.
+                        // Subset regen instructions: web/fonts/README.md.
+                        let mut fonts = egui::FontDefinitions::default();
+                        const JP_FONT: &[u8] =
+                            include_bytes!("../../web/fonts/BIZUDPGothic-Regular-subset.ttf");
+                        fonts.font_data.insert(
+                            "biz_udp_gothic_jp".to_owned(),
+                            egui::FontData::from_static(JP_FONT),
+                        );
+                        if let Some(family) =
+                            fonts.families.get_mut(&egui::FontFamily::Proportional)
+                        {
+                            family.insert(0, "biz_udp_gothic_jp".to_owned());
+                        }
+                        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                            family.push("biz_udp_gothic_jp".to_owned());
+                        }
+                        cc.egui_ctx.set_fonts(fonts);
+                        Ok(Box::new(WebApp::default()))
+                    }),
                 )
                 .await;
             if let Err(e) = result {
