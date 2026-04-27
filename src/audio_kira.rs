@@ -74,7 +74,19 @@ pub struct KiraEngine {
     voices: HashMap<u8, VoiceSoundHandle>,
     current_engine: Engine,
     current_modal_preset: ModalPreset,
-    sample_rate: u32,
+    /// Live sample rate, written by the probe `Effect` whenever Kira
+    /// reports a rate (`init` and `on_change_sample_rate`). Read by
+    /// `note_on` so each voice is constructed at the rate that's
+    /// actually feeding the platform output. Atomic because the
+    /// audio thread writes and the JS main thread reads.
+    ///
+    /// Crucial for KS-family voices: `PianoVoice` builds its delay
+    /// line with length `sr / freq` and chooses dispersion all-pass
+    /// coefficients per `sr`. Constructing a voice at the wrong sr
+    /// (e.g. the 48 kHz default before Kira reports the actual
+    /// 44.1 kHz the platform negotiated) gives audibly the wrong
+    /// pitch + completely different timbre.
+    sample_rate: Arc<AtomicU32>,
 }
 
 impl KiraEngine {
@@ -83,18 +95,20 @@ impl KiraEngine {
         let mut manager = AudioManager::<DefaultBackend>::new(AudioManagerSettings::default())
             .map_err(|err| format!("AudioManager::new failed: {err:?}"))?;
 
-        let sample_rate_cell = Arc::new(AtomicU32::new(0));
+        let sample_rate = Arc::new(AtomicU32::new(0));
         let mut bus_builder = TrackBuilder::new();
-        bus_builder.add_effect(SampleRateProbeBuilder::new(sample_rate_cell.clone()));
+        bus_builder.add_effect(SampleRateProbeBuilder::new(sample_rate.clone()));
         bus_builder.add_effect(BusEffectBuilder);
         let bus_track = manager
             .add_sub_track(bus_builder)
             .map_err(|err| format!("bus sub-track failed: {err:?}"))?;
 
-        let sample_rate = sample_rate_cell.load(Ordering::SeqCst);
-        if sample_rate == 0 {
-            return Err("Kira initialised, but no sample rate was reported".to_string());
-        }
+        // Don't error out on `sample_rate == 0` here. Kira may not
+        // call `Effect::init` until the audio thread spins up, which
+        // can be after `add_sub_track` returns. `note_on` re-reads
+        // the atomic and gates voice construction on a non-zero
+        // value; that guarantees voices use the actual platform sr,
+        // not our guess.
 
         let preset = ModalPreset::Default;
         preset.apply();
@@ -122,12 +136,33 @@ impl KiraEngine {
             return;
         }
 
+        // Re-read sr on every note_on so we always use whatever rate
+        // Kira's most recent `Effect::init` / `on_change_sample_rate`
+        // reported. Drop the request if the audio thread hasn't
+        // delivered a non-zero rate yet — better silence than a
+        // voice constructed at the wrong delay-line length.
+        let sr = self.sample_rate.load(Ordering::Relaxed);
+        if sr == 0 {
+            eprintln!(
+                "KiraEngine note_on: sample rate not yet reported by audio thread; \
+                 dropping note {note}"
+            );
+            return;
+        }
+
         if let Some(mut old_handle) = self.voices.remove(&note) {
             old_handle.stop(default_stop_tween());
         }
 
-        let sound_data =
-            VoiceSoundData::new(engine, self.sample_rate, midi_to_freq(note), velocity);
+        // One-shot diagnostic on the first note: log the actual sr +
+        // the engine that's about to play. Lets the user verify the
+        // platform sr in the browser console rather than guessing
+        // why the timbre differs from native.
+        if self.voices.is_empty() {
+            eprintln!("KiraEngine: first note_on with engine={:?} sr={sr}", engine);
+        }
+
+        let sound_data = VoiceSoundData::new(engine, sr, midi_to_freq(note), velocity);
         match self.bus_track.play(sound_data) {
             Ok(handle) => {
                 self.voices.insert(note, handle);
@@ -156,7 +191,7 @@ impl KiraEngine {
     }
 
     pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
+        self.sample_rate.load(Ordering::Relaxed)
     }
 }
 
