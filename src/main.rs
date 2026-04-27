@@ -28,14 +28,28 @@ use cpal::{SampleFormat, StreamConfig};
 use midir::{Ignore, MidiInput};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
+use keysynth::live_reload::Reloader;
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
 use keysynth::sympathetic::SympatheticBank;
 use keysynth::synth::{
-    make_voice, midi_to_freq, DashState, Engine, LiveParams, MixMode, ModalLut, Voice, VoiceImpl,
-    MODAL_LUT,
+    make_voice, midi_to_freq, set_live_voice_factory, DashState, Engine, LiveParams, MixMode,
+    ModalLut, Voice, VoiceImpl, MODAL_LUT,
 };
 use keysynth::ui;
+
+/// Process-global reloader handle. Set once by `main()` after spawning
+/// the watcher thread so the engine factory registered via
+/// `set_live_voice_factory` (a plain `fn`, no captures) can read it.
+static LIVE_RELOADER: std::sync::OnceLock<Reloader> = std::sync::OnceLock::new();
+
+/// Trampoline registered via `set_live_voice_factory`. Must be a plain
+/// `fn` (no captures) which is why we route through the `OnceLock`.
+fn live_voice_trampoline(sr: f32, freq: f32, vel: u8) -> Option<Box<dyn VoiceImpl + Send>> {
+    LIVE_RELOADER
+        .get()
+        .and_then(|r| r.make_voice(sr, freq, vel))
+}
 
 /// Shared rustysynth instance for `sf-piano`. `None` until `--sf2` is loaded
 /// (or always `None` for the other engines). Behind a Mutex because the
@@ -325,6 +339,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             eprintln!("keysynth: no residual LUT (bench-out/RESIDUAL/ not found)");
+        }
+    }
+
+    // -- Voice hot-reload (Engine::Live) --
+    //
+    // Spawns a watcher + builder pair that monitors `voices_live/src/`,
+    // rebuilds the cdylib on save, and atomically swaps the loaded DLL
+    // so the next note_on routes through the freshly-compiled code.
+    // Held notes finish with whatever code they were spawned under; the
+    // ABI safety story (Arc<Library> pinned by every voice until drop)
+    // is documented in `.dispatch/design.md` and `src/live_reload.rs`.
+    //
+    // Auto-discovery: look for `voices_live/Cargo.toml` next to the
+    // running binary first (release tarball case), then in the current
+    // working directory (cargo run / dev case). If neither is found,
+    // log a one-line warning and skip — Engine::Live then renders silence
+    // until a reloader is wired in (graceful degradation, not a hard
+    // failure, since the brief gates this behind a single Engine variant).
+    {
+        let candidates = [
+            std::env::current_dir().ok().map(|d| d.join("voices_live")),
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .map(|d| d.join("voices_live")),
+        ];
+        let voices_live_root = candidates
+            .into_iter()
+            .flatten()
+            .find(|p| p.join("Cargo.toml").exists());
+        match voices_live_root {
+            Some(root) => {
+                eprintln!("keysynth: live-reload watching {}", root.display());
+                let reloader = Reloader::spawn(root);
+                let _ = LIVE_RELOADER.set(reloader);
+                set_live_voice_factory(live_voice_trampoline);
+            }
+            None => {
+                eprintln!("keysynth: live-reload disabled (no voices_live/Cargo.toml found)");
+            }
         }
     }
 
@@ -893,6 +947,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         startup_sfz_path: args.sfz.clone(),
         startup_sf2_path: args.sf2.clone(),
         startup_engine: args.engine,
+        live_reloader: LIVE_RELOADER.get().cloned(),
     })?;
 
     eprintln!("keysynth: stopping");

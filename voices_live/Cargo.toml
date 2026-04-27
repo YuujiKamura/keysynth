@@ -1,0 +1,34 @@
+[package]
+name = "keysynth_voices_live"
+version = "0.1.0"
+edition = "2021"
+description = "Hot-reloadable voice DSP for keysynth. Edit src/lib.rs, save, hear it."
+publish = false
+
+[lib]
+# cdylib gives us a .dll / .so / .dylib with C ABI for libloading. The host
+# binary loads us through `keysynth_live_*` extern "C" symbols defined in
+# src/lib.rs.
+crate-type = ["cdylib"]
+
+[dependencies]
+# Intentionally none. Keeping the live crate dependency-free means
+# rebuilds are dominated by the user's edit, not by re-linking the
+# rest of the world. Audio primitives (sin, exp, etc.) come from
+# core / libstd.
+
+# Fast incremental rebuild: opt-level=1 vectorises the inner loop
+# enough to keep audio alive at 44.1 kHz without LTO penalty. dev
+# is the default profile cargo build picks; release is reserved
+# for the rare case the user wants to compare DSP perf.
+[profile.dev]
+opt-level = 1
+debug = 0
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = false
+incremental = true
+codegen-units = 16
