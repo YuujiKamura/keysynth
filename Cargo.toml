@@ -36,6 +36,7 @@ web = [
     "dep:console_error_panic_hook",
     "dep:js-sys",
     "dep:rustysynth",
+    "dep:kira",
     "cpal/wasm-bindgen",
 ]
 
@@ -51,6 +52,11 @@ serde_json = "1"
 midir = { version = "0.10", optional = true }
 ctrlc = { version = "3.4", optional = true }
 rustysynth = { version = "1.3", optional = true }
+# Kira: high-level Rust audio engine. Used as the web build's audio
+# backend (replaces hand-rolled AudioWorkletProcessor + chunk-render).
+# Internally uses cpal which on wasm32 talks to AudioContext via the
+# `cpal/wasm-bindgen` feature flag enabled by the `web` cargo feature.
+kira = { version = "0.12", default-features = false, features = ["cpal"], optional = true }
 hound = { version = "3.5", optional = true }
 rustfft = { version = "6", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
