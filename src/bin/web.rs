@@ -1075,9 +1075,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             match captured {
                 None => {
                     // Was idle → arm.
-                    *self.recording.borrow_mut() = Some(Vec::with_capacity(
-                        (self.sample_rate as usize) * 4,
-                    ));
+                    *self.recording.borrow_mut() =
+                        Some(Vec::with_capacity((self.sample_rate as usize) * 4));
                     self.push_event("record: ●".to_string());
                 }
                 Some(buf) => {
@@ -1089,11 +1088,9 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         n as f32 / sr as f32
                     ));
                     let wav_bytes = encode_wav_16bit_mono(&buf, sr);
-                    if let Err(e) = trigger_download(
-                        &wav_bytes,
-                        "keysynth-recording.wav",
-                        "audio/wav",
-                    ) {
+                    if let Err(e) =
+                        trigger_download(&wav_bytes, "keysynth-recording.wav", "audio/wav")
+                    {
                         web_sys::console::warn_1(
                             &format!("keysynth-web: download failed: {e}").into(),
                         );
@@ -2255,7 +2252,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         out.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate
         out.extend_from_slice(&2u16.to_le_bytes()); // block align
         out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-        // data sub-chunk.
+                                                     // data sub-chunk.
         out.extend_from_slice(b"data");
         out.extend_from_slice(&data_bytes.to_le_bytes());
         for &s in samples {

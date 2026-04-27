@@ -173,8 +173,8 @@ fn web_bus_pianomodal_default_chord_within_thresholds() {
     let mono = render_chord_through_bus(&[60, 64, 67], 1.5, Engine::PianoModal);
 
     let peak = mono.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-    let rms = (mono.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / mono.len() as f64)
-        .sqrt() as f32;
+    let rms =
+        (mono.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / mono.len() as f64).sqrt() as f32;
     let crest = peak / rms.max(1e-12);
 
     let peak_db = db(peak);
@@ -265,8 +265,8 @@ fn web_bus_old_master_3_plain_actually_does_clip() {
     }
 
     let peak = out.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-    let rms = (out.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / out.len() as f64)
-        .sqrt() as f32;
+    let rms =
+        (out.iter().map(|s| (*s as f64).powi(2)).sum::<f64>() / out.len() as f64).sqrt() as f32;
     let crest = peak / rms.max(1e-12);
     let peak_db = db(peak);
     let rms_db = db(rms);
