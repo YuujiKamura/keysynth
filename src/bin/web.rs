@@ -35,8 +35,6 @@ mod imp {
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    use cpal::StreamConfig;
     use eframe::egui;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
@@ -99,11 +97,103 @@ mod imp {
     // On-screen keyboard span in semitones (2 octaves + 1 = 25 keys).
     const KEYBOARD_SPAN: u8 = 25;
 
-    // Hold the cpal stream so it isn't dropped (which kills audio). Stream is
-    // not Send/Sync on wasm32 single-threaded, but `WebApp` only ever lives on
-    // the main JS thread, so plain ownership is fine.
+    // ---------------------------------------------------------------------
+    // Audio output via AudioWorklet
+    // ---------------------------------------------------------------------
+    //
+    // Earlier revisions used cpal's webaudio backend, which schedules a
+    // pair of AudioBufferSourceNodes and re-arms them via `setTimeout`
+    // polled on the main JS thread. That polling competes with egui paint
+    // for main-thread time, so a busy frame slips the next-buffer
+    // schedule and the output picks up clicks at every gap. The fix is
+    // to move the *output* side into an AudioWorkletProcessor, whose
+    // `process()` is driven from the audio thread at deterministic rate.
+    //
+    // Architecture:
+    //   - Main thread (Rust) renders mono samples in chunks and posts
+    //     them to the worklet via `port.postMessage`.
+    //   - Worklet (JS) holds a ring buffer; on each `process()` call
+    //     it copies samples out of the ring into the output channels.
+    //   - When the ring drops below half-full, the worklet posts a
+    //     `'need'` request back to the main thread, which renders one
+    //     more chunk and posts it. Closed-loop, no polling.
+    //
+    // No SharedArrayBuffer required, so this works on plain GitHub
+    // Pages without COOP/COEP service-worker shims. There's a
+    // postMessage hop per chunk, but with a generous ring (default
+    // 16384 frames ≈ 372 ms at 44.1 kHz) the main thread can stall
+    // for 100+ ms without the worklet ever running dry.
+    const WORKLET_PROCESSOR_JS: &str = r#"
+class KeysynthProcessor extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const opts = (options && options.processorOptions) || {};
+    this.cap = opts.ringCapacity || 16384;
+    this.ring = new Float32Array(this.cap);
+    this.read = 0;
+    this.write = 0;
+    this.size = 0;
+    this.requesting = false;
+    this.lowWatermark = Math.floor(this.cap / 2);
+    this.port.onmessage = (e) => {
+      const msg = e.data;
+      if (!msg || msg.type !== 'fill' || !msg.samples) return;
+      const s = msg.samples;
+      const n = s.length;
+      // Drop overflow rather than overwrite — caller respects watermark.
+      const room = this.cap - this.size;
+      const copy = n < room ? n : room;
+      for (let i = 0; i < copy; i++) {
+        this.ring[this.write] = s[i];
+        this.write = (this.write + 1) % this.cap;
+      }
+      this.size += copy;
+      this.requesting = false;
+    };
+    // Kick the main thread for the first fill so process() doesn't
+    // start emitting silence before the first chunk arrives.
+    this.port.postMessage({ type: 'need', want: this.cap });
+    this.requesting = true;
+  }
+  process(inputs, outputs, parameters) {
+    const channels = outputs[0];
+    const out0 = channels[0];
+    const n = out0.length;
+    let i = 0;
+    if (this.size >= n) {
+      // Fast path: fully drain n samples in one go.
+      for (; i < n; i++) {
+        out0[i] = this.ring[this.read];
+        this.read = (this.read + 1) % this.cap;
+      }
+      this.size -= n;
+    } else {
+      const have = this.size;
+      for (; i < have; i++) {
+        out0[i] = this.ring[this.read];
+        this.read = (this.read + 1) % this.cap;
+      }
+      this.size = 0;
+      for (; i < n; i++) out0[i] = 0;
+    }
+    for (let c = 1; c < channels.length; c++) channels[c].set(out0);
+    if (this.size < this.lowWatermark && !this.requesting) {
+      this.requesting = true;
+      this.port.postMessage({ type: 'need', want: this.cap - this.size });
+    }
+    return true;
+  }
+}
+registerProcessor('keysynth-processor', KeysynthProcessor);
+"#;
+
+    /// Live audio output handle. Holds the AudioContext + worklet node
+    /// + the closure that handles fill requests so JS-side references
+    /// stay alive for the page lifetime.
     struct AudioHandle {
-        _stream: cpal::Stream,
+        _ctx: web_sys::AudioContext,
+        _node: web_sys::AudioWorkletNode,
+        _on_message: Closure<dyn FnMut(web_sys::MessageEvent)>,
     }
 
     // ---------------------------------------------------------------------
@@ -150,8 +240,14 @@ mod imp {
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
         sample_rate: u32,
-        audio: Option<AudioHandle>,
-        audio_err: Option<String>,
+        /// `AudioHandle` is moved here by the async worklet handshake
+        /// (see `build_audio`) so the splash gate can flip from "Start"
+        /// to the running UI as soon as the AudioContext is alive.
+        audio: Rc<RefCell<Option<AudioHandle>>>,
+        /// Async-populated error slot. `Rc<RefCell<…>>` because the
+        /// `spawn_local` block writes after `start_audio()` has
+        /// returned.
+        audio_err: Rc<RefCell<Option<String>>>,
         /// Notes currently held by mouse/touch. PC keyboard tracking is via
         /// the separate `pc_held` set below — egui's `key_pressed` returns
         /// true on every browser KeyDown including auto-repeat, so we
@@ -221,8 +317,8 @@ mod imp {
                     mix_mode: MixMode::Plain,
                 })),
                 sample_rate: 0,
-                audio: None,
-                audio_err: None,
+                audio: Rc::new(RefCell::new(None)),
+                audio_err: Rc::new(RefCell::new(None)),
                 mouse_down_note: None,
                 pc_held: 0,
                 base_note: 48, // C3
@@ -236,14 +332,19 @@ mod imp {
 
     impl WebApp {
         fn start_audio(&mut self) {
-            if self.audio.is_some() {
+            if self.audio.borrow().is_some() {
                 return;
             }
-            match build_audio(self.voices.clone(), self.live.clone()) {
-                Ok((handle, sr)) => {
+            // Clear any prior error so retries don't keep stale text.
+            *self.audio_err.borrow_mut() = None;
+            match build_audio(
+                self.voices.clone(),
+                self.live.clone(),
+                self.audio.clone(),
+                self.audio_err.clone(),
+            ) {
+                Ok(sr) => {
                     self.sample_rate = sr;
-                    self.audio = Some(handle);
-                    self.audio_err = None;
                     web_sys::console::log_1(
                         &format!("keysynth-web: audio started @ {sr} Hz").into(),
                     );
@@ -260,7 +361,7 @@ mod imp {
                     web_sys::console::error_1(
                         &format!("keysynth-web: audio start failed: {e}").into(),
                     );
-                    self.audio_err = Some(e);
+                    *self.audio_err.borrow_mut() = Some(e);
                 }
             }
         }
@@ -333,7 +434,7 @@ mod imp {
         }
 
         fn note_on(&mut self, note: u8, velocity: u8) {
-            if self.audio.is_none() || self.sample_rate == 0 {
+            if self.audio.borrow().is_none() || self.sample_rate == 0 {
                 return;
             }
             let engine = self.live.lock().unwrap().engine;
@@ -544,7 +645,7 @@ mod imp {
             // the main-thread budget for cpal's polling.
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
-            if self.audio.is_some() {
+            if self.audio.borrow().is_some() {
                 self.handle_pc_keyboard(ctx);
             }
             // Drain the MIDI inbox every frame regardless of audio state.
@@ -569,7 +670,7 @@ mod imp {
             // permissions (autoplay → AudioContext, Web MIDI →
             // requestMIDIAccess). On retry / error the smaller "🎹
             // Retry MIDI" button lives inside the running UI.
-            if self.audio.is_none() {
+            if self.audio.borrow().is_none() {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(60.0);
@@ -597,7 +698,7 @@ mod imp {
                         if resp.clicked() {
                             self.start_audio();
                         }
-                        if let Some(err) = &self.audio_err {
+                        if let Some(err) = self.audio_err.borrow().as_ref() {
                             ui.add_space(20.0);
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 90, 90),
@@ -755,81 +856,197 @@ mod imp {
     // Audio thread setup
     // ===========================================================================
 
+    /// Synchronous wrapper that kicks off the async worklet handshake.
+    /// Returns the AudioContext sample rate immediately (the worklet
+    /// loads concurrently — no audible difference because `process()`
+    /// only fires after both `addModule` and the first `port` round
+    /// trip have resolved). The handle gets stashed into
+    /// `WebApp::audio` once the async block populates a shared slot.
     fn build_audio(
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
-    ) -> Result<(AudioHandle, u32), String> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
-            .ok_or_else(|| "no default output device".to_string())?;
-        let supported = device
-            .default_output_config()
-            .map_err(|e| format!("default output config: {e}"))?;
-        let sr = supported.sample_rate().0;
-        let channels = supported.channels();
-        let stream_cfg: StreamConfig = supported.into();
+        slot: Rc<RefCell<Option<AudioHandle>>>,
+        err_slot: Rc<RefCell<Option<String>>>,
+    ) -> Result<u32, String> {
+        let ctx_opts = web_sys::AudioContextOptions::new();
+        let ctx = web_sys::AudioContext::new_with_context_options(&ctx_opts)
+            .map_err(|e| format!("AudioContext::new: {e:?}"))?;
+        let sr = ctx.sample_rate() as u32;
 
-        let ir = reverb::synthetic_body_ir(sr);
-        let mut reverb = Reverb::new(ir);
-        let mut sympathetic = SympatheticBank::new_piano(sr as f32);
-        let mut mono: Vec<f32> = Vec::new();
-        let mut mono_compressed: Vec<f32> = Vec::new();
-        let mut limiter_gain: f32 = 1.0;
+        // Inline the worklet processor source as a Blob URL so we don't
+        // need to ship a separate JS file via Trunk. The browser caches
+        // the URL for the AudioContext's lifetime.
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from_str(WORKLET_PROCESSOR_JS));
+        let blob_opts = web_sys::BlobPropertyBag::new();
+        blob_opts.set_type("text/javascript");
+        let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &blob_opts)
+            .map_err(|e| format!("Blob::new: {e:?}"))?;
+        let url = web_sys::Url::create_object_url_with_blob(&blob)
+            .map_err(|e| format!("Url::createObjectURL: {e:?}"))?;
 
+        // Per-stream DSP state lives on the heap inside this Rc so the
+        // port `onmessage` closure can hold it without hitting
+        // `&mut self` lifetime issues.
+        let render_state = Rc::new(RefCell::new(RenderState {
+            reverb: Reverb::new(reverb::synthetic_body_ir(sr)),
+            sympathetic: SympatheticBank::new_piano(sr as f32),
+            mono: Vec::new(),
+            mono_compressed: Vec::new(),
+            limiter_gain: 1.0,
+        }));
+
+        let worklet = ctx
+            .audio_worklet()
+            .map_err(|e| format!("audio_worklet(): {e:?}"))?;
+        let module_promise = worklet
+            .add_module(&url)
+            .map_err(|e| format!("addModule: {e:?}"))?;
+
+        let ctx_clone = ctx.clone();
         let voices_cb = voices.clone();
         let live_cb = live.clone();
+        let render_state_cb = render_state.clone();
+        let slot_cb = slot.clone();
+        let err_cb = err_slot.clone();
 
-        let stream = device
-            .build_output_stream::<f32, _, _>(
-                &stream_cfg,
-                move |out: &mut [f32], _info| {
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = wasm_bindgen_futures::JsFuture::from(module_promise).await {
+                *err_cb.borrow_mut() = Some(format!("worklet load failed: {e:?}"));
+                return;
+            }
+            // Free the blob URL once the module is parsed.
+            let _ = web_sys::Url::revoke_object_url(&url);
+
+            let node_opts = web_sys::AudioWorkletNodeOptions::new();
+            // Stereo output (mirrored from mono inside the worklet so
+            // both ears get the same signal).
+            node_opts.set_output_channel_count(&js_sys::Array::of1(&JsValue::from_f64(2.0)));
+            // Pass a generous ring capacity via processor options so the
+            // worklet can buffer ~370 ms at 44.1 kHz, absorbing main-
+            // thread stalls without underrunning.
+            let proc_opts = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &proc_opts,
+                &JsValue::from_str("ringCapacity"),
+                &JsValue::from_f64(16384.0),
+            );
+            node_opts.set_processor_options(Some(&proc_opts));
+
+            let node = match web_sys::AudioWorkletNode::new_with_options(
+                &ctx_clone,
+                "keysynth-processor",
+                &node_opts,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    *err_cb.borrow_mut() = Some(format!("AudioWorkletNode::new: {e:?}"));
+                    return;
+                }
+            };
+            if let Err(e) = node.connect_with_audio_node(ctx_clone.destination().as_ref()) {
+                *err_cb.borrow_mut() = Some(format!("node.connect: {e:?}"));
+                return;
+            }
+
+            // Wire the port: every `'need'` request triggers a render
+            // pass on the main thread that produces `want` mono samples
+            // and posts them straight back. The worklet's ring buffer
+            // absorbs the postMessage round-trip latency.
+            let port = match node.port() {
+                Ok(p) => p,
+                Err(e) => {
+                    *err_cb.borrow_mut() = Some(format!("port(): {e:?}"));
+                    return;
+                }
+            };
+            let port_for_cb = port.clone();
+            let voices_h = voices_cb;
+            let live_h = live_cb;
+            let render_h = render_state_cb;
+            let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
+                move |ev: web_sys::MessageEvent| {
+                    let msg = ev.data();
+                    let kind = js_sys::Reflect::get(&msg, &JsValue::from_str("type"))
+                        .ok()
+                        .and_then(|v| v.as_string());
+                    if kind.as_deref() != Some("need") {
+                        return;
+                    }
+                    let want = js_sys::Reflect::get(&msg, &JsValue::from_str("want"))
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(1024.0) as usize;
+                    // Cap one render pass at 4096 frames so a huge
+                    // initial fill request doesn't stall the main
+                    // thread for tens of ms; the worklet will just ask
+                    // again next process() until full.
+                    let chunk = want.min(4096);
                     let (master, wet, engine, mix_mode) = {
-                        let lp = live_cb.lock().unwrap();
+                        let lp = live_h.lock().unwrap();
                         (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
                     };
-                    audio_render(
-                        out,
-                        channels,
-                        &voices_cb,
-                        master,
-                        wet,
-                        &mut mono,
-                        &mut mono_compressed,
-                        &mut reverb,
-                        &mut sympathetic,
-                        &mut limiter_gain,
-                        engine,
-                        mix_mode,
+                    let mut buf = vec![0.0_f32; chunk];
+                    {
+                        let mut state = render_h.borrow_mut();
+                        render_mono_chunk(
+                            &mut buf, &voices_h, master, wet, engine, mix_mode, &mut state,
+                        );
+                    }
+                    let arr = js_sys::Float32Array::new_with_length(chunk as u32);
+                    arr.copy_from(&buf);
+                    let out_msg = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &out_msg,
+                        &JsValue::from_str("type"),
+                        &JsValue::from_str("fill"),
                     );
+                    let _ = js_sys::Reflect::set(&out_msg, &JsValue::from_str("samples"), &arr);
+                    let _ = port_for_cb.post_message(&out_msg);
                 },
-                move |err| {
-                    web_sys::console::error_1(&format!("keysynth-web: stream error: {err}").into());
-                },
-                None,
-            )
-            .map_err(|e| format!("build_output_stream: {e}"))?;
+            );
+            port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+            // Some browsers leave the AudioContext suspended even after
+            // a user gesture; explicitly resume just in case.
+            if let Ok(p) = ctx_clone.resume() {
+                let _ = wasm_bindgen_futures::JsFuture::from(p).await;
+            }
+            *slot_cb.borrow_mut() = Some(AudioHandle {
+                _ctx: ctx_clone,
+                _node: node,
+                _on_message: on_message,
+            });
+        });
 
-        stream.play().map_err(|e| format!("stream.play: {e}"))?;
-        Ok((AudioHandle { _stream: stream }, sr))
+        Ok(sr)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn audio_render(
+    /// Per-stream DSP state owned by the audio render closure. Lives
+    /// behind `Rc<RefCell<…>>` so the JS-thread `onmessage` Closure can
+    /// hold it without `&mut self` plumbing.
+    struct RenderState {
+        reverb: Reverb,
+        sympathetic: SympatheticBank,
+        mono: Vec<f32>,
+        mono_compressed: Vec<f32>,
+        limiter_gain: f32,
+    }
+
+    /// Render `out.len()` mono samples into `out`. Same DSP graph as
+    /// the prior `audio_render` (voice mix → sym bank → denormal flush
+    /// → reverb → mix-mode tanh) minus the per-channel mirroring that
+    /// the worklet does on the JS side.
+    fn render_mono_chunk(
         out: &mut [f32],
-        channels: u16,
         voices: &Arc<Mutex<Vec<Voice>>>,
         master: f32,
         reverb_wet: f32,
-        mono: &mut Vec<f32>,
-        mono_compressed: &mut Vec<f32>,
-        reverb: &mut Reverb,
-        sympathetic: &mut SympatheticBank,
-        limiter_gain: &mut f32,
         engine: Engine,
         mix_mode: MixMode,
+        state: &mut RenderState,
     ) {
-        let frames = out.len() / channels as usize;
+        let frames = out.len();
+        let mono = &mut state.mono;
         if mono.len() != frames {
             mono.resize(frames, 0.0);
         } else {
@@ -849,23 +1066,16 @@ mod imp {
             const MIX: f32 = 0.3;
             for sample in mono.iter_mut() {
                 let drive = *sample;
-                let sym_out = sympathetic.process(drive, COUPLING);
+                let sym_out = state.sympathetic.process(drive, COUPLING);
                 *sample += sym_out * MIX;
             }
         } else {
             for _ in 0..mono.len() {
-                let _ = sympathetic.process(0.0, 0.0);
+                let _ = state.sympathetic.process(0.0, 0.0);
             }
         }
 
-        // NaN/Inf guard + denormal flush. wasm32 has no equivalent of
-        // x86 SSE FZ/DAZ, so high-Q resonator state (PianoModal's 96
-        // bandpass biquads decay exponentially toward zero) eventually
-        // crosses ~1e-38 into f32 denormal range. Native flushes those
-        // via MXCSR; on wasm we have to do it by hand or the per-sample
-        // arithmetic falls off a cliff (100×–1000× slower depending on
-        // the runtime), busting the audio deadline and producing
-        // intermittent or full silence specifically on PianoModal.
+        // NaN/Inf guard + denormal flush.
         for s in mono.iter_mut() {
             if !s.is_finite() {
                 *s = 0.0;
@@ -874,14 +1084,8 @@ mod imp {
             }
         }
 
-        // Reverb is direct convolution against a ~6600-sample IR
-        // (synthetic body @ 44.1 kHz). At 1024-frame buffers that's
-        // ~6.7 M MACs per audio callback. On wasm32 (no SIMD) this
-        // alone can dominate the per-callback budget. Skip when fully
-        // dry so users with limited CPU headroom still get clean
-        // PianoModal output; flip back on by raising the slider.
         if reverb_wet > 0.0 {
-            reverb.process(mono.as_mut_slice(), reverb_wet);
+            state.reverb.process(mono.as_mut_slice(), reverb_wet);
         }
 
         match mix_mode {
@@ -895,13 +1099,13 @@ mod imp {
                 const RELEASE: f32 = 0.0001;
                 for sample in mono.iter_mut() {
                     let abs_s = sample.abs();
-                    if abs_s > *limiter_gain {
-                        *limiter_gain += (abs_s - *limiter_gain) * ATTACK;
+                    if abs_s > state.limiter_gain {
+                        state.limiter_gain += (abs_s - state.limiter_gain) * ATTACK;
                     } else {
-                        *limiter_gain += (abs_s - *limiter_gain) * RELEASE;
+                        state.limiter_gain += (abs_s - state.limiter_gain) * RELEASE;
                     }
-                    let gr = if *limiter_gain > 1.0 {
-                        1.0 / *limiter_gain
+                    let gr = if state.limiter_gain > 1.0 {
+                        1.0 / state.limiter_gain
                     } else {
                         1.0
                     };
@@ -913,18 +1117,19 @@ mod imp {
                 const BETA: f32 = 0.6;
                 const ATTACK: f32 = 0.5;
                 const RELEASE: f32 = 0.0001;
+                let mono_compressed = &mut state.mono_compressed;
                 if mono_compressed.len() != mono.len() {
                     mono_compressed.resize(mono.len(), 0.0);
                 }
                 for (i, sample) in mono.iter().enumerate() {
                     let abs_s = sample.abs();
-                    if abs_s > *limiter_gain {
-                        *limiter_gain += (abs_s - *limiter_gain) * ATTACK;
+                    if abs_s > state.limiter_gain {
+                        state.limiter_gain += (abs_s - state.limiter_gain) * ATTACK;
                     } else {
-                        *limiter_gain += (abs_s - *limiter_gain) * RELEASE;
+                        state.limiter_gain += (abs_s - state.limiter_gain) * RELEASE;
                     }
-                    let gr = if *limiter_gain > 1.0 {
-                        1.0 / *limiter_gain
+                    let gr = if state.limiter_gain > 1.0 {
+                        1.0 / state.limiter_gain
                     } else {
                         1.0
                     };
@@ -937,12 +1142,7 @@ mod imp {
             }
         }
 
-        for (frame_idx, frame) in out.chunks_mut(channels as usize).enumerate() {
-            let s = mono[frame_idx];
-            for slot in frame.iter_mut() {
-                *slot = s;
-            }
-        }
+        out.copy_from_slice(mono);
     }
 
     // ===========================================================================
