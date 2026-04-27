@@ -124,7 +124,18 @@ pub fn decompose(signal: &[f32], sr: f32, f0_hz: f32, max_partials: usize) -> Ve
     let mut sorted_mag: Vec<f32> = mag.clone();
     sorted_mag.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let noise_floor = sorted_mag[sorted_mag.len() / 10].max(1e-12);
-    let snr_threshold = noise_floor * 100.0; // 40 dB
+    // SNR threshold lowered 40 → 20 dB so high-order partials (typically
+    // 30-50 dB below fundamental on real piano samples) are retained.
+    // Iter K (modal_lut max_partials 24 → 48) was a near no-op on
+    // residual_l2_aw because the extractor stopped at ~24 partials per
+    // mid note regardless of the cap — the extractor's own SNR gate
+    // dropped the high partials before max_partials applied. 20 dB
+    // (factor 10) keeps the gate above pure-noise bins (Rayleigh tail
+    // sits ~5-10 dB above floor for FFT_SIZE=4096) but recovers the
+    // -30 to -50 dBFS partial structure that drives the user-perceived
+    // "lo-fi" feel of modal voice (2-4k +2.5 dB deficit, very-hi
+    // surplus dominated by hammer noise rather than real partials).
+    let snr_threshold = noise_floor * 10.0;
 
     let bin_hz = sr / FFT_SIZE as f32;
     // ±50 cents window: factor of 2^(50/1200) ≈ 1.0293

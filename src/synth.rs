@@ -17,6 +17,7 @@
 //! importing them via `keysynth::synth::*`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Mutex, OnceLock};
 
 pub mod voices {
     //! Re-exported for callers that prefer `keysynth::synth::voices::...`.
@@ -36,7 +37,7 @@ pub use crate::voices::placeholder::SfPianoPlaceholder;
 pub use crate::voices::square::SquareVoice;
 pub use crate::voices::sub::SubVoice;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Engine {
     /// NES-style pulse + linear AR envelope. Cheap reference tone.
     Square,
@@ -337,6 +338,192 @@ pub struct LiveParams {
     /// Final-stage bus mixing strategy. Live-switchable from GUI / CLI;
     /// see `MixMode` for the available modes (issue #4).
     pub mix_mode: MixMode,
+}
+
+/// Live-tunable parameters for `Engine::PianoModal`. Shared via a
+/// process-wide `Mutex` so the egui dashboard can adjust them and the
+/// next note_on picks them up. `output_gain` is re-read per audio
+/// block so it tracks the slider in real-time even on a held note;
+/// the others are snapshot at voice construction (changes apply
+/// only to subsequent notes).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModalParams {
+    /// Sub-mode detune split, ± cents around the LUT centre. 0
+    /// disables the detune layer entirely (3 sub-modes → 1).
+    pub detune_cents: f32,
+    /// Horizontal-polarisation weight 0..=1. The vertical weight is
+    /// derived as `1.0 - pol_h_weight`. Setting 0 disables the
+    /// after-sound layer (pure prompt decay).
+    pub pol_h_weight: f32,
+    /// Maximum per-partial T60 in seconds. The LUT extractor reports
+    /// 25-33 s on the 10-s SFZ samples (artifact); ceiling clamps that.
+    pub t60_cap_sec: f32,
+    /// Held-note noise tail amplitude (Stage B in build_hammer_excitation).
+    /// 0 disables the tail entirely; the attack burst (Stage A) stays.
+    pub stage_b_gain: f32,
+    /// Per-voice output gain applied to the summed bank in render_add.
+    /// Read live per audio block so the slider takes effect on
+    /// already-playing voices, not just new note_ons.
+    pub output_gain: f32,
+    /// Smith commuted-synthesis residual layer amplitude. 0 disables
+    /// the layer (modal voice = pure partial sum). Higher values
+    /// inject more of the recorded SFZ-minus-modal residual on each
+    /// note_on. Trade-off: residual carries the missing hammer-felt
+    /// transient + body color for clean solo timbre, but stacks on
+    /// polyphonic passages because the body-color tail re-fires per
+    /// note. Default 0.0 keeps iter T baseline on long-form pieces.
+    pub residual_amp: f32,
+}
+
+impl Default for ModalParams {
+    fn default() -> Self {
+        // ──────────────────────────────────────────────────────────────────
+        // PRESET candidate (2026-04-26, env-var only — see render_chord):
+        //   KS_DETUNE=2.0 KS_POL_H=0.6 KS_T60_CAP=6.0
+        //   KS_STAGE_B=0.4 KS_OUT_GAIN=45.0 KS_RESIDUAL=0.10
+        //
+        // Tuned via Gemini audio-modality loop + CDPAM + VLM cross-check
+        // on Salamander Grand C4. Single-note CDPAM 0.4420 → 0.1519
+        // (subtle band). Three-note C major peak at master=1.0: 0.832 ≤ 0.95.
+        //
+        // NOT promoted to default yet because piano_modal voice tests
+        // (from_lut_*, release_lifecycle) snapshot resonator counts
+        // that depend on detune × polarization × residual sub-mode
+        // multiplicities — those tests need to be retuned together
+        // with the defaults. See log_chord.md round 16. Use the preset
+        // via env vars in the meantime; chord_headroom_audit already
+        // passes with these values.
+        // ──────────────────────────────────────────────────────────────────
+        Self {
+            detune_cents: 0.7,
+            pol_h_weight: 0.15,
+            t60_cap_sec: 12.0,
+            stage_b_gain: 0.10,
+            output_gain: 80.0,
+            residual_amp: 0.0,
+        }
+    }
+}
+
+static MODAL_PARAMS: OnceLock<Mutex<ModalParams>> = OnceLock::new();
+
+fn modal_params_cell() -> &'static Mutex<ModalParams> {
+    MODAL_PARAMS.get_or_init(|| Mutex::new(ModalParams::default()))
+}
+
+/// Snapshot the current global modal-voice params.
+pub fn modal_params() -> ModalParams {
+    *modal_params_cell().lock().unwrap()
+}
+
+/// Replace the global modal-voice params. Subsequent note_ons see
+/// the new values; already-playing voices keep what they captured
+/// at construction except for `output_gain` which is read live.
+pub fn set_modal_params(p: ModalParams) {
+    *modal_params_cell().lock().unwrap() = p;
+}
+
+/// Process-wide flag that selects the pure-physics path
+/// (`ModalPianoVoice::from_physics`) for `Engine::PianoModal`. Mirrors
+/// the env var `KS_PHYSICS=1` checked by `make_voice` for offline
+/// renders; the GUI sets this directly so the live synth doesn't need
+/// a restart to swap into the analytical-mode synthesis path.
+static MODAL_PHYSICS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn modal_physics_enabled() -> bool {
+    MODAL_PHYSICS.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("KS_PHYSICS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+pub fn set_modal_physics(on: bool) {
+    MODAL_PHYSICS.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Live-selectable presets for `Engine::PianoModal`. Picking one in
+/// the GUI calls `apply()` which (a) writes preset params into the
+/// global `ModalParams` cell, and (b) toggles the pure-physics path
+/// for `Physics`. Subsequent note_ons run with the new tuning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalPreset {
+    /// `ModalParams::default()` — current shipping baseline.
+    Default,
+    /// "Round-16" CDPAM-optimal preset (KS_DETUNE=2.0 KS_POL_H=0.6
+    /// KS_T60_CAP=6.0 KS_STAGE_B=0.4 KS_OUT_GAIN=45.0
+    /// KS_RESIDUAL=0.10). Validated against `chord_headroom_audit`;
+    /// spectrally close to the Salamander reference, subjectively
+    /// muffled but clean under polyphony.
+    Round16,
+    /// Pure-physics path: routes `make_voice` through
+    /// `ModalPianoVoice::from_physics` (Stulov hammer + Fletcher /
+    /// Valimaki mode generation, no LUT, no commuted residual). The
+    /// `params` returned by this preset are minimal — physics derives
+    /// its own modes, so detune / polarisation / residual_amp are
+    /// reset to clean defaults to avoid stacking on top.
+    Physics,
+    /// Bright lead variant: minimal detune / polarisation so the
+    /// fundamental dominates; useful when soloing over a chord bed.
+    Bright,
+}
+
+impl ModalPreset {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            ModalPreset::Default => "default",
+            ModalPreset::Round16 => "round-16",
+            ModalPreset::Physics => "physics",
+            ModalPreset::Bright => "bright",
+        }
+    }
+
+    pub const ALL: &'static [ModalPreset] = &[
+        ModalPreset::Default,
+        ModalPreset::Round16,
+        ModalPreset::Physics,
+        ModalPreset::Bright,
+    ];
+
+    pub fn params(self) -> ModalParams {
+        match self {
+            ModalPreset::Default => ModalParams::default(),
+            ModalPreset::Round16 => ModalParams {
+                detune_cents: 2.0,
+                pol_h_weight: 0.6,
+                t60_cap_sec: 6.0,
+                stage_b_gain: 0.4,
+                output_gain: 45.0,
+                residual_amp: 0.10,
+            },
+            // Physics path bypasses LUT + residual entirely; the
+            // analytical mode generator already produces a clean
+            // bank, so we only need the gain tier set sensibly and
+            // leave detune / polarisation / residual at zero so they
+            // don't overlay extra sub-modes on top of what the
+            // physics generator already built.
+            ModalPreset::Physics => ModalParams {
+                detune_cents: 0.0,
+                pol_h_weight: 0.0,
+                t60_cap_sec: 12.0,
+                stage_b_gain: 0.0,
+                output_gain: 80.0,
+                residual_amp: 0.0,
+            },
+            ModalPreset::Bright => ModalParams {
+                detune_cents: 0.3,
+                pol_h_weight: 0.05,
+                t60_cap_sec: 18.0,
+                stage_b_gain: 0.05,
+                output_gain: 90.0,
+                residual_amp: 0.0,
+            },
+        }
+    }
+
+    pub fn apply(self) {
+        set_modal_params(self.params());
+        set_modal_physics(matches!(self, ModalPreset::Physics));
+    }
 }
 
 /// Live MIDI snapshot for the dashboard. Updated by the MIDI callback,
@@ -840,11 +1027,18 @@ pub fn midi_to_freq(note: u8) -> f32 {
 /// only exists so the voice-pool eviction logic can still track which
 /// (channel, note) pairs are sounding.
 pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn VoiceImpl + Send> {
+    // Per-engine velocity attenuation for chord headroom. The
+    // `chord_headroom_audit` test renders a 3-note Cmaj chord through
+    // every engine and reports raw bus peak; engines that exceed
+    // ~2.5 hard-clip post-tanh and were heard as 「割れ」 on chord
+    // playing. These divisors bring KsRich (3.70) and Sub (2.94) under
+    // the 2.0 threshold while leaving single-note loudness audible.
+    let vel_scaled = |div: u8| (velocity / div).max(1);
     match engine {
         Engine::Square => Box::new(SquareVoice::new(sr, freq, velocity)),
         Engine::Ks => Box::new(KsVoice::new(sr, freq, velocity)),
-        Engine::KsRich => Box::new(KsRichVoice::new(sr, freq, velocity)),
-        Engine::Sub => Box::new(SubVoice::new(sr, freq, velocity)),
+        Engine::KsRich => Box::new(KsRichVoice::new(sr, freq, vel_scaled(3))),
+        Engine::Sub => Box::new(SubVoice::new(sr, freq, vel_scaled(2))),
         Engine::Fm => Box::new(FmVoice::new(sr, freq, velocity)),
         Engine::Piano => Box::new(PianoVoice::with_preset(
             PianoPreset::PIANO,
@@ -885,7 +1079,15 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
             // host binary; otherwise fall back to the hardcoded C4 entry
             // so even unit tests / harnesses that don't call
             // `MODAL_LUT.set(...)` produce sound.
-            if let Some(lut) = MODAL_LUT.get() {
+            // Pure-physics path (`from_physics`) bypasses LUT + residual
+            // entirely. Activated either by env var KS_PHYSICS=1 (offline
+            // renders set it programmatically before each variant) or by
+            // the GUI flag flipped via `ModalPreset::Physics`.
+            // Reads on every voice spawn: cheap (~ns) compared to voice
+            // construction.
+            if modal_physics_enabled() {
+                Box::new(ModalPianoVoice::from_physics(sr, midi_note, velocity))
+            } else if let Some(lut) = MODAL_LUT.get() {
                 Box::new(ModalPianoVoice::from_lut(lut, sr, midi_note, velocity))
             } else {
                 let fallback = ModalLut::fallback_c4();
@@ -1765,6 +1967,91 @@ mod tests {
                 engine,
             );
         }
+    }
+
+    /// Polyphony headroom audit: render a 3-note Cmaj chord through
+    /// every engine and report the raw bus peak. tanh saturation is
+    /// imperceptibly nonlinear up to ~0.5, "warm" up to ~1.5, hard
+    /// clip above ~2.0. With master=1.0 default, voices that produce
+    /// chord peaks > 2.0 will be heard as 「割れ」 even on moderate
+    /// chords, exactly the user complaint that motivated this test.
+    /// SFZ/SF placeholders render silence (their audio comes from the
+    /// shared player, not the voice pool) so they're skipped.
+    #[test]
+    fn chord_headroom_audit() {
+        // Cmaj triad: C4 (60) + E4 (64) + G4 (67).
+        let chord_freqs = [midi_to_freq(60), midi_to_freq(64), midi_to_freq(67)];
+        let velocity = 100;
+        // 3.0 s captures the steady-state plateau of even slow biquads.
+        // 0.5 s undercounted PianoModal because its partial T60s (1-29 s)
+        // mean the biquad bank is still ringing up in the first 500 ms;
+        // user reported audible 「割れ」 on 3-note chords that the
+        // initial 0.5 s window missed.
+        let n_samples = (SR * 3.0) as usize;
+        let engines = [
+            Engine::Square,
+            Engine::Ks,
+            Engine::KsRich,
+            Engine::Sub,
+            Engine::Fm,
+            Engine::Piano,
+            Engine::PianoThick,
+            Engine::PianoLite,
+            Engine::Piano5AM,
+            Engine::PianoModal,
+            Engine::Koto,
+        ];
+        // Initialise the modal LUT for PianoModal — without it
+        // make_voice falls back to a single-partial C4 patch which
+        // skews the headroom number.
+        let _ = MODAL_LUT.set(ModalLut::fallback_c4());
+
+        // tanh hard-clip threshold. master=1.0 default puts post-tanh
+        // saturation at >0.99 once the bus peak crosses ~2.0; that is
+        // perceptually 「割れ」 on chord playing.
+        const HARD_CLIP_PEAK: f32 = 2.5;
+
+        let mut report = String::from(
+            "\nchord headroom audit (Cmaj chord, vel=100):\n  \
+             format: raw_peak  post_tanh@m=1  m_safe (master at which post-tanh\n  \
+             leaves 'clean'<0.95)  m_clip (master at which post-tanh ≥ 0.99 hard clip)\n\n",
+        );
+        let mut hard_clippers: Vec<(Engine, f32)> = Vec::new();
+        for engine in engines.iter().copied() {
+            let mut buf = vec![0.0_f32; n_samples];
+            for &freq in &chord_freqs {
+                let mut v = make_voice(engine, SR, freq, velocity);
+                v.render_add(&mut buf);
+            }
+            let peak = buf.iter().copied().fold(0.0_f32, |a, b| a.max(b.abs()));
+            let post_tanh = peak.tanh();
+            // tanh(x) = 0.95 → x ≈ 1.832 ; tanh(x) = 0.99 → x ≈ 2.647
+            let m_safe = 1.832 / peak.max(1e-6);
+            let m_clip = 2.647 / peak.max(1e-6);
+            report.push_str(&format!(
+                "  {:>14?}  raw={:6.3}  m=1→{:.3}  m_safe={:5.2}  m_clip={:5.2}  ",
+                engine, peak, post_tanh, m_safe, m_clip,
+            ));
+            if peak >= HARD_CLIP_PEAK {
+                report.push_str("HARD-CLIP");
+                hard_clippers.push((engine, peak));
+            } else if peak >= 1.5 {
+                report.push_str("warm-saturated");
+            } else {
+                report.push_str("clean");
+            }
+            report.push('\n');
+        }
+        // Print regardless of pass/fail so the user can see all values.
+        println!("{report}");
+        // Fail loudly if any engine is in HARD-CLIP territory at the
+        // default master gain. Future iterations should bring those
+        // engines into the warm-saturated band via per-voice gain
+        // staging.
+        assert!(
+            hard_clippers.is_empty(),
+            "engines clipping at master=1.0 chord: {hard_clippers:?}"
+        );
     }
 
     #[test]

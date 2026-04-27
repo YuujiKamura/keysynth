@@ -47,7 +47,8 @@ mod imp {
     use keysynth::reverb::{self, Reverb};
     use keysynth::sympathetic::SympatheticBank;
     use keysynth::synth::{
-        make_voice, midi_to_freq, Engine, LiveParams, MixMode, ModalLut, Voice, MODAL_LUT,
+        make_voice, midi_to_freq, Engine, LiveParams, MixMode, ModalLut, ModalPreset, Voice,
+        MODAL_LUT,
     };
 
     /// Path of the GM SoundFont served alongside the wasm bundle. Trunk
@@ -226,6 +227,12 @@ mod imp {
         label: &'static str,
         category: VoiceCategory,
         engine: Engine,
+        /// `Engine::PianoModal` preset for the four `Modal (…)` slots.
+        /// Click handler calls `ModalPreset::apply()` which writes the
+        /// preset's `ModalParams` into the global cell read by every
+        /// subsequent `note_on` rendering through `ModalPianoVoice`.
+        /// `None` for non-modal slots (KS variants, synths, SF2).
+        modal_preset: Option<ModalPreset>,
         /// GM program for `Engine::SfPiano` slots; ignored otherwise.
         sf_program: u8,
         /// GM bank for `Engine::SfPiano` slots (0 = melodic, 128 =
@@ -248,13 +255,16 @@ mod imp {
     /// own PR.
     const WEB_VOICE_SLOTS: &[WebVoiceSlot] = &[
         // ── Piano family ────────────────────────────────────────────
-        // Modal preset variants. Same Engine, same audio today; once
-        // ModalPreset.apply() lands on main, each will write a
-        // distinct ModalParams set into MODAL_PARAMS on click.
+        // Modal preset variants. Each writes a distinct ModalParams
+        // set into MODAL_PARAMS on click via ModalPreset::apply, so
+        // the four entries produce audibly distinct sounds (Default
+        // = baseline, Round-16 = CDPAM-optimised muffled, Physics =
+        // pure Stulov+Valimaki path, Bright = minimal-detune lead).
         WebVoiceSlot {
             label: "Modal (default)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoModal,
+            modal_preset: Some(ModalPreset::Default),
             sf_program: 0,
             sf_bank: 0,
         },
@@ -262,6 +272,7 @@ mod imp {
             label: "Modal (Round-16)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoModal,
+            modal_preset: Some(ModalPreset::Round16),
             sf_program: 0,
             sf_bank: 0,
         },
@@ -269,6 +280,7 @@ mod imp {
             label: "Modal (Physics)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoModal,
+            modal_preset: Some(ModalPreset::Physics),
             sf_program: 0,
             sf_bank: 0,
         },
@@ -276,6 +288,7 @@ mod imp {
             label: "Modal (Bright)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoModal,
+            modal_preset: Some(ModalPreset::Bright),
             sf_program: 0,
             sf_bank: 0,
         },
@@ -284,6 +297,7 @@ mod imp {
             label: "KS Piano",
             category: VoiceCategory::Piano,
             engine: Engine::Piano,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -291,6 +305,7 @@ mod imp {
             label: "KS Piano (thick)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoThick,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -298,6 +313,7 @@ mod imp {
             label: "KS Piano (lite)",
             category: VoiceCategory::Piano,
             engine: Engine::PianoLite,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -305,6 +321,7 @@ mod imp {
             label: "KS Piano (5AM)",
             category: VoiceCategory::Piano,
             engine: Engine::Piano5AM,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -316,6 +333,7 @@ mod imp {
             label: "GeneralUser-GS (SF2 piano)",
             category: VoiceCategory::Piano,
             engine: Engine::SfPiano,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -324,6 +342,7 @@ mod imp {
             label: "Square",
             category: VoiceCategory::Synth,
             engine: Engine::Square,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -331,6 +350,7 @@ mod imp {
             label: "KS pluck",
             category: VoiceCategory::Synth,
             engine: Engine::Ks,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -338,6 +358,7 @@ mod imp {
             label: "KS rich",
             category: VoiceCategory::Synth,
             engine: Engine::KsRich,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -345,6 +366,7 @@ mod imp {
             label: "Sub (subtractive)",
             category: VoiceCategory::Synth,
             engine: Engine::Sub,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -352,6 +374,7 @@ mod imp {
             label: "FM bell",
             category: VoiceCategory::Synth,
             engine: Engine::Fm,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -359,6 +382,7 @@ mod imp {
             label: "Koto",
             category: VoiceCategory::Synth,
             engine: Engine::Koto,
+            modal_preset: None,
             sf_program: 0,
             sf_bank: 0,
         },
@@ -1023,6 +1047,14 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     lp.sf_program = slot.sf_program;
                     lp.sf_bank = slot.sf_bank;
                 }
+            }
+            // Modal preset apply: writes the preset's ModalParams
+            // into the global MODAL_PARAMS cell that ModalPianoVoice
+            // reads on every render_add, and toggles MODAL_PHYSICS
+            // for the Physics preset so make_voice routes through
+            // the pure-physics constructor.
+            if let Some(preset) = slot.modal_preset {
+                preset.apply();
             }
             if slot.engine == Engine::SfPiano {
                 if let Some(s) = self.synth.lock().unwrap().as_mut() {

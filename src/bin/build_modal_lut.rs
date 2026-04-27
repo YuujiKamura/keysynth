@@ -102,7 +102,7 @@ struct CliArgs {
 fn parse_args() -> Result<CliArgs, String> {
     let mut input_dir = PathBuf::from("bench-out/REF/sfz_salamander_multi");
     let mut output: Option<PathBuf> = None;
-    let mut max_partials: usize = 16;
+    let mut max_partials: usize = 48;
 
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;

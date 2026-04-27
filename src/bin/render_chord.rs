@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use hound::{SampleFormat, WavSpec, WavWriter};
 
 use keysynth::sfz::SfzPlayer;
-use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
+use keysynth::synth::{
+    make_voice, midi_to_freq, modal_params, set_modal_params, Engine, ModalLut, MODAL_LUT,
+};
 
 const SR: u32 = 44100;
 
@@ -265,6 +267,21 @@ fn render_keysynth(args: &Args) -> Result<(Vec<f32>, Vec<f32>), String> {
         let (lut, source) = ModalLut::auto_load(args.modal_lut_path.as_deref());
         eprintln!("render_chord: modal LUT source = {source}");
         let _ = MODAL_LUT.set(lut);
+        // Optional residual layer (Smith commuted synthesis). Loaded
+        // when bench-out/RESIDUAL/ exists. Silently skipped otherwise
+        // so legacy renders (and the `build_residual_ir.py` pipeline
+        // itself, which renders modal-only) keep working.
+        let res_dir = std::path::PathBuf::from("bench-out/RESIDUAL");
+        if res_dir.is_dir() {
+            if let Ok(rl) = keysynth::voices::piano_modal::ResidualLut::from_dir(&res_dir) {
+                eprintln!(
+                    "render_chord: residual LUT source = {} ({} entries)",
+                    rl.source,
+                    rl.entries.len(),
+                );
+                let _ = keysynth::voices::piano_modal::RESIDUAL_LUT.set(rl);
+            }
+        }
     }
     let total_samples = (args.duration_sec * SR as f32) as usize;
     let release_at = ((args.hold_sec * SR as f32) as usize).min(total_samples);
@@ -335,6 +352,43 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // Optional ModalParams override via env vars (one-shot tuning experiments).
+    {
+        let mut p = modal_params();
+        if let Ok(v) = std::env::var("KS_DETUNE") {
+            if let Ok(x) = v.parse() {
+                p.detune_cents = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KS_POL_H") {
+            if let Ok(x) = v.parse() {
+                p.pol_h_weight = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KS_T60_CAP") {
+            if let Ok(x) = v.parse() {
+                p.t60_cap_sec = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KS_STAGE_B") {
+            if let Ok(x) = v.parse() {
+                p.stage_b_gain = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KS_OUT_GAIN") {
+            if let Ok(x) = v.parse() {
+                p.output_gain = x;
+            }
+        }
+        if let Ok(v) = std::env::var("KS_RESIDUAL") {
+            if let Ok(x) = v.parse() {
+                p.residual_amp = x;
+            }
+        }
+        eprintln!("render_chord: ModalParams = {:?}", p);
+        set_modal_params(p);
+    }
 
     let (mut left, mut right) = match args.engine {
         Engine::SfzPiano => render_sfz(&args),
