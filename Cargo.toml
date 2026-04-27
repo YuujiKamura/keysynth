@@ -19,16 +19,18 @@ native = [
     "dep:image",
 ]
 
-# Web build: stripped to the modelling engines + on-screen keyboard. Drops
-# midir / rustysynth / hound / rustfft / image / sfz so the wasm bundle stays
-# small and so we don't try to compile native-only crates against
-# wasm32-unknown-unknown.
+# Web build: stripped to the modelling engines + on-screen keyboard. Pulls
+# in rustysynth so the SF2 (sf-piano) engine works on Pages too — the SF2
+# bytes are baked into the wasm via `include_bytes!`. Drops midir / hound /
+# rustfft / image / sfz (sample library) which are either native-only
+# crates (midir audio backends) or only used by offline analysis tools.
 web = [
     "dep:wasm-bindgen",
     "dep:wasm-bindgen-futures",
     "dep:web-sys",
     "dep:console_error_panic_hook",
     "dep:js-sys",
+    "dep:rustysynth",
     "cpal/wasm-bindgen",
 ]
 

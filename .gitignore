@@ -52,6 +52,9 @@ reference/*.wav
 **/*.sf2
 **/*.sf3
 **/*.sfz
+# Exception: the web demo build bundles a small GM SoundFont so Pages
+# can run the sf-piano engine without a separate fetch step. ~32 MB.
+!web/GeneralUser-GS.sf2
 **/*.dls
 # Compressed bundles users may drop in (sample packs, IR libraries)
 *.zip
