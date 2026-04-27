@@ -33,7 +33,7 @@ use crate::extract::t60::extract_t60;
 
 /// Number of partials to extract on each side before fitting B / T60.
 /// Matches the `extract_dump` debug helper for parity with pinned goldens.
-const MAX_PARTIALS: usize = 16;
+const MAX_PARTIALS: usize = 32;
 
 /// Onset window in milliseconds (matches the issue #3 brief).
 const ONSET_WINDOW_MS: u32 = 80;
