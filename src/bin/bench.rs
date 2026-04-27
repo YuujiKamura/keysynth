@@ -310,6 +310,7 @@ fn engine_slug(e: Engine) -> &'static str {
         Engine::PianoLite => "piano-lite",
         Engine::Piano5AM => "piano-5am",
         Engine::PianoModal => "piano-modal",
+        Engine::Live => "live",
     }
 }
 

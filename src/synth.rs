@@ -109,6 +109,16 @@ pub enum Engine {
     /// available the hardcoded C4 fallback (`ModalLut::fallback_c4`)
     /// keeps the voice audible at MIDI 60.
     PianoModal,
+    /// Hot-reloadable voice: routes note_on through the
+    /// `voices_live/` cdylib loaded by `crate::live_reload::Reloader`.
+    /// Edit `voices_live/src/lib.rs`, save, and the next note plays the
+    /// recompiled DSP. Held notes finish out with their original library
+    /// (each voice pins its own `Arc<Library>` until drop).
+    /// See `.dispatch/design.md` for the swap protocol + ABI safety.
+    /// Selecting this engine when no factory is loaded yet (initial
+    /// build pending or last build errored) produces silence; the GUI
+    /// side panel surfaces the current build status.
+    Live,
 }
 
 impl Engine {
@@ -1096,6 +1106,73 @@ pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn V
                 ))
             }
         }
+        Engine::Live => make_live_voice(sr, freq, velocity),
+    }
+}
+
+/// Construct a hot-reloaded voice via the registered live `Reloader`,
+/// or fall back to silence if no reloader is registered (web build,
+/// offline harness, initial build pending). The reloader hook is set
+/// by `main.rs` after starting the watcher; offline / wasm callers
+/// never set it and just see a silent placeholder.
+fn make_live_voice(sr: f32, freq: f32, velocity: u8) -> Box<dyn VoiceImpl + Send> {
+    #[cfg(feature = "native")]
+    {
+        if let Some(hook) = LIVE_VOICE_FACTORY.get() {
+            if let Some(v) = hook(sr, freq, velocity) {
+                return v;
+            }
+        }
+    }
+    let _ = (freq, velocity);
+    Box::new(SilentVoice {
+        // 50 ms release: short enough that the pool evicts the silent
+        // placeholder quickly when the note ends, but long enough to
+        // avoid a click if a real factory loads mid-note.
+        env: ReleaseEnvelope::new(0.05, sr),
+    })
+}
+
+/// Process-global hook that lets the host crate register its
+/// `live_reload::Reloader::make_voice` without `synth.rs` having to
+/// depend on the native-only `live_reload` module. `main.rs` calls
+/// `set_live_voice_factory` once at startup; subsequent calls are
+/// rejected (the OnceLock is single-shot). The signature returns
+/// `Option` so a registered hook can still produce silence when its
+/// internal factory is `None` (initial build pending / errored).
+#[cfg(feature = "native")]
+pub type LiveVoiceFactory = fn(sr: f32, freq: f32, vel: u8) -> Option<Box<dyn VoiceImpl + Send>>;
+
+#[cfg(feature = "native")]
+static LIVE_VOICE_FACTORY: OnceLock<LiveVoiceFactory> = OnceLock::new();
+
+/// Register the live-voice factory hook (host-side). Idempotent in
+/// effect: if already set, the new value is ignored. Web builds skip
+/// this entirely.
+#[cfg(feature = "native")]
+pub fn set_live_voice_factory(f: LiveVoiceFactory) {
+    let _ = LIVE_VOICE_FACTORY.set(f);
+}
+
+/// Silent fallback voice for `Engine::Live` when no reloader is
+/// registered. Renders nothing, decays via a short ReleaseEnvelope so
+/// the voice pool eventually evicts it.
+struct SilentVoice {
+    env: ReleaseEnvelope,
+}
+
+impl VoiceImpl for SilentVoice {
+    fn render_add(&mut self, buf: &mut [f32]) {
+        // Step the envelope per-sample so is_done eventually trips.
+        for _ in buf {
+            self.env.step();
+        }
+    }
+    fn release_env(&self) -> Option<&ReleaseEnvelope> {
+        Some(&self.env)
+    }
+    fn release_env_mut(&mut self) -> Option<&mut ReleaseEnvelope> {
+        Some(&mut self.env)
     }
 }
 
