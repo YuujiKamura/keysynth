@@ -246,7 +246,6 @@ fn run(args: &CliArgs) -> Result<ModalLut, String> {
         );
     }
 
-
     let rendered_template = format!(
         "{}/note_NN.wav",
         args.input_dir.display().to_string().replace('\\', "/")
