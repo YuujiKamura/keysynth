@@ -552,19 +552,68 @@ mod imp {
                         if ui.button("retry").clicked() {
                             self.start_audio();
                         }
-                    } else if ui.button("Start audio").clicked() {
-                        self.start_audio();
+                    } else {
+                        // Big, coloured action button so first-time
+                        // visitors can't miss it. Browser autoplay
+                        // policy refuses to start the AudioContext
+                        // until they click.
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("▶ Start audio")
+                                    .size(18.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(40, 120, 200))
+                            .min_size(egui::vec2(140.0, 28.0)),
+                        );
+                        if resp.clicked() {
+                            self.start_audio();
+                        }
                     }
                     ui.separator();
-                    ui.label(format!("MIDI: {}", self.midi_status.borrow()));
-                    if !self.midi_requested.get() && ui.button("Connect MIDI").clicked() {
-                        // Browser autoplay-style gating: requestMIDIAccess
-                        // also wants a user gesture to surface the
-                        // permission prompt, so bind it to a button click
-                        // rather than auto-firing on page load.
-                        self.request_midi();
+                    if self.midi_requested.get() {
+                        // Already attempted (in-flight or succeeded) —
+                        // status label communicates state.
+                        ui.label(format!("MIDI: {}", self.midi_status.borrow()));
+                    } else {
+                        // Same prominent treatment as Start audio so
+                        // it's clear MIDI input also needs an explicit
+                        // user gesture (browser permission prompt).
+                        let resp = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("🎹 Connect MIDI keyboard")
+                                    .size(16.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(egui::Color32::from_rgb(180, 90, 40))
+                            .min_size(egui::vec2(220.0, 28.0)),
+                        );
+                        if resp.clicked() {
+                            // Browser autoplay-style gating:
+                            // requestMIDIAccess also wants a user
+                            // gesture to surface the permission prompt.
+                            self.request_midi();
+                        }
                     }
                 });
+                // One-line hint below the action row so first-time
+                // visitors know which buttons do what without having
+                // to read the source.
+                if self.audio.is_none() || !self.midi_requested.get() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        let mut hints: Vec<&str> = Vec::new();
+                        if self.audio.is_none() {
+                            hints.push("①「▶ Start audio」を押すと音が出ます");
+                        }
+                        if !self.midi_requested.get() {
+                            hints.push("②「🎹 Connect MIDI keyboard」で USB-MIDI 鍵盤入力を有効化");
+                        }
+                        ui.colored_label(egui::Color32::from_gray(170), hints.join("　／　"));
+                    });
+                }
             });
 
             egui::TopBottomPanel::top("controls").show(ctx, |ui| {
