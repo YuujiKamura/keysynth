@@ -533,9 +533,16 @@ mod imp {
 
     impl eframe::App for WebApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Continuous repaint so the on-screen keyboard reflects PC-key
-            // and audio state immediately.
-            ctx.request_repaint();
+            // Repaint at 30 fps rather than the implicit 60 fps from a
+            // bare `request_repaint()`. The cpal webaudio backend on
+            // wasm32 polls `setTimeout` for the next AudioBufferSource
+            // schedule on the same JS event loop egui paints from, so
+            // a busy 60 fps repaint loop directly steals scheduling
+            // slack from the audio thread → audible clicks at buffer
+            // boundaries. 30 fps is more than enough for the on-screen
+            // keyboard's "active" highlight while leaving roughly half
+            // the main-thread budget for cpal's polling.
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
 
             if self.audio.is_some() {
                 self.handle_pc_keyboard(ctx);
