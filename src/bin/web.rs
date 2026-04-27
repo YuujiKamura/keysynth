@@ -110,8 +110,18 @@ mod imp {
         audio: Option<AudioHandle>,
         audio_err: Option<String>,
         /// Notes currently held by mouse/touch. PC keyboard tracking is via
-        /// egui's per-frame key state, not this set.
+        /// the separate `pc_held` set below — egui's `key_pressed` returns
+        /// true on every browser KeyDown including auto-repeat, so we
+        /// track our own edge state instead.
         mouse_down_note: Option<u8>,
+        /// MIDI notes the PC keyboard is currently holding down, packed
+        /// as a 128-bit bitset (one bit per MIDI note 0..=127). Edge
+        /// transitions (bit set → note_on, bit cleared → note_off) drive
+        /// the voice pool so a held key produces ONE voice, not a stream
+        /// of re-triggered voices on each browser auto-repeat event.
+        /// Bitset over `HashSet<u8>` avoids per-frame heap traffic in
+        /// the egui input loop.
+        pc_held: u128,
         /// Base MIDI note for the leftmost on-screen key. Defaults to C3 (48).
         base_note: u8,
         /// Status string for Web MIDI (e.g. "not requested" / "connected: ..."
@@ -131,17 +141,27 @@ mod imp {
             Self {
                 voices: Arc::new(Mutex::new(Vec::with_capacity(32))),
                 live: Arc::new(Mutex::new(LiveParams {
-                    master: 1.5,
+                    // Match native defaults (main.rs::Args::default). 1.5
+                    // was too low for `Engine::PianoModal`, whose 3-detune
+                    // resonator bank produces per-sample peaks ~10x smaller
+                    // than KS / square / sub voices; under master=1.5 +
+                    // ParallelComp the PianoModal bus sat below audibility
+                    // while every other engine still saturated tanh.
+                    master: 3.0,
                     engine: Engine::PianoModal,
                     reverb_wet: 0.25,
                     sf_program: 0,
                     sf_bank: 0,
-                    mix_mode: MixMode::ParallelComp,
+                    // Plain tanh matches native default and avoids the
+                    // ParallelComp limiter swallowing PianoModal's already
+                    // low-amplitude bus into silence on the first hit.
+                    mix_mode: MixMode::Plain,
                 })),
                 sample_rate: 0,
                 audio: None,
                 audio_err: None,
                 mouse_down_note: None,
+                pc_held: 0,
                 base_note: 48, // C3
                 midi_status: "not requested".to_string(),
             }
@@ -205,20 +225,51 @@ mod imp {
             }
         }
 
-        /// Process PC keyboard input via egui's per-frame input snapshot.
-        /// Tracks key edges (just_pressed → note_on, just_released → note_off).
+        /// Process PC keyboard input. Two failure modes to dodge:
+        ///
+        ///   1. Browsers fire OS auto-repeat KeyDown events while a key is
+        ///      held, and `egui::InputState::key_pressed` returns true on
+        ///      each one — a held `z` plays as a fast trill instead of a
+        ///      sustained tone.
+        ///   2. A `keys_down` snapshot misses any tap that begins and ends
+        ///      between two UI frames (low-FPS spike or short stab) — the
+        ///      note never sounds at all.
+        ///
+        /// Stay event-based (`key_pressed` / `key_released`) so transient
+        /// taps survive, but filter via our own `pc_held` set: `note_on`
+        /// only fires when the note isn't already in the held-set, which
+        /// suppresses auto-repeat without dropping any genuine event.
         fn handle_pc_keyboard(&mut self, ctx: &egui::Context) {
+            // Bounded by KEYBOARD_SPAN (=25) so a stack-sized smallvec
+            // would also work, but Vec::new() with no pushes doesn't
+            // allocate, and most frames push 0-1 entries.
+            let mut to_on: Vec<u8> = Vec::new();
+            let mut to_off: Vec<u8> = Vec::new();
             ctx.input(|i| {
                 for &(key, semi) in PC_KEYMAP {
                     let note = (self.base_note as i32 + semi).clamp(0, 127) as u8;
-                    if i.key_pressed(key) {
-                        self.note_on(note, 100);
+                    let bit = 1u128 << note;
+                    if i.key_released(key) && (self.pc_held & bit) != 0 {
+                        self.pc_held &= !bit;
+                        to_off.push(note);
                     }
-                    if i.key_released(key) {
-                        self.note_off(note);
+                    // `(self.pc_held & bit) == 0` — only fire note_on if
+                    // the bit isn't already set. Browser KeyDown
+                    // auto-repeats while a key is held arrive as
+                    // `key_pressed = true` on every frame, but the bit
+                    // is already set from the first press so we skip.
+                    if i.key_pressed(key) && (self.pc_held & bit) == 0 {
+                        self.pc_held |= bit;
+                        to_on.push(note);
                     }
                 }
             });
+            for note in to_off {
+                self.note_off(note);
+            }
+            for note in to_on {
+                self.note_on(note, 100);
+            }
         }
 
         fn draw_on_screen_keyboard(&mut self, ui: &mut egui::Ui) {
