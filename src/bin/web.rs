@@ -89,115 +89,107 @@ mod imp {
     /// Engines exposed to the web UI. Three columns:
     ///
     ///   1. The `Engine` variant.
-    ///   2. A short user-facing label rendered in the dropdown / current
-    ///      selection. Friendlier than the CLI flag (`piano-modal` →
-    ///      `Piano (modal, SFZ-derived)`) so first-time visitors can
-    ///      pick a starting point without reading the source.
-    ///   3. A one-line description rendered under the dropdown to
-    ///      explain what the selected engine actually does.
+    ///   2. A short CLI-style label (matches `src/main.rs` `--engine`
+    ///      argument values: "square", "ks-rich", "piano-modal", …)
+    ///      so the row of selectable labels stays compact across the
+    ///      full engine list and the labels are A/B comparable with
+    ///      the native build's flags.
+    ///   3. A one-line description rendered under the row to explain
+    ///      what the *currently selected* engine actually does.
     ///
-    /// The order matters: the piano family lands at the top because
-    /// that's the demo's flagship and the web build defaults into the
-    /// first entry. Within each family we lead with the variant we
-    /// actively recommend (`PianoModal` for piano, `KsRich` for
-    /// plucked, etc.).
-    ///
-    /// SfzPiano deliberately omitted — it needs the multi-GB Salamander
-    /// Grand V3 SFZ library on disk that we can't ship to Pages.
-    /// `SfPiano` ships because the GM SoundFont is small enough (~32 MB)
-    /// to ship as a static asset alongside the wasm and fetch on
-    /// demand (see `fetch_and_load_sf2`); the wasm itself stays small
-    /// (~5 MB) so first-paint isn't blocked by the SF2 download.
+    /// Order mirrors the native `ENGINE_CHOICES` (`src/ui.rs:420`).
+    /// `SfzPiano` deliberately omitted — multi-GB sample bank we can't
+    /// ship to Pages. `SfPiano` ships because the GM SoundFont is
+    /// small enough (~32 MB) to fetch as a static asset alongside the
+    /// wasm; the wasm itself stays small (~5 MB) so first-paint isn't
+    /// blocked by the SF2 download (see `fetch_and_load_sf2`).
     const ENGINES_FOR_WEB: &[(Engine, &str, &str)] = &[
-        // ── Piano family ────────────────────────────────────────────
         (
-            Engine::SfPiano,
-            "Piano (SF2 sampled, GeneralUser GS)",
-            "Real recorded piano samples played by rustysynth from the \
-             bundled GeneralUser-GS SoundFont (program 0 = Acoustic \
-             Grand). Closest match to the native build's `--engine \
-             sf-piano`; the modal/KS engines below are pure DSP for \
-             comparison.",
+            Engine::Square,
+            "square",
+            "NES-style pulse + linear AR envelope. The cheapest \
+             reference tone — useful as a sanity check that the \
+             output path is alive.",
         ),
         (
-            Engine::PianoModal,
-            "Piano (modal, SFZ-derived)",
-            "Parallel-bandpass projection: per-note partials + T60 + \
-             init_amp lifted from SFZ Salamander Grand recordings, \
-             32-mode bass extrapolation, 3-string ±0.7 cent detune, \
-             coloured-noise hammer impulse. Most reference-faithful.",
+            Engine::Ks,
+            "ks",
+            "Single string, white-noise-excited delay loop with a \
+             2-tap lowpass. Phase-1 physical model — thin plucked \
+             string.",
+        ),
+        (
+            Engine::KsRich,
+            "ks-rich",
+            "3-string unison detune + 1-pole allpass dispersion in the \
+             feedback loop. Stiffer, chorused — closer to a piano-ish \
+             sustain than the basic KS.",
+        ),
+        (
+            Engine::Piano,
+            "piano",
+            "Original 3-string KS + asymmetric ms-scale hammer + \
+             frequency-dependent decay + sympathetic bank. The voice \
+             that all the variants above started from.",
+        ),
+        (
+            Engine::PianoThick,
+            "piano-thick",
+            "7-string KS + 12-mode lite soundboard, fuller body \
+             radiation than `lite`. Heavier but flabbier; nice for \
+             held chords.",
         ),
         (
             Engine::PianoLite,
-            "Piano (light soundboard)",
+            "piano-lite",
             "3-string KS + 12-mode 'lite' soundboard, no shared \
              sympathetic bank. Tuned against SFZ Salamander C4 T60 \
              vector — closest per-partial decay match across the \
              physical-model variants.",
         ),
         (
-            Engine::PianoThick,
-            "Piano (thick soundboard)",
-            "7-string KS + 12-mode lite soundboard, fuller body \
-             radiation than `light`. Heavier but flabbier; nice for \
-             held chords.",
-        ),
-        (
-            Engine::Piano,
-            "Piano (KS-string base)",
-            "Original 3-string KS + asymmetric ms-scale hammer + \
-             frequency-dependent decay + sympathetic bank. The voice \
-             that all the variants above started from.",
-        ),
-        (
             Engine::Piano5AM,
-            "Piano (5 AM snapshot)",
+            "piano-5am",
             "Frozen snapshot of the perceptually-balanced state from \
              commit 8f0df23 (3 strings, no soundboard, no sym bank). \
              Kept reproducible so the morning's tone can be A/B'd \
              against later builds.",
         ),
-        // ── Plucked strings ─────────────────────────────────────────
+        (
+            Engine::PianoModal,
+            "piano-modal",
+            "Parallel-bandpass projection: per-note partials + T60 + \
+             init_amp lifted from SFZ Salamander Grand recordings, \
+             32-mode bass extrapolation, 3-string ±0.7 cent detune, \
+             coloured-noise hammer impulse. Most reference-faithful \
+             of the modelling engines.",
+        ),
         (
             Engine::Koto,
-            "Koto",
+            "koto",
             "Single-string KS with a sharp narrow plectrum injected \
              at ~1/4 string length. Long sustain, minimal stiffness.",
         ),
         (
-            Engine::KsRich,
-            "Karplus-Strong (rich)",
-            "3-string unison detune + 1-pole allpass dispersion in the \
-             feedback loop. Stiffer, chorused — closer to a piano-ish \
-             sustain than the basic KS.",
-        ),
-        (
-            Engine::Ks,
-            "Karplus-Strong (basic)",
-            "Single string, white-noise-excited delay loop with a \
-             2-tap lowpass. Phase-1 physical model — thin plucked \
-             string.",
-        ),
-        // ── Classic synths ──────────────────────────────────────────
-        (
             Engine::Sub,
-            "Subtractive (analog)",
+            "sub",
             "Sawtooth → state-variable lowpass with cutoff envelope + \
              ADSR amp. Classic 1980s analog-synth voice.",
         ),
         (
             Engine::Fm,
-            "FM (DX7-ish bell)",
+            "fm",
             "2-operator FM (sine carrier × sine modulator, ratio 14:1) \
              with its own ADSR on the modulation index. Bell / \
              e-piano flavour.",
         ),
         (
-            Engine::Square,
-            "Square wave (NES)",
-            "NES-style pulse + linear AR envelope. The cheapest \
-             reference tone — useful as a sanity check that the \
-             output path is alive.",
+            Engine::SfPiano,
+            "sf-piano",
+            "Real recorded samples played by rustysynth from the \
+             bundled GeneralUser-GS SoundFont. Pick a GM 128 patch in \
+             the left panel; closest match to the native build's \
+             `--engine sf-piano`.",
         ),
     ];
 
@@ -1229,29 +1221,29 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
 
             egui::TopBottomPanel::top("controls").show(ctx, |ui| {
                 let mut live = self.live.lock().unwrap();
-                let (current_label, current_desc) = ENGINES_FOR_WEB
+                let current_desc = ENGINES_FOR_WEB
                     .iter()
                     .find(|(e, _, _)| *e == live.engine)
-                    .map(|(_, l, d)| (*l, *d))
-                    .unwrap_or(("?", ""));
+                    .map(|(_, _, d)| *d)
+                    .unwrap_or("");
+
+                // Master + reverb sliders share the first row so the
+                // primary continuous controls are immediately reachable
+                // regardless of how long the engine list grows. SF2
+                // status sits next to them so a glance covers
+                // "SF2 loading?" + "where am I in the gain stage".
                 ui.horizontal(|ui| {
-                    ui.label("engine:");
-                    // Drop the fixed-width hint so narrow viewports
-                    // (mobile, split panes) aren't forced to overflow.
-                    // egui auto-sizes to the longest label.
-                    egui::ComboBox::from_id_salt("engine")
-                        .selected_text(current_label)
-                        .show_ui(ui, |ui| {
-                            for (eng, label, _desc) in ENGINES_FOR_WEB {
-                                ui.selectable_value(&mut live.engine, *eng, *label);
-                            }
-                        });
+                    ui.label("master:");
+                    ui.add(egui::Slider::new(&mut live.master, 0.0..=4.0).step_by(0.05));
+                    ui.separator();
+                    ui.label("reverb:");
+                    ui.add(egui::Slider::new(&mut live.reverb_wet, 0.0..=1.0).step_by(0.01));
 
                     // Surface the SF2 fetch lifecycle so SfPiano isn't
                     // a silent no-op while the bytes are still en
-                    // route. Idle = pre-audio-start (don't draw), Ready
-                    // = quiet OK label, Loading / Failed = visible
-                    // status with colour.
+                    // route. Idle = pre-audio-start (don't draw),
+                    // Ready = quiet OK label, Loading / Failed =
+                    // visible status with colour.
                     let status = self.synth_status.borrow().clone();
                     match status {
                         SfStatus::Idle => {}
@@ -1264,10 +1256,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         }
                         SfStatus::Ready => {
                             ui.separator();
-                            ui.colored_label(
-                                egui::Color32::from_gray(150),
-                                "SF2: ready",
-                            );
+                            ui.colored_label(egui::Color32::from_gray(150), "SF2: ready");
                         }
                         SfStatus::Failed(msg) => {
                             ui.separator();
@@ -1277,24 +1266,60 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                             );
                         }
                     }
+                });
 
-                    ui.separator();
-                    ui.label("master:");
-                    ui.add(egui::Slider::new(&mut live.master, 0.0..=4.0).step_by(0.05));
-
-                    ui.separator();
-                    ui.label("reverb:");
-                    ui.add(egui::Slider::new(&mut live.reverb_wet, 0.0..=1.0).step_by(0.01));
-
-                    ui.separator();
+                // Mix mode as a row of selectable labels, mirroring
+                // `src/ui.rs:130` on the native side. Dropdowns hide
+                // the currently-unselected options behind a click; a
+                // flat row is faster to scan and matches the GM 128
+                // patch picker / engine row idiom below.
+                ui.horizontal_wrapped(|ui| {
                     ui.label("mix:");
-                    egui::ComboBox::from_id_salt("mix")
-                        .selected_text(live.mix_mode.as_label())
-                        .show_ui(ui, |ui| {
-                            for &mm in MixMode::ALL {
-                                ui.selectable_value(&mut live.mix_mode, mm, mm.as_label());
-                            }
-                        });
+                    for m in MixMode::ALL {
+                        let selected = live.mix_mode == *m;
+                        if ui.selectable_label(selected, m.as_label()).clicked() {
+                            live.mix_mode = *m;
+                        }
+                    }
+                });
+
+                // Engine selector as a row of selectable labels,
+                // mirroring `src/ui.rs:139` on the native side. Short
+                // CLI-style labels (square / ks / piano-modal …) so
+                // the row stays compact across the full engine list;
+                // the long human-readable description shows below for
+                // the current selection.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("engine:");
+                    for (eng, label, _desc) in ENGINES_FOR_WEB {
+                        let selected = live.engine == *eng;
+                        if ui.selectable_label(selected, *label).clicked() {
+                            live.engine = *eng;
+                        }
+                    }
+                    // Show the live SoundFont patch name beside the
+                    // engine selector when SfPiano is active so the
+                    // user always knows what timbre the next keypress
+                    // will produce — same shape as `src/ui.rs:150`.
+                    if live.engine == Engine::SfPiano {
+                        ui.separator();
+                        let prog = live.sf_program;
+                        let bank = live.sf_bank;
+                        let name = GM_INSTRUMENTS
+                            .get(prog as usize)
+                            .map(|(_, n, _)| *n)
+                            .unwrap_or("<unknown>");
+                        let label = if bank == 128 {
+                            format!("[bank128 prog{prog}] (drum kit)")
+                        } else {
+                            format!("[{:>3} {}]", prog, name)
+                        };
+                        ui.label(
+                            egui::RichText::new(label)
+                                .monospace()
+                                .color(egui::Color32::from_rgb(255, 200, 80)),
+                        );
+                    }
                 });
                 drop(live);
 
