@@ -778,6 +778,26 @@ impl ModalLut {
 
 impl VoiceImpl for ModalPianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
+        // Output level compensation. A high-Q bandpass biquad at T60≈18 s
+        // has Q ≈ T60·f·π ≈ 7000 at f=130 Hz, so its impulse response
+        // peak per resonator is ≈ init_amp / Q ≈ 1.4e-4 — three to four
+        // orders of magnitude below init_amp itself. Even with 96
+        // resonators summing across the bank, raw bus peak lands around
+        // 2e-3 (≈ -54 dBFS), versus -2 to -8 dBFS for `Piano` /
+        // `PianoLite` / `Piano5AM` / `KS` / `Square` measured at the
+        // same note (53). At master=3.0 + tanh that translates to a
+        // PianoModal output sitting under -40 dBFS while every other
+        // engine saturates the soft-clip into a comfortable listening
+        // level — perceived as silence next to the others.
+        //
+        // Compensate at the voice level (not the engine selector) so
+        // both native and web see the same loudness across engines, and
+        // so future projection-model voices in this style inherit the
+        // right scaling by construction. 100× ≈ +40 dB lifts PianoModal
+        // raw peak to ~0.2, which lines up with the other modelling
+        // voices and stays well within tanh's headroom.
+        const OUTPUT_GAIN: f32 = 100.0;
+
         // Lazy damper engage: cheaper than wrapping every step in a
         // branch, and we can do it once at the top of each render pass.
         if self.damper_pending {
@@ -801,7 +821,7 @@ impl VoiceImpl for ModalPianoVoice {
                 sum += r.step(x);
             }
             let env = self.release.step();
-            *sample += sum * env;
+            *sample += sum * env * OUTPUT_GAIN;
         }
     }
     fn trigger_release(&mut self) {
