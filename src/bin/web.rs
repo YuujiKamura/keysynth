@@ -149,13 +149,19 @@ mod imp {
                     // while every other engine still saturated tanh.
                     master: 3.0,
                     engine: Engine::PianoModal,
-                    reverb_wet: 0.25,
+                    reverb_wet: 0.0,
                     sf_program: 0,
                     sf_bank: 0,
                     // Plain tanh matches native default and avoids the
                     // ParallelComp limiter swallowing PianoModal's already
                     // low-amplitude bus into silence on the first hit.
                     mix_mode: MixMode::Plain,
+                    // NOTE: reverb_wet is overridden below to 0.0 to debug
+                    // PianoModal silence on web. The 6600-tap direct
+                    // convolution may be busting the wasm32 audio
+                    // deadline; skip it for now and let the user re-enable
+                    // via the slider once we confirm whether reverb is
+                    // the culprit.
                 })),
                 sample_rate: 0,
                 audio: None,
@@ -515,6 +521,13 @@ mod imp {
         let mut mono: Vec<f32> = Vec::new();
         let mut mono_compressed: Vec<f32> = Vec::new();
         let mut limiter_gain: f32 = 1.0;
+        // Diagnostic: log the first ~5 callbacks with non-zero peak so we
+        // can verify on the live page whether PianoModal is producing
+        // any signal at all (vs the audio path running but the voice
+        // rendering silence). Emits one line per such callback to the
+        // browser console, then quiesces. Cheap — one max() pass per
+        // callback before we even reach the early-out.
+        let mut nonzero_callbacks_logged: u32 = 0;
 
         let voices_cb = voices.clone();
         let live_cb = live.clone();
@@ -541,6 +554,20 @@ mod imp {
                         engine,
                         mix_mode,
                     );
+                    // Diagnostic peak probe.
+                    if nonzero_callbacks_logged < 5 {
+                        let peak =
+                            out.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+                        if peak > 1e-4 {
+                            nonzero_callbacks_logged += 1;
+                            web_sys::console::log_1(
+                                &format!(
+                                    "keysynth-web: callback peak={peak:.4} (engine={engine:?}, master={master}, wet={wet})"
+                                )
+                                .into(),
+                            );
+                        }
+                    }
                 },
                 move |err| {
                     web_sys::console::error_1(&format!("keysynth-web: stream error: {err}").into());
@@ -597,13 +624,31 @@ mod imp {
             }
         }
 
+        // NaN/Inf guard + denormal flush. wasm32 has no equivalent of
+        // x86 SSE FZ/DAZ, so high-Q resonator state (PianoModal's 96
+        // bandpass biquads decay exponentially toward zero) eventually
+        // crosses ~1e-38 into f32 denormal range. Native flushes those
+        // via MXCSR; on wasm we have to do it by hand or the per-sample
+        // arithmetic falls off a cliff (100×–1000× slower depending on
+        // the runtime), busting the audio deadline and producing
+        // intermittent or full silence specifically on PianoModal.
         for s in mono.iter_mut() {
             if !s.is_finite() {
+                *s = 0.0;
+            } else if s.abs() < 1e-30 {
                 *s = 0.0;
             }
         }
 
-        reverb.process(mono.as_mut_slice(), reverb_wet);
+        // Reverb is direct convolution against a ~6600-sample IR
+        // (synthetic body @ 44.1 kHz). At 1024-frame buffers that's
+        // ~6.7 M MACs per audio callback. On wasm32 (no SIMD) this
+        // alone can dominate the per-callback budget. Skip when fully
+        // dry so users with limited CPU headroom still get clean
+        // PianoModal output; flip back on by raising the slider.
+        if reverb_wet > 0.0 {
+            reverb.process(mono.as_mut_slice(), reverb_wet);
+        }
 
         match mix_mode {
             MixMode::Plain => {
