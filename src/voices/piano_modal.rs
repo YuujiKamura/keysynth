@@ -36,6 +36,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::synth::{ReleaseEnvelope, VoiceImpl};
 
+/// Output level compensation applied at resonator construction so each
+/// `ModalResonator::step` already returns gained samples — no per-sample
+/// multiply in `render_add`.
+///
+/// A high-Q bandpass biquad at T60 ≈ 18 s on the bass / mid range has
+/// Q ≈ T60·f·π ≈ 7000 at f=130 Hz, so the impulse response peak per
+/// resonator is roughly `init_amp / Q ≈ 1e-4` — three to four orders
+/// of magnitude below `init_amp` itself. Even with 96 resonators
+/// summing across the bank the raw bus peaks at ~2e-3 (-54 dBFS) at
+/// velocity=100, vs -2 to -8 dBFS for `Piano` / `PianoLite` /
+/// `Piano5AM` / `KS` / `Square` measured at the same note. With one
+/// shared master gain across all engines (`main.rs::audio_callback`
+/// does `tanh(sample * master)` with `master = 3.0` by default) the
+/// PianoModal bus saturates well below the audible floor while every
+/// other engine reaches the soft-clip ceiling. Compensate at the voice
+/// level so master gain stays meaningful as a perceptual control across
+/// engines.
+///
+/// 100× ≈ +40 dB lifts PianoModal raw peak to ~0.20 (-14 dBFS), within
+/// 6-12 dB of the other modelling voices and inside `tanh`'s headroom.
+/// Tracked alongside the per-engine output-level audit in #13.
+pub const MODAL_OUTPUT_GAIN: f32 = 100.0;
+
 /// One modal resonance: (f, T60, gain). `init_amp` is the LINEAR
 /// amplitude (not dB), so callers converting from `extract::Partial::init_db`
 /// need to do `10f32.powf(init_db / 20.0)` first.
@@ -203,10 +226,17 @@ impl ModalPianoVoice {
         excitation: Vec<f32>,
         velocity_amp: f32,
     ) -> Self {
+        // Bake `MODAL_OUTPUT_GAIN` into each resonator's `init_amp` here
+        // so `ModalResonator::step` already returns gained samples — no
+        // per-sample multiply in `render_add`. See `MODAL_OUTPUT_GAIN`'s
+        // doc for why the compensation is needed.
         let resonators = modes
             .iter()
             .copied()
-            .map(|m| ModalResonator::new(m, sr))
+            .map(|mut m| {
+                m.init_amp *= MODAL_OUTPUT_GAIN;
+                ModalResonator::new(m, sr)
+            })
             .collect();
         let scaled_excitation: Vec<f32> = excitation.iter().map(|&s| s * velocity_amp).collect();
         Self {
@@ -778,25 +808,10 @@ impl ModalLut {
 
 impl VoiceImpl for ModalPianoVoice {
     fn render_add(&mut self, buf: &mut [f32]) {
-        // Output level compensation. A high-Q bandpass biquad at T60≈18 s
-        // has Q ≈ T60·f·π ≈ 7000 at f=130 Hz, so its impulse response
-        // peak per resonator is ≈ init_amp / Q ≈ 1.4e-4 — three to four
-        // orders of magnitude below init_amp itself. Even with 96
-        // resonators summing across the bank, raw bus peak lands around
-        // 2e-3 (≈ -54 dBFS), versus -2 to -8 dBFS for `Piano` /
-        // `PianoLite` / `Piano5AM` / `KS` / `Square` measured at the
-        // same note (53). At master=3.0 + tanh that translates to a
-        // PianoModal output sitting under -40 dBFS while every other
-        // engine saturates the soft-clip into a comfortable listening
-        // level — perceived as silence next to the others.
-        //
-        // Compensate at the voice level (not the engine selector) so
-        // both native and web see the same loudness across engines, and
-        // so future projection-model voices in this style inherit the
-        // right scaling by construction. 100× ≈ +40 dB lifts PianoModal
-        // raw peak to ~0.2, which lines up with the other modelling
-        // voices and stays well within tanh's headroom.
-        const OUTPUT_GAIN: f32 = 100.0;
+        // Output level compensation is baked into each resonator's
+        // `init_amp` at construction (see `MODAL_OUTPUT_GAIN` and
+        // `with_modes_no_detune`), so the hot loop here stays a plain
+        // sum + envelope — no per-sample gain multiply.
 
         // Lazy damper engage: cheaper than wrapping every step in a
         // branch, and we can do it once at the top of each render pass.
@@ -821,7 +836,7 @@ impl VoiceImpl for ModalPianoVoice {
                 sum += r.step(x);
             }
             let env = self.release.step();
-            *sample += sum * env * OUTPUT_GAIN;
+            *sample += sum * env;
         }
     }
     fn trigger_release(&mut self) {
@@ -1142,5 +1157,50 @@ mod tests {
         let res = ModalResonator::new(mode, SR);
         let r2 = res.a2;
         assert!(r2 > 0.99 && r2 < 1.0, "pole radius² out of range: {r2}");
+    }
+
+    /// Pin the output level of a `from_lut`-constructed voice. Without
+    /// `MODAL_OUTPUT_GAIN` baked into resonator construction, raw peak
+    /// across the full bank lands around 2e-3 (-54 dBFS) at velocity=100
+    /// — well below other engines (-2 to -8 dBFS) and inaudible at the
+    /// shared `master = 3.0 + tanh` setting in `main.rs::audio_callback`
+    /// and `bin/web.rs`. Assert the bake places PianoModal in the
+    /// -25..0 dBFS band where it matches the rest of the voice family.
+    /// See #13 for the cross-engine output-level audit this anchors.
+    #[test]
+    fn from_lut_peak_within_expected_band() {
+        // Single-mode LUT at C4 — `from_lut_with_excitation` will
+        // bass-fill extrapolate it up toward 32 partials, then 3-detune
+        // expand to ~96 resonators just like the live path. Use a real
+        // h1 init_amp (-2.7 dB linear) so the test reflects field
+        // amplitude, not a synthetic boost.
+        let lut = ModalLut {
+            entries: vec![ModalLutEntry {
+                midi_note: 60,
+                f0_hz: 261.6,
+                modes: vec![Mode {
+                    freq_hz: 261.6,
+                    t60_sec: 18.0,
+                    init_amp: 10f32.powf(-2.7 / 20.0),
+                }],
+                time_to_peak_s: 0.0,
+                peak_db: 0.0,
+                post_peak_slope_db_s: 0.0,
+            }],
+        };
+        let mut v = ModalPianoVoice::from_lut(&lut, SR, 60, 100);
+        // 1 s of render covers the full hammer-noise excitation
+        // (~262 ms) plus the resonator ring-up and into the natural
+        // decay tail.
+        let mut buf = vec![0.0_f32; SR as usize];
+        v.render_add(&mut buf);
+        let peak = buf.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
+        let peak_db = 20.0 * peak.max(1e-9).log10();
+        assert!(
+            (-25.0..=0.0).contains(&peak_db),
+            "PianoModal raw peak out of expected band: {peak:.4} ({peak_db:.1} dBFS) — \
+             likely either MODAL_OUTPUT_GAIN regressed or the bake site moved. \
+             This is the level test issue #13 is generalising across all engines."
+        );
     }
 }
