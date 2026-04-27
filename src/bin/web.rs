@@ -152,13 +152,6 @@ mod imp {
         sample_rate: u32,
         audio: Option<AudioHandle>,
         audio_err: Option<String>,
-        /// Realtime bus peak (linear), written by the audio callback as
-        /// f32::to_bits and logged from the egui update loop at low
-        /// frequency. None until audio starts.
-        bus_peak: Option<Arc<std::sync::atomic::AtomicU32>>,
-        /// Frame counter so we can rate-limit peak logging from the egui
-        /// update loop (~once per ~30 frames ≈ 0.5 s at 60 fps).
-        peak_log_frame: u32,
         /// Notes currently held by mouse/touch. PC keyboard tracking is via
         /// the separate `pc_held` set below — egui's `key_pressed` returns
         /// true on every browser KeyDown including auto-repeat, so we
@@ -219,25 +212,17 @@ mod imp {
                     // while every other engine still saturated tanh.
                     master: 3.0,
                     engine: Engine::PianoModal,
-                    reverb_wet: 0.0,
+                    reverb_wet: 0.25,
                     sf_program: 0,
                     sf_bank: 0,
                     // Plain tanh matches native default and avoids the
                     // ParallelComp limiter swallowing PianoModal's already
                     // low-amplitude bus into silence on the first hit.
                     mix_mode: MixMode::Plain,
-                    // NOTE: reverb_wet is overridden below to 0.0 to debug
-                    // PianoModal silence on web. The 6600-tap direct
-                    // convolution may be busting the wasm32 audio
-                    // deadline; skip it for now and let the user re-enable
-                    // via the slider once we confirm whether reverb is
-                    // the culprit.
                 })),
                 sample_rate: 0,
                 audio: None,
                 audio_err: None,
-                bus_peak: None,
-                peak_log_frame: 0,
                 mouse_down_note: None,
                 pc_held: 0,
                 base_note: 48, // C3
@@ -255,10 +240,9 @@ mod imp {
                 return;
             }
             match build_audio(self.voices.clone(), self.live.clone()) {
-                Ok((handle, sr, peak)) => {
+                Ok((handle, sr)) => {
                     self.sample_rate = sr;
                     self.audio = Some(handle);
-                    self.bus_peak = Some(peak);
                     self.audio_err = None;
                     web_sys::console::log_1(
                         &format!("keysynth-web: audio started @ {sr} Hz").into(),
@@ -346,17 +330,6 @@ mod imp {
             }
             let engine = self.live.lock().unwrap().engine;
             let freq = midi_to_freq(note);
-            // Diagnostic: log on the UI thread (no audio-callback overhead)
-            // so we can verify a voice is actually being constructed for
-            // each key press. Only fires for the first 10 note_ons to
-            // avoid spamming.
-            web_sys::console::log_1(
-                &format!(
-                    "keysynth-web: note_on n={note} f={freq:.1} engine={engine:?} pool_before={}",
-                    self.voices.lock().unwrap().len()
-                )
-                .into(),
-            );
             let inner = make_voice(engine, self.sample_rate as f32, freq, velocity);
             let v = Voice {
                 key: (0, note),
@@ -568,24 +541,6 @@ mod imp {
             // burst of every key they pressed during setup.
             self.drain_midi_inbox();
 
-            // Diagnostic: every ~30 frames (~0.5 s @ 60 fps) log the
-            // most recent audio-callback bus peak. Lets us verify on
-            // the live page whether the audio thread is producing any
-            // signal at all when a key is held. Read is cheap: one
-            // atomic load + one f32::from_bits on the UI thread.
-            self.peak_log_frame = self.peak_log_frame.wrapping_add(1);
-            if self.peak_log_frame.is_multiple_of(30) {
-                if let Some(p) = &self.bus_peak {
-                    let bits = p.load(std::sync::atomic::Ordering::Relaxed);
-                    let peak = f32::from_bits(bits);
-                    if peak > 1e-5 {
-                        web_sys::console::log_1(
-                            &format!("keysynth-web: bus peak={peak:.5}").into(),
-                        );
-                    }
-                }
-            }
-
             egui::TopBottomPanel::top("top").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("keysynth (web)");
@@ -690,7 +645,7 @@ mod imp {
     fn build_audio(
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
-    ) -> Result<(AudioHandle, u32, Arc<std::sync::atomic::AtomicU32>), String> {
+    ) -> Result<(AudioHandle, u32), String> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -708,12 +663,6 @@ mod imp {
         let mut mono: Vec<f32> = Vec::new();
         let mut mono_compressed: Vec<f32> = Vec::new();
         let mut limiter_gain: f32 = 1.0;
-        // Diagnostic peak slot — written by the audio callback (one
-        // atomic store per callback, no allocation, no JS host call) and
-        // read + logged by the egui update loop. Stores f32 peak as raw
-        // u32 bits via f32::to_bits / from_bits.
-        let bus_peak_bits = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let bus_peak_for_cb = bus_peak_bits.clone();
 
         let voices_cb = voices.clone();
         let live_cb = live.clone();
@@ -740,11 +689,6 @@ mod imp {
                         engine,
                         mix_mode,
                     );
-                    // Realtime-safe peak probe: just a max + one atomic
-                    // store. No format!, no JS host call. The egui
-                    // update loop reads and logs.
-                    let peak = out.iter().fold(0.0_f32, |a, &x| a.max(x.abs()));
-                    bus_peak_for_cb.store(peak.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 },
                 move |err| {
                     web_sys::console::error_1(&format!("keysynth-web: stream error: {err}").into());
@@ -754,7 +698,7 @@ mod imp {
             .map_err(|e| format!("build_output_stream: {e}"))?;
 
         stream.play().map_err(|e| format!("stream.play: {e}"))?;
-        Ok((AudioHandle { _stream: stream }, sr, bus_peak_bits))
+        Ok((AudioHandle { _stream: stream }, sr))
     }
 
     #[allow(clippy::too_many_arguments)]
