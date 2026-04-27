@@ -6,9 +6,18 @@ on:
   push:
     branches: [main]
 
+# Cancel superseded runs on the same ref so a quick succession of
+# pushes to a branch doesn't queue stale CI work.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  check:
-    name: fmt + clippy + test + build
+  # `fmt` is its own job so it can fail in seconds without holding up
+  # the longer test/build path. Pure check, no toolchain other than
+  # rustfmt needed.
+  fmt:
+    name: cargo fmt --check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,7 +26,29 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt -- --check
+
+  # Clippy + test + build run together because they share the same
+  # cargo build artifact cache; splitting them further would force
+  # repeated dependency rebuilds and would actually be slower under
+  # cold cache. Clippy runs informationally for now — main has 16
+  # pre-existing warnings (loop-index, div_ceil, clamp-pattern).
+  # Tightening to `-D warnings` is tracked in issue #2. Once main is
+  # clean, change to: `cargo clippy --all-targets -- -D warnings`.
+  check:
+    name: clippy + test + build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo registry / target
         uses: Swatinem/rust-cache@v2
@@ -28,14 +59,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libasound2-dev
 
-      - name: cargo fmt --check
-        run: cargo fmt -- --check
-
-      # Clippy runs informationally for now — main has 16 pre-existing
-      # warnings in analysis.rs / reverb.rs / synth.rs (loop-index,
-      # div_ceil, clamp-pattern). Tightening to `-D warnings` is tracked
-      # alongside the cleanup pass in issue #2. Once main is clean,
-      # change to: `cargo clippy --all-targets -- -D warnings`.
       - name: cargo clippy
         run: cargo clippy --all-targets
 
