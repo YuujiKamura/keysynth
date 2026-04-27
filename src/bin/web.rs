@@ -41,6 +41,9 @@ mod imp {
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
 
+    use std::collections::VecDeque;
+
+    use keysynth::gm::{GM_FAMILIES, GM_INSTRUMENTS};
     use keysynth::reverb::{self, Reverb};
     use keysynth::sympathetic::SympatheticBank;
     use keysynth::synth::{
@@ -465,6 +468,14 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// `Engine::SfPiano` selection isn't a silent no-op while
         /// loading.
         synth_status: Rc<RefCell<SfStatus>>,
+        /// Rolling log of recent MIDI events drawn in the right side
+        /// panel. Mirrors the native build's `DashState::recent` ring
+        /// (newest at the back, capped at 64). `Rc<RefCell<…>>` because
+        /// `note_on` / `note_off` are called through `&mut self` while
+        /// the side panel UI also wants to read it via egui's borrow
+        /// closure — using a separate Rc avoids re-entering `&mut
+        /// self` during update().
+        recent_events: Rc<RefCell<VecDeque<String>>>,
     }
 
     impl Default for WebApp {
@@ -509,6 +520,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 midi_handles: Rc::new(RefCell::new(None)),
                 synth: Arc::new(Mutex::new(None)),
                 synth_status: Rc::new(RefCell::new(SfStatus::Idle)),
+                recent_events: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
             }
         }
     }
@@ -680,6 +692,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 return;
             }
             let engine = self.live.lock().unwrap().engine;
+            self.push_event(format!("noteOn  ch=0 note={note:>3} vel={velocity:>3}"));
 
             // SfPiano routes the note straight into the rustysynth
             // shared synth — the modelling-engine voice pool is bypassed
@@ -716,6 +729,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         }
 
         fn note_off(&mut self, note: u8) {
+            self.push_event(format!("noteOff ch=0 note={note:>3}"));
             // Always forward note_off to the synth so SF2 keys release
             // even after the user has switched away from SfPiano while
             // a note was held — leaving rustysynth's internal envelope
@@ -808,6 +822,128 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             }
             for note in to_on {
                 self.note_on(note, 100);
+            }
+        }
+
+        /// Push a one-line summary of a MIDI event into the rolling
+        /// `recent_events` ring used by the right side panel. Caps the
+        /// ring at 64 entries (newest at the back) so a sustained MIDI
+        /// stream doesn't grow unbounded across the page lifetime.
+        fn push_event(&self, line: String) {
+            let mut events = self.recent_events.borrow_mut();
+            if events.len() >= 64 {
+                events.pop_front();
+            }
+            events.push_back(line);
+        }
+
+        /// Render the GM 128 patch picker on the left. Disabled (greyed)
+        /// unless `Engine::SfPiano` is the currently selected engine —
+        /// the patch number only matters for the SoundFont path.
+        fn draw_instruments_panel(&self, ctx: &egui::Context) {
+            let (engine, mut sf_program, mut sf_bank) = {
+                let lp = self.live.lock().unwrap();
+                (lp.engine, lp.sf_program, lp.sf_bank)
+            };
+            let sf_active = engine == Engine::SfPiano;
+            let mut changed = false;
+            egui::SidePanel::left("instruments")
+                .default_width(280.0)
+                .show(ctx, |ui| {
+                    ui.heading("GM 128 patches");
+                    ui.add_space(2.0);
+                    // Drum-kit toggle. GeneralUser-GS maps drum kits to
+                    // bank 128; program then selects the kit (0 =
+                    // Standard, 8 = Room, 16 = Power, ...). When drum
+                    // mode is on, melodic patch clicks below first flip
+                    // bank back to 0.
+                    ui.horizontal(|ui| {
+                        let drum_on = sf_bank == 128;
+                        let label = if drum_on {
+                            "Drum Kit (bank 128) [ON]"
+                        } else {
+                            "Drum Kit (bank 128) [off]"
+                        };
+                        if ui.selectable_label(drum_on, label).clicked() {
+                            sf_bank = if drum_on { 0 } else { 128 };
+                            changed = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(if sf_active {
+                            "Click an instrument to switch live."
+                        } else {
+                            "Switch engine to SF2 piano to use these."
+                        })
+                        .small()
+                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_enabled_ui(sf_active, |ui| {
+                                for family in GM_FAMILIES.iter() {
+                                    // Open Pianos by default; other
+                                    // families collapse so the panel
+                                    // stays scannable on narrow
+                                    // viewports.
+                                    let default_open = *family == "Pianos";
+                                    egui::CollapsingHeader::new(*family)
+                                        .default_open(default_open)
+                                        .show(ui, |ui| {
+                                            for (prog, name, fam) in GM_INSTRUMENTS.iter() {
+                                                if fam != family {
+                                                    continue;
+                                                }
+                                                let selected =
+                                                    sf_program == *prog && sf_bank != 128;
+                                                let label_text = format!("[{:>3}] {}", prog, name);
+                                                let rich = if selected {
+                                                    egui::RichText::new(label_text)
+                                                        .monospace()
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(
+                                                            255, 220, 120,
+                                                        ))
+                                                } else {
+                                                    egui::RichText::new(label_text).monospace()
+                                                };
+                                                if ui.selectable_label(selected, rich).clicked() {
+                                                    sf_program = *prog;
+                                                    // Picking a melodic
+                                                    // patch implicitly
+                                                    // leaves drum mode.
+                                                    sf_bank = 0;
+                                                    changed = true;
+                                                }
+                                            }
+                                        });
+                                }
+                            });
+                        });
+                });
+
+            // Apply changes outside the panel closure: persist the new
+            // program/bank in `LiveParams` for the audio render to
+            // observe, and immediately push the GM Bank Select + Program
+            // Change pair into the shared synth so the next keypress
+            // sounds the new patch instead of waiting on note-driven
+            // path. No-op when the synth hasn't loaded yet.
+            if changed {
+                {
+                    let mut lp = self.live.lock().unwrap();
+                    lp.sf_program = sf_program;
+                    lp.sf_bank = sf_bank;
+                }
+                if let Some(s) = self.synth.lock().unwrap().as_mut() {
+                    // CC 0 = Bank Select MSB. Per GM/GS spec, bank
+                    // change only takes effect on the next program
+                    // change so we always emit the pair together.
+                    s.process_midi_message(0, 0xB0, 0, sf_bank as i32);
+                    s.process_midi_message(0, 0xC0, sf_program as i32, 0);
+                }
+                self.push_event(format!("patch program={sf_program} bank={sf_bank}"));
             }
         }
 
@@ -1230,6 +1366,34 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 });
             });
 
+            // Left side panel: GM 128 patch picker for `Engine::SfPiano`.
+            // Mirrors the native build's `instruments` SidePanel — same
+            // collapsible-by-family layout, same drum-kit (bank 128)
+            // toggle, same "switch engine to sf-piano to use these"
+            // hint for the disabled state. Click an instrument to flip
+            // `live.sf_program` / `live.sf_bank` and push the GM Bank
+            // Select + Program Change pair into rustysynth so the next
+            // keypress sounds the new patch.
+            self.draw_instruments_panel(ctx);
+
+            // Right side panel: rolling MIDI log. `recent_events` is
+            // populated by note_on / note_off (covers both PC keyboard
+            // and Web MIDI sources since both funnel through the same
+            // pair). Mirrors `dash_snapshot.recent` on native.
+            egui::SidePanel::right("log")
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.heading("MIDI log");
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in self.recent_events.borrow().iter() {
+                                ui.monospace(line);
+                            }
+                        });
+                });
+
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.add_space(12.0);
                 self.draw_on_screen_keyboard(ui);
@@ -1237,8 +1401,9 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 ui.collapsing("about", |ui| {
                     ui.label(
                         "keysynth — pure-Rust real-time modelling synth. The web build \
-                     drops SF2/SFZ sample players and live MIDI input; the modelling \
-                     engines (Karplus-Strong, modal piano, FM, etc.) run unchanged.",
+                     fetches GeneralUser-GS.sf2 for SfPiano, drops the multi-GB SFZ \
+                     Salamander library; modelling engines (Karplus-Strong, modal \
+                     piano, FM, etc.) run unchanged from the native build.",
                     );
                     ui.label("source: https://github.com/YuujiKamura/keysynth");
                 });
