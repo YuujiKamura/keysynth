@@ -95,6 +95,17 @@ impl ModalResonator {
     #[inline]
     fn step(&mut self, x: f32) -> f32 {
         let y0 = self.b0 * x - self.a1 * self.y1 - self.a2 * self.y2;
+        // Flush near-zero state to true zero before storing it back.
+        // High-Q biquad poles (T60 = 18 s → r ≈ 0.99999 at 44.1 kHz)
+        // decay exponentially toward zero; once `y1` / `y2` cross
+        // ~1.18e-38 they enter f32 denormal range, where some runtimes
+        // (notably wasm32 without SIMD) drop into 100×–1000× slower
+        // arithmetic. Native flushes at the SSE level via MXCSR FZ/DAZ
+        // (see `main.rs::audio_callback`); on wasm we have to do it
+        // here because the slow math happens inside this hot loop, not
+        // at the bus-mix stage. Threshold is well below the audible
+        // floor (-720 dB FS) so the clamp is inaudible.
+        let y0 = if y0.abs() < 1e-30 { 0.0 } else { y0 };
         self.y2 = self.y1;
         self.y1 = y0;
         y0 * self.init_amp
