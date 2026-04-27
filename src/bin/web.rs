@@ -549,36 +549,81 @@ mod imp {
             // burst of every key they pressed during setup.
             self.drain_midi_inbox();
 
-            egui::TopBottomPanel::top("top").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("keysynth (web)");
-                    ui.separator();
-                    if self.audio.is_some() {
-                        ui.label(format!("audio @ {} Hz", self.sample_rate));
-                    } else if let Some(err) = &self.audio_err {
-                        ui.colored_label(egui::Color32::RED, format!("audio error: {err}"));
-                        if ui.button("retry").clicked() {
-                            self.start_audio();
-                        }
-                    } else {
-                        // Big, coloured action button so first-time
-                        // visitors can't miss it. Browser autoplay
-                        // policy refuses to start the AudioContext
-                        // until they click.
+            // Splash gate: until the user has started audio there's
+            // nothing useful to interact with — engine selector,
+            // master gain, keyboard all want a running stream. Show
+            // a single fullscreen overlay with a big centered Start
+            // button so the required first click is impossible to
+            // miss. Once audio is running, fall through to the normal
+            // 3-panel layout below.
+            //
+            // `start_audio()` also fires `request_midi()` in the same
+            // gesture so the same click satisfies both browser
+            // permissions (autoplay → AudioContext, Web MIDI →
+            // requestMIDIAccess). On retry / error the smaller "🎹
+            // Retry MIDI" button lives inside the running UI.
+            if self.audio.is_none() {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(60.0);
+                        ui.heading(egui::RichText::new("keysynth (web)").size(28.0).strong());
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Pure-Rust real-time modelling synth.\n\
+                                 Click below to start audio + connect any USB-MIDI keyboard.",
+                            )
+                            .size(15.0)
+                            .color(egui::Color32::from_gray(190)),
+                        );
+                        ui.add_space(40.0);
                         let resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new("▶ Start audio")
-                                    .size(18.0)
+                                egui::RichText::new("▶ Start")
+                                    .size(28.0)
                                     .color(egui::Color32::WHITE)
                                     .strong(),
                             )
                             .fill(egui::Color32::from_rgb(40, 120, 200))
-                            .min_size(egui::vec2(140.0, 28.0)),
+                            .min_size(egui::vec2(220.0, 56.0)),
                         );
                         if resp.clicked() {
                             self.start_audio();
                         }
-                    }
+                        if let Some(err) = &self.audio_err {
+                            ui.add_space(20.0);
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 90, 90),
+                                format!("audio error: {err}"),
+                            );
+                            ui.label(
+                                egui::RichText::new("クリックでもう一度試す")
+                                    .size(13.0)
+                                    .color(egui::Color32::from_gray(170)),
+                            );
+                        }
+                        ui.add_space(40.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "MIDI keyboard ない場合はクリック後に画面の鍵盤 / PC キー\n\
+                                 (zsxdcvgbhnjm = lower octave, qweryt... = upper) で演奏",
+                            )
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                    });
+                });
+                return;
+            }
+
+            egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("keysynth (web)");
+                    ui.separator();
+                    // Audio is already running here (the splash gate
+                    // above early-returns until it is), so we just show
+                    // the sample rate.
+                    ui.label(format!("audio @ {} Hz", self.sample_rate));
                     ui.separator();
                     // Status label is always shown so the previous
                     // outcome (success / error / not requested) stays
@@ -595,52 +640,35 @@ mod imp {
                         ui.label(format!("MIDI: {status_owned}"));
                     }
                     if !self.midi_requested.get() {
-                        // Same prominent treatment as Start audio so
-                        // it's clear MIDI input also needs an explicit
-                        // user gesture (browser permission prompt).
-                        // After an error this stays visible alongside
-                        // the red error label so the user can retry.
-                        let label = if is_error {
-                            "🎹 Retry MIDI"
-                        } else {
-                            "🎹 Connect MIDI keyboard"
-                        };
+                        // Only reachable if Start failed to grant MIDI
+                        // (denied / Web MIDI unsupported). Recover via
+                        // an explicit retry click.
                         let resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new(label)
-                                    .size(16.0)
+                                egui::RichText::new("🎹 Retry MIDI")
+                                    .size(15.0)
                                     .color(egui::Color32::WHITE)
                                     .strong(),
                             )
                             .fill(egui::Color32::from_rgb(180, 90, 40))
-                            .min_size(egui::vec2(220.0, 28.0)),
+                            .min_size(egui::vec2(140.0, 24.0)),
                         );
                         if resp.clicked() {
-                            // Browser autoplay-style gating:
-                            // requestMIDIAccess also wants a user
-                            // gesture to surface the permission prompt.
                             self.request_midi();
                         }
                     }
                 });
-                // One-line hint below the action row so first-time
-                // visitors know which buttons do what without having
-                // to read the source.
-                if self.audio.is_none() || !self.midi_requested.get() {
+                // Hint row only shows when the user is in a recoverable
+                // MIDI failure state — once MIDI is connected (or even
+                // mid-handshake) the hint disappears so the chrome
+                // doesn't waste vertical space.
+                if !self.midi_requested.get() {
                     ui.horizontal(|ui| {
                         ui.add_space(4.0);
-                        let mut hints: Vec<&str> = Vec::new();
-                        if self.audio.is_none() {
-                            hints.push(
-                                "「▶ Start audio」を押すと音が出ます（USB-MIDI 鍵盤も同時に有効化されます）",
-                            );
-                        }
-                        if !self.midi_requested.get() && self.audio.is_some() {
-                            hints.push(
-                                "「🎹 Retry MIDI」で USB-MIDI 鍵盤入力を再要求",
-                            );
-                        }
-                        ui.colored_label(egui::Color32::from_gray(170), hints.join("　／　"));
+                        ui.colored_label(
+                            egui::Color32::from_gray(170),
+                            "「🎹 Retry MIDI」で USB-MIDI 鍵盤入力を再要求できます",
+                        );
                     });
                 }
             });
