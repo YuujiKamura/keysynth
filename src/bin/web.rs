@@ -126,16 +126,23 @@ mod imp {
 
     type MidiInbox = Rc<RefCell<Vec<MidiMsg>>>;
 
-    /// Closures handed to the browser via `set_onmidimessage` /
-    /// `set_onstatechange`. We have to keep them alive for the life of
-    /// the page (the browser only holds a JsValue reference, which
-    /// doesn't keep the underlying Rust closure pinned), so park them
-    /// here as `Closure::into_js_value` can't be called while we still
-    /// want to drop them on `WebApp` teardown. Forgetting this is the
-    /// classic "MIDI works for one second then stops" wasm bug.
+    /// Shared registry of every per-port `onmidimessage` closure. Initial
+    /// inputs (resolved from `requestMIDIAccess`) and hot-plugged inputs
+    /// (added by the `onstatechange` callback) both push into the same
+    /// `Vec` so we don't have to leak per-event closures on hot-plug.
+    /// Lives behind `Rc<RefCell<…>>` because the onstatechange closure
+    /// owns a clone separate from the one stored on `WebApp::midi_handles`.
+    type MessageClosures = Rc<RefCell<Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>>>>;
+
+    /// Closures + access object handed to the browser. The browser only
+    /// stores function references; if we drop the underlying Rust
+    /// closures the references go dangling and MIDI silently stops.
+    /// Park everything here so `WebApp::midi_handles` keeps it alive
+    /// for the page lifetime — and so a future "Disconnect MIDI"
+    /// operation has a single place to drop from.
     struct MidiHandles {
         _access: web_sys::MidiAccess,
-        _on_message_closures: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>>,
+        _closures: MessageClosures,
         _on_state_change: Closure<dyn FnMut(web_sys::MidiConnectionEvent)>,
     }
 
@@ -183,6 +190,13 @@ mod imp {
         /// reference. Set true synchronously in `request_midi()`, cleared
         /// in the async error branch, kept true on success.
         midi_requested: Rc<std::cell::Cell<bool>>,
+        /// Slot the async handshake populates with the resolved
+        /// `MidiHandles`. Stored in `Rc<RefCell<Option<…>>>` rather than
+        /// leaked via `Box::leak` so the resources have one named home,
+        /// hot-plugged closures get pushed into the existing handles
+        /// instead of leaking on every device reconnect, and a future
+        /// "Disconnect MIDI" path has somewhere to drop from.
+        midi_handles: Rc<RefCell<Option<MidiHandles>>>,
     }
 
     impl Default for WebApp {
@@ -230,6 +244,7 @@ mod imp {
                 midi_status: Rc::new(RefCell::new("not requested".to_string())),
                 midi_inbox: Rc::new(RefCell::new(Vec::new())),
                 midi_requested: Rc::new(std::cell::Cell::new(false)),
+                midi_handles: Rc::new(RefCell::new(None)),
             }
         }
     }
@@ -300,12 +315,17 @@ mod imp {
             let inbox = self.midi_inbox.clone();
             let status = self.midi_status.clone();
             let requested_flag = self.midi_requested.clone();
+            let handles_slot = self.midi_handles.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match request_midi_access(inbox).await {
                     Ok(handles) => {
-                        let n = handles._on_message_closures.len();
+                        let n = handles._closures.borrow().len();
                         *status.borrow_mut() = format!("{n} input(s) connected");
-                        Box::leak(Box::new(handles));
+                        // Store on `WebApp` so the closures live as long
+                        // as the page does and have a named owner. No
+                        // `Box::leak` — drop happens with `WebApp` on
+                        // page teardown.
+                        *handles_slot.borrow_mut() = Some(handles);
                         // Leave `requested_flag` true on success so the
                         // Connect button stays out of the way.
                     }
@@ -931,30 +951,37 @@ mod imp {
             .dyn_into()
             .map_err(|_| "MIDI access result wasn't a MIDIAccess".to_string())?;
 
-        // Walk every current input and attach a message handler.
+        // Shared registry every onmidimessage closure pushes into —
+        // both the initial walk below and the hot-plug `onstatechange`
+        // closure further down. Keeping one named owner avoids the
+        // per-reconnect leak the original `Box::leak` path produced.
+        let closures: MessageClosures = Rc::new(RefCell::new(Vec::new()));
+
+        // Walk every current input and attach a message handler. Use
+        // `inputs.values()` rather than `entries()` so we get
+        // `MidiInput` directly without destructuring `[key, value]`.
         let inputs = access.inputs();
-        let mut on_message_closures: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>> =
-            Vec::new();
-        let entries: js_sys::Iterator = inputs.entries();
+        let values: js_sys::Iterator = inputs.values();
         loop {
-            let next = entries
+            let next = values
                 .next()
-                .map_err(|e| format!("MIDIInputMap.entries iter failed: {e:?}"))?;
+                .map_err(|e| format!("MIDIInputMap.values iter failed: {e:?}"))?;
             if next.done() {
                 break;
             }
-            let pair: js_sys::Array = next.value().into();
-            // [key, value] — value is the MIDIInput.
-            let port_jsv = pair.get(1);
-            let port: web_sys::MidiInput = match port_jsv.dyn_into() {
+            let port: web_sys::MidiInput = match next.value().dyn_into() {
                 Ok(p) => p,
                 Err(_) => continue,
             };
-            attach_midi_handler(&port, inbox.clone(), &mut on_message_closures);
+            attach_midi_handler(&port, inbox.clone(), &closures);
         }
 
         // Hot-plug: handle devices that connect after the access grant.
+        // Capture clones of the inbox and the shared closure registry so
+        // a new `Connected` event can attach a handler and store its
+        // closure inside the same `MidiHandles` we hand back below.
         let inbox_state = inbox.clone();
+        let closures_state = closures.clone();
         let on_state_change = Closure::<dyn FnMut(web_sys::MidiConnectionEvent)>::new(
             move |ev: web_sys::MidiConnectionEvent| {
                 let Some(port) = ev.port() else { return };
@@ -967,33 +994,27 @@ mod imp {
                 let Ok(input) = port.dyn_into::<web_sys::MidiInput>() else {
                     return;
                 };
-                // Hot-plugged input → leak its handler too. Cheap; same
-                // page-lifetime story as the initial handles.
-                let mut sink: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>> = Vec::new();
-                attach_midi_handler(&input, inbox_state.clone(), &mut sink);
-                for c in sink {
-                    Box::leak(Box::new(c));
-                }
+                attach_midi_handler(&input, inbox_state.clone(), &closures_state);
             },
         );
         access.set_onstatechange(Some(on_state_change.as_ref().unchecked_ref()));
 
         Ok(MidiHandles {
             _access: access,
-            _on_message_closures: on_message_closures,
+            _closures: closures,
             _on_state_change: on_state_change,
         })
     }
 
     /// Wire one MIDI input port: set its `onmidimessage` to a closure
     /// that parses the 3-byte status message and pushes a `MidiMsg` onto
-    /// the inbox. Pushes the created `Closure` onto `closures` so the
-    /// caller keeps it alive — letting it drop here would dangle the
-    /// browser's stored function reference.
+    /// the inbox. Pushes the created `Closure` into the shared
+    /// `MessageClosures` registry so the caller keeps it alive — letting
+    /// it drop here would dangle the browser's stored function reference.
     fn attach_midi_handler(
         port: &web_sys::MidiInput,
         inbox: MidiInbox,
-        closures: &mut Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>>,
+        closures: &MessageClosures,
     ) {
         let on_message = Closure::<dyn FnMut(web_sys::MidiMessageEvent)>::new(
             move |ev: web_sys::MidiMessageEvent| {
@@ -1016,7 +1037,7 @@ mod imp {
             },
         );
         port.set_onmidimessage(Some(on_message.as_ref().unchecked_ref()));
-        closures.push(on_message);
+        closures.borrow_mut().push(on_message);
     }
 
     fn pick_canvas(id: &str) -> web_sys::HtmlCanvasElement {
