@@ -32,10 +32,12 @@ fn main() {
 mod imp {
 
     use std::cell::RefCell;
+    use std::io::Cursor;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use eframe::egui;
+    use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
 
@@ -44,6 +46,22 @@ mod imp {
     use keysynth::synth::{
         make_voice, midi_to_freq, Engine, LiveParams, MixMode, ModalLut, Voice, MODAL_LUT,
     };
+
+    /// Embedded GM SoundFont used by `Engine::SfPiano`. ~32 MB; baked
+    /// into the wasm bundle at build time so Pages can play sample-based
+    /// piano without a separate runtime fetch. Source matches the
+    /// auto-discovered `GeneralUser-GS.sf2` the native build picks up
+    /// from CWD.
+    const EMBEDDED_SF2: &[u8] = include_bytes!("../../web/GeneralUser-GS.sf2");
+
+    /// Process-wide shared `rustysynth::Synthesizer` populated once the
+    /// AudioContext is alive (the Synthesizer takes the actual
+    /// `ctx.sample_rate()` for its internal interpolation). `None`
+    /// before audio start; `Some` for the rest of the page lifetime.
+    /// `Mutex` mirrors the native `SharedSynth` pattern even though
+    /// wasm32 is single-threaded — the lock is uncontended and lets the
+    /// MIDI / render paths share the same reference shape as `main.rs`.
+    type SharedSynth = Arc<Mutex<Option<Synthesizer>>>;
 
     /// Engines exposed to the web UI. Three columns:
     ///
@@ -61,11 +79,21 @@ mod imp {
     /// actively recommend (`PianoModal` for piano, `KsRich` for
     /// plucked, etc.).
     ///
-    /// SfPiano / SfzPiano deliberately omitted — they need a real
-    /// SoundFont / SFZ library on disk that we don't ship to GitHub
-    /// Pages.
+    /// SfzPiano deliberately omitted — it needs the multi-GB Salamander
+    /// Grand V3 SFZ library on disk that we can't ship to Pages.
+    /// `SfPiano` ships because the GM SoundFont is small enough (~32 MB)
+    /// to bake into the wasm bundle via `EMBEDDED_SF2`.
     const ENGINES_FOR_WEB: &[(Engine, &str, &str)] = &[
         // ── Piano family ────────────────────────────────────────────
+        (
+            Engine::SfPiano,
+            "Piano (SF2 sampled, GeneralUser GS)",
+            "Real recorded piano samples played by rustysynth from the \
+             bundled GeneralUser-GS SoundFont (program 0 = Acoustic \
+             Grand). Closest match to the native build's `--engine \
+             sf-piano`; the modal/KS engines below are pure DSP for \
+             comparison.",
+        ),
         (
             Engine::PianoModal,
             "Piano (modal, SFZ-derived)",
@@ -405,6 +433,15 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// instead of leaking on every device reconnect, and a future
         /// "Disconnect MIDI" path has somewhere to drop from.
         midi_handles: Rc<RefCell<Option<MidiHandles>>>,
+        /// Shared `rustysynth::Synthesizer` for `Engine::SfPiano`. Filled
+        /// in synchronously by `build_audio` once the AudioContext sample
+        /// rate is known — Synthesizer is parameterised on sample rate
+        /// for sample interpolation, so we can't construct it earlier.
+        /// `None` until then; engine selection on the splash gate UI is
+        /// available before the synth lands but `note_on` / render just
+        /// no-op (silent) until `Some` arrives, which happens in the
+        /// same JS task as the audio start success.
+        synth: SharedSynth,
     }
 
     impl Default for WebApp {
@@ -447,6 +484,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 midi_inbox: Rc::new(RefCell::new(Vec::new())),
                 midi_requested: Rc::new(std::cell::Cell::new(false)),
                 midi_handles: Rc::new(RefCell::new(None)),
+                synth: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -467,6 +505,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             match build_audio(
                 self.voices.clone(),
                 self.live.clone(),
+                self.synth.clone(),
                 self.audio.clone(),
                 self.audio_err.clone(),
                 self.audio_starting.clone(),
@@ -571,6 +610,19 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 return;
             }
             let engine = self.live.lock().unwrap().engine;
+
+            // SfPiano routes the note straight into the rustysynth
+            // shared synth — the modelling-engine voice pool is bypassed
+            // entirely (the synth holds its own internal voice state and
+            // mixing into the bus happens in render_mono_chunk). For
+            // every other engine we fall through to the modelling path.
+            if engine == Engine::SfPiano {
+                if let Some(s) = self.synth.lock().unwrap().as_mut() {
+                    s.note_on(0, note as i32, velocity as i32);
+                }
+                return;
+            }
+
             let freq = midi_to_freq(note);
             let inner = make_voice(engine, self.sample_rate as f32, freq, velocity);
             let v = Voice {
@@ -594,6 +646,13 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         }
 
         fn note_off(&mut self, note: u8) {
+            // Always forward note_off to the synth so SF2 keys release
+            // even after the user has switched away from SfPiano while
+            // a note was held — leaving rustysynth's internal envelope
+            // pinned would leak voices for the AudioContext lifetime.
+            if let Some(s) = self.synth.lock().unwrap().as_mut() {
+                s.note_off(0, note as i32);
+            }
             let mut pool = self.voices.lock().unwrap();
             if let Some(slot) = pool.iter_mut().find(|x| x.key == (0, note)) {
                 slot.inner.trigger_release();
@@ -1099,6 +1158,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     fn build_audio(
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
+        synth: SharedSynth,
         slot: Rc<RefCell<Option<AudioHandle>>>,
         err_slot: Rc<RefCell<Option<String>>>,
         starting: Rc<std::cell::Cell<bool>>,
@@ -1132,6 +1192,49 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         let sr = ctx.sample_rate() as u32;
         web_sys::console::log_1(&format!("keysynth-web: AudioContext sampleRate = {sr} Hz").into());
 
+        // Initialise the embedded GM SoundFont synth now that we know
+        // the actual sample rate. SF2 bytes were baked in at compile
+        // time via `EMBEDDED_SF2`, so this is just a parse + Synthesizer
+        // construction — no fetch, no async. Polyphony cap mirrors the
+        // native build (256) so chord runs don't steal still-decaying
+        // notes. If the parse fails we log + continue: SfPiano will be
+        // silent (every other engine still works), surfacing the error
+        // to console rather than blocking audio start.
+        match SoundFont::new(&mut Cursor::new(EMBEDDED_SF2)) {
+            Ok(sf) => {
+                let mut settings = SynthesizerSettings::new(sr as i32);
+                settings.maximum_polyphony = 256;
+                match Synthesizer::new(&Arc::new(sf), &settings) {
+                    Ok(mut s) => {
+                        // Default to GM program 0 = Acoustic Grand Piano
+                        // on channel 0. `process_midi_message(.., 0xC0,
+                        // program, 0)` is rustysynth's program-change
+                        // entry point; bank stays 0 (the only bank
+                        // GeneralUser-GS ships piano on by default).
+                        s.process_midi_message(0, 0xC0, 0, 0);
+                        *synth.lock().unwrap() = Some(s);
+                        web_sys::console::log_1(
+                            &format!(
+                                "keysynth-web: SF2 ready ({} bytes embedded, sr={sr} Hz)",
+                                EMBEDDED_SF2.len()
+                            )
+                            .into(),
+                        );
+                    }
+                    Err(e) => {
+                        web_sys::console::warn_1(
+                            &format!("keysynth-web: Synthesizer::new failed: {e:?}").into(),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                web_sys::console::warn_1(
+                    &format!("keysynth-web: SoundFont parse failed: {e:?}").into(),
+                );
+            }
+        }
+
         // Inline the worklet processor source as a Blob URL so we don't
         // need to ship a separate JS file via Trunk. The browser caches
         // the URL for the AudioContext's lifetime.
@@ -1153,6 +1256,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             mono: Vec::new(),
             mono_compressed: Vec::new(),
             limiter_gain: 1.0,
+            sf_left: Vec::new(),
+            sf_right: Vec::new(),
         }));
 
         let worklet = ctx
@@ -1165,6 +1270,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         let ctx_clone = ctx.clone();
         let voices_cb = voices.clone();
         let live_cb = live.clone();
+        let synth_cb = synth.clone();
         let render_state_cb = render_state.clone();
         let slot_cb = slot.clone();
         let err_cb = err_slot.clone();
@@ -1227,6 +1333,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             let port_for_cb = port.clone();
             let voices_h = voices_cb;
             let live_h = live_cb;
+            let synth_h = synth_cb;
             let render_h = render_state_cb;
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                 move |ev: web_sys::MessageEvent| {
@@ -1259,7 +1366,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     let arr = {
                         let mut state = render_h.borrow_mut();
                         render_mono_chunk(
-                            &voices_h, master, wet, engine, mix_mode, &mut state, chunk,
+                            &voices_h, &synth_h, master, wet, engine, mix_mode, &mut state, chunk,
                         );
                         let a = js_sys::Float32Array::new_with_length(chunk as u32);
                         a.copy_from(&state.mono);
@@ -1320,6 +1427,13 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         mono: Vec<f32>,
         mono_compressed: Vec<f32>,
         limiter_gain: f32,
+        /// Scratch buffers for the rustysynth `render(left, right)` call
+        /// when `Engine::SfPiano` is active. Held in `RenderState` so
+        /// they're reused across audio blocks instead of allocated
+        /// per-callback (the audio thread can't tolerate hidden heap
+        /// traffic). Resized lazily to match the current chunk size.
+        sf_left: Vec<f32>,
+        sf_right: Vec<f32>,
     }
 
     /// Render `frames` mono samples directly into `state.mono`. Same
@@ -1330,6 +1444,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     /// request `Vec` allocation.
     fn render_mono_chunk(
         voices: &Arc<Mutex<Vec<Voice>>>,
+        synth: &SharedSynth,
         master: f32,
         reverb_wet: f32,
         engine: Engine,
@@ -1342,6 +1457,31 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             mono.resize(frames, 0.0);
         } else {
             mono.fill(0.0);
+        }
+
+        // Mix the rustysynth SF2 voice into the bus when active. Same
+        // downmix-to-mono shape as native `audio_callback` (sf_left +
+        // sf_right) * 0.5. Always render so the synth's internal voice
+        // envelopes keep advancing even on engine switches; the
+        // contribution is only added when SfPiano is the selected
+        // engine so non-SF voices don't get a phantom piano bus.
+        {
+            let mut guard = synth.lock().unwrap();
+            if let Some(s) = guard.as_mut() {
+                if state.sf_left.len() != frames {
+                    state.sf_left.resize(frames, 0.0);
+                    state.sf_right.resize(frames, 0.0);
+                } else {
+                    state.sf_left.fill(0.0);
+                    state.sf_right.fill(0.0);
+                }
+                s.render(state.sf_left.as_mut_slice(), state.sf_right.as_mut_slice());
+                if engine == Engine::SfPiano {
+                    for i in 0..frames {
+                        mono[i] += (state.sf_left[i] + state.sf_right[i]) * 0.5;
+                    }
+                }
+            }
         }
 
         {
