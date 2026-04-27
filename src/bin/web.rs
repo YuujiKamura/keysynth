@@ -669,6 +669,13 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// closure — using a separate Rc avoids re-entering `&mut
         /// self` during update().
         recent_events: Rc<RefCell<VecDeque<String>>>,
+        /// Active recording buffer when the user is capturing audio for
+        /// offline A/B against the native build. `Some(Vec<f32>)` from
+        /// the moment Record is clicked until Stop; the render closure
+        /// appends each `state.mono` chunk to it. `None` when idle.
+        /// Capped at ~30 s (sr × 30 samples) so a forgotten recording
+        /// doesn't grow unbounded.
+        recording: Rc<RefCell<Option<Vec<f32>>>>,
     }
 
     impl Default for WebApp {
@@ -720,6 +727,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 // `Engine::PianoModal` default in `LiveParams` above.
                 current_voice_idx: Rc::new(std::cell::Cell::new(0)),
                 recent_events: Rc::new(RefCell::new(VecDeque::with_capacity(64))),
+                recording: Rc::new(RefCell::new(None)),
             }
         }
     }
@@ -741,6 +749,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 self.voices.clone(),
                 self.live.clone(),
                 self.synth.clone(),
+                self.recording.clone(),
                 self.audio.clone(),
                 self.audio_err.clone(),
                 self.audio_starting.clone(),
@@ -1042,6 +1051,54 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         /// the next keypress immediately sounds the new patch (no
         /// note-driven catch-up). Logs to the MIDI log so the user
         /// can see the swap reflected.
+        /// Toggle live audio capture. First click stashes an empty
+        /// `Vec<f32>` in `self.recording` so the render closure starts
+        /// appending each rendered chunk; second click pops the buffer,
+        /// encodes it as 16-bit PCM mono WAV at the AudioContext sample
+        /// rate, and triggers a browser download via a hidden anchor.
+        /// Used for offline A/B against the native build (compare with
+        /// `render_chord` output through `ab-test/analyse.py`).
+        fn toggle_recording(&self) {
+            // Don't try to record before the AudioContext is live —
+            // there's nothing to capture and `sample_rate` is 0.
+            if self.audio.borrow().is_none() || self.sample_rate == 0 {
+                self.push_event("record: ignored (audio not started)".to_string());
+                return;
+            }
+            // Take the current state out so the render closure sees
+            // None mid-encode (no further appends contaminate the
+            // captured buffer).
+            let captured: Option<Vec<f32>> = {
+                let mut rec = self.recording.borrow_mut();
+                rec.take()
+            };
+            match captured {
+                None => {
+                    // Was idle → arm.
+                    *self.recording.borrow_mut() =
+                        Some(Vec::with_capacity((self.sample_rate as usize) * 4));
+                    self.push_event("record: ●".to_string());
+                }
+                Some(buf) => {
+                    // Was recording → encode + download.
+                    let sr = self.sample_rate;
+                    let n = buf.len();
+                    self.push_event(format!(
+                        "record: ■ {n} samples ({:.2}s)",
+                        n as f32 / sr as f32
+                    ));
+                    let wav_bytes = encode_wav_16bit_mono(&buf, sr);
+                    if let Err(e) =
+                        trigger_download(&wav_bytes, "keysynth-recording.wav", "audio/wav")
+                    {
+                        web_sys::console::warn_1(
+                            &format!("keysynth-web: download failed: {e}").into(),
+                        );
+                    }
+                }
+            }
+        }
+
         fn apply_voice_slot(&self, idx: usize, slot: &WebVoiceSlot) {
             {
                 let mut lp = self.live.lock().unwrap();
@@ -1620,10 +1677,37 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     if panic_btn.clicked() {
                         self.panic_release();
                     }
+
+                    // Live-audio capture toggle for offline A/B against
+                    // the native build. Click → arm, click again →
+                    // download `keysynth-recording.wav`. Capped at 30 s
+                    // so a forgotten recording doesn't leak memory.
+                    let recording_active = self.recording.borrow().is_some();
+                    let (label, fill) = if recording_active {
+                        (
+                            "■ Stop & download .wav",
+                            egui::Color32::from_rgb(220, 90, 90),
+                        )
+                    } else {
+                        ("● Record audio", egui::Color32::from_rgb(60, 130, 200))
+                    };
+                    let rec_btn = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new(label)
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .fill(fill)
+                        .min_size(egui::vec2(180.0, 22.0)),
+                    );
+                    if rec_btn.clicked() {
+                        self.toggle_recording();
+                    }
+
                     ui.add_space(8.0);
                     ui.label(
                         egui::RichText::new(
-                            "(Press if keys get stuck. Also fires automatically when the page loses focus.)",
+                            "(Press Panic if keys get stuck. Record captures the live audio bus to a WAV file.)",
                         )
                         .small()
                         .color(egui::Color32::from_gray(160)),
@@ -1725,6 +1809,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
         synth: SharedSynth,
+        recording: Rc<RefCell<Option<Vec<f32>>>>,
         slot: Rc<RefCell<Option<AudioHandle>>>,
         err_slot: Rc<RefCell<Option<String>>>,
         starting: Rc<std::cell::Cell<bool>>,
@@ -1794,6 +1879,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
         let voices_cb = voices.clone();
         let live_cb = live.clone();
         let synth_cb = synth.clone();
+        let recording_cb = recording.clone();
         let render_state_cb = render_state.clone();
         let slot_cb = slot.clone();
         let err_cb = err_slot.clone();
@@ -1857,6 +1943,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             let voices_h = voices_cb;
             let live_h = live_cb;
             let synth_h = synth_cb;
+            let recording_h = recording_cb;
             let render_h = render_state_cb;
             let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
                 move |ev: web_sys::MessageEvent| {
@@ -1891,6 +1978,21 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                         render_mono_chunk(
                             &voices_h, &synth_h, master, wet, engine, mix_mode, &mut state, chunk,
                         );
+                        // Tap the rendered samples into the active
+                        // recording buffer (if any). 30 s soft cap so
+                        // a forgotten record doesn't grow unbounded;
+                        // beyond that we just silently drop further
+                        // chunks until the user clicks Stop.
+                        if let Ok(mut rec) = recording_h.try_borrow_mut() {
+                            if let Some(buf) = rec.as_mut() {
+                                let max_samples = (sr as usize) * 30;
+                                if buf.len() < max_samples {
+                                    let remaining = max_samples - buf.len();
+                                    let take = state.mono.len().min(remaining);
+                                    buf.extend_from_slice(&state.mono[..take]);
+                                }
+                            }
+                        }
                         let a = js_sys::Float32Array::new_with_length(chunk as u32);
                         a.copy_from(&state.mono);
                         a
@@ -2127,6 +2229,70 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
     // ---------------------------------------------------------------------
     // Web MIDI handshake
     // ---------------------------------------------------------------------
+
+    /// Encode a mono float32 sample buffer as a 16-bit PCM WAV at
+    /// `sr` Hz. Hand-rolled (no `hound` on the web feature) since the
+    /// data layout is small and known. Output is a complete WAV file
+    /// ready for `Blob::new` + download.
+    fn encode_wav_16bit_mono(samples: &[f32], sr: u32) -> Vec<u8> {
+        let n = samples.len();
+        let data_bytes = (n * 2) as u32; // 16 bit = 2 bytes per sample
+        let chunk_size = 36 + data_bytes;
+        let mut out = Vec::with_capacity(44 + n * 2);
+        // RIFF header.
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&chunk_size.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        // fmt sub-chunk.
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // sub-chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // num channels
+        out.extend_from_slice(&sr.to_le_bytes()); // sample rate
+        out.extend_from_slice(&(sr * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+                                                     // data sub-chunk.
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_bytes.to_le_bytes());
+        for &s in samples {
+            let clamped = s.clamp(-1.0, 1.0);
+            let v = (clamped * 32767.0) as i16;
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
+    /// Trigger a browser download of `bytes` as `filename`. Wraps the
+    /// Blob → object URL → `<a download>` click → revoke pattern so
+    /// `toggle_recording` doesn't carry the boilerplate inline.
+    fn trigger_download(bytes: &[u8], filename: &str, mime: &str) -> Result<(), String> {
+        // wasm-bindgen Blob constructor wants a JS array of parts.
+        let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+        arr.copy_from(bytes);
+        let parts = js_sys::Array::new();
+        parts.push(&arr.buffer());
+        let opts = web_sys::BlobPropertyBag::new();
+        opts.set_type(mime);
+        let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&parts, &opts)
+            .map_err(|e| format!("Blob::new: {e:?}"))?;
+        let url = web_sys::Url::create_object_url_with_blob(&blob)
+            .map_err(|e| format!("createObjectURL: {e:?}"))?;
+        let document = web_sys::window()
+            .ok_or_else(|| "no window".to_string())?
+            .document()
+            .ok_or_else(|| "no document".to_string())?;
+        let a: web_sys::HtmlAnchorElement = document
+            .create_element("a")
+            .map_err(|e| format!("create_element(a): {e:?}"))?
+            .dyn_into()
+            .map_err(|_| "anchor cast".to_string())?;
+        a.set_href(&url);
+        a.set_download(filename);
+        a.click();
+        let _ = web_sys::Url::revoke_object_url(&url);
+        Ok(())
+    }
 
     /// Fetch the SF2 bytes from `SF2_URL` (a static asset trunk copies
     /// next to the wasm), parse with rustysynth at `sr` Hz, set the
