@@ -193,6 +193,141 @@ mod imp {
         ),
     ];
 
+    /// Top-level grouping in the voice browser side panel. Mirrors
+    /// `crate::voice_lib::Category` on the native (live-hotswap) build
+    /// minus the `Custom` category — Custom slots persist to
+    /// `~/.keysynth/voices.json` on native, which we have no
+    /// equivalent for on wasm32 so the category would always be
+    /// empty.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum VoiceCategory {
+        Piano,
+        Synth,
+    }
+
+    impl VoiceCategory {
+        const ALL: &'static [VoiceCategory] = &[VoiceCategory::Piano, VoiceCategory::Synth];
+
+        fn label(self) -> &'static str {
+            match self {
+                VoiceCategory::Piano => "Piano",
+                VoiceCategory::Synth => "Other (synth)",
+            }
+        }
+    }
+
+    /// One row in the voice browser. Selecting a slot sets the live
+    /// `engine` and (when the slot points at `Engine::SfPiano`) the
+    /// SF2 program / bank in one click — same shape as the native
+    /// `VoiceSlot` apply path. The wasm build can't load arbitrary
+    /// SFZ / SF2 files at runtime so the slot list is hardcoded;
+    /// future work could persist user-added slots to localStorage.
+    struct WebVoiceSlot {
+        label: &'static str,
+        category: VoiceCategory,
+        engine: Engine,
+        /// GM program for `Engine::SfPiano` slots; ignored otherwise.
+        sf_program: u8,
+        /// GM bank for `Engine::SfPiano` slots (0 = melodic, 128 =
+        /// drum kit); ignored otherwise.
+        sf_bank: u8,
+    }
+
+    /// Built-in voice library shown in the left side panel. Mirrors
+    /// the native `VoiceLibrary::builtins` on the live-hotswap branch
+    /// minus the SFZ slot (no Salamander on Pages) and the modal
+    /// preset variants (those need the `MODAL_PHYSICS` atomic +
+    /// `ModalPreset` enum which only exist on live-hotswap; here a
+    /// single "Modal piano" slot covers `Engine::PianoModal`).
+    const WEB_VOICE_SLOTS: &[WebVoiceSlot] = &[
+        // ── Piano family ────────────────────────────────────────────
+        WebVoiceSlot {
+            label: "Modal piano",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoModal,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS Piano",
+            category: VoiceCategory::Piano,
+            engine: Engine::Piano,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS Piano (thick)",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoThick,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS Piano (lite)",
+            category: VoiceCategory::Piano,
+            engine: Engine::PianoLite,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS Piano (5 AM)",
+            category: VoiceCategory::Piano,
+            engine: Engine::Piano5AM,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "GeneralUser GS (SF2 piano)",
+            category: VoiceCategory::Piano,
+            engine: Engine::SfPiano,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        // ── Synth family ────────────────────────────────────────────
+        WebVoiceSlot {
+            label: "Square (NES)",
+            category: VoiceCategory::Synth,
+            engine: Engine::Square,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS pluck",
+            category: VoiceCategory::Synth,
+            engine: Engine::Ks,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "KS rich",
+            category: VoiceCategory::Synth,
+            engine: Engine::KsRich,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "Sub (subtractive)",
+            category: VoiceCategory::Synth,
+            engine: Engine::Sub,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "FM bell",
+            category: VoiceCategory::Synth,
+            engine: Engine::Fm,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+        WebVoiceSlot {
+            label: "Koto",
+            category: VoiceCategory::Synth,
+            engine: Engine::Koto,
+            sf_program: 0,
+            sf_bank: 0,
+        },
+    ];
+
     // PC keyboard → MIDI semitone offset within the current octave.
     // Standard tracker layout: bottom row = white keys, q-row = upper octave.
     const PC_KEYMAP: &[(egui::Key, i32)] = &[
@@ -829,113 +964,182 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
             events.push_back(line);
         }
 
-        /// Render the GM 128 patch picker on the left. Disabled (greyed)
-        /// unless `Engine::SfPiano` is the currently selected engine —
-        /// the patch number only matters for the SoundFont path.
-        fn draw_instruments_panel(&self, ctx: &egui::Context) {
-            let (engine, mut sf_program, mut sf_bank) = {
+        /// Apply a voice slot click: swap the live engine, set the SF2
+        /// program/bank if the slot points at SfPiano, and push the GM
+        /// Bank Select + Program Change pair into the shared synth so
+        /// the next keypress immediately sounds the new patch (no
+        /// note-driven catch-up). Logs to the MIDI log so the user
+        /// can see the swap reflected.
+        fn apply_voice_slot(&self, slot: &WebVoiceSlot) {
+            {
+                let mut lp = self.live.lock().unwrap();
+                lp.engine = slot.engine;
+                if slot.engine == Engine::SfPiano {
+                    lp.sf_program = slot.sf_program;
+                    lp.sf_bank = slot.sf_bank;
+                }
+            }
+            if slot.engine == Engine::SfPiano {
+                if let Some(s) = self.synth.lock().unwrap().as_mut() {
+                    // Bank Select MSB then Program Change — bank only
+                    // takes effect on the next PC per GM/GS spec, so
+                    // we always emit the pair together.
+                    s.process_midi_message(0, 0xB0, 0, slot.sf_bank as i32);
+                    s.process_midi_message(0, 0xC0, slot.sf_program as i32, 0);
+                }
+            }
+            self.push_event(format!("voice → {}", slot.label));
+        }
+
+        /// Apply a GM 128 patch pick (separate from voice slots — these
+        /// only switch program/bank within the SfPiano voice that's
+        /// already active; engine stays put). Mirrors the native
+        /// hot-swap path under `if engine == Engine::SfPiano` in
+        /// `src/ui.rs:713`.
+        fn apply_sf_patch(&self, sf_program: u8, sf_bank: u8) {
+            {
+                let mut lp = self.live.lock().unwrap();
+                lp.sf_program = sf_program;
+                lp.sf_bank = sf_bank;
+            }
+            if let Some(s) = self.synth.lock().unwrap().as_mut() {
+                s.process_midi_message(0, 0xB0, 0, sf_bank as i32);
+                s.process_midi_message(0, 0xC0, sf_program as i32, 0);
+            }
+            self.push_event(format!("patch program={sf_program} bank={sf_bank}"));
+        }
+
+        /// Render the voice browser on the left. Mirrors `src/ui.rs:538`
+        /// on the live-hotswap branch: categorised list of voice slots
+        /// (Piano / Synth) where one click swaps engine + (for SF2
+        /// slots) program/bank in one operation. When `Engine::SfPiano`
+        /// is the active voice, a collapsible "GM 128 patches"
+        /// sub-section appears below for live program switching
+        /// (mirrors `src/ui.rs:715`).
+        fn draw_voice_browser(&self, ctx: &egui::Context) {
+            let (engine, sf_program, sf_bank) = {
                 let lp = self.live.lock().unwrap();
                 (lp.engine, lp.sf_program, lp.sf_bank)
             };
-            let sf_active = engine == Engine::SfPiano;
-            let mut changed = false;
-            egui::SidePanel::left("instruments")
-                .default_width(280.0)
+            let mut clicked_slot: Option<usize> = None;
+            let mut clicked_patch: Option<(u8, u8)> = None;
+            egui::SidePanel::left("voice_browser")
+                .default_width(260.0)
+                .min_width(200.0)
                 .show(ctx, |ui| {
-                    ui.heading("GM 128 patches");
-                    ui.add_space(2.0);
-                    // Drum-kit toggle. GeneralUser-GS maps drum kits to
-                    // bank 128; program then selects the kit (0 =
-                    // Standard, 8 = Room, 16 = Power, ...). When drum
-                    // mode is on, melodic patch clicks below first flip
-                    // bank back to 0.
-                    ui.horizontal(|ui| {
-                        let drum_on = sf_bank == 128;
-                        let label = if drum_on {
-                            "Drum Kit (bank 128) [ON]"
-                        } else {
-                            "Drum Kit (bank 128) [off]"
-                        };
-                        if ui.selectable_label(drum_on, label).clicked() {
-                            sf_bank = if drum_on { 0 } else { 128 };
-                            changed = true;
-                        }
-                    });
+                    ui.heading("Voices");
                     ui.label(
-                        egui::RichText::new(if sf_active {
-                            "Click an instrument to switch live."
-                        } else {
-                            "Switch engine to SF2 piano to use these."
-                        })
-                        .small()
-                        .color(egui::Color32::from_rgb(170, 170, 170)),
+                        egui::RichText::new("Click to switch instrument live.")
+                            .small()
+                            .color(egui::Color32::from_rgb(170, 170, 170)),
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            ui.add_enabled_ui(sf_active, |ui| {
-                                for family in GM_FAMILIES.iter() {
-                                    // Open Pianos by default; other
-                                    // families collapse so the panel
-                                    // stays scannable on narrow
-                                    // viewports.
-                                    let default_open = *family == "Pianos";
-                                    egui::CollapsingHeader::new(*family)
-                                        .default_open(default_open)
-                                        .show(ui, |ui| {
-                                            for (prog, name, fam) in GM_INSTRUMENTS.iter() {
-                                                if fam != family {
-                                                    continue;
-                                                }
-                                                let selected =
-                                                    sf_program == *prog && sf_bank != 128;
-                                                let label_text = format!("[{:>3}] {}", prog, name);
-                                                let rich = if selected {
-                                                    egui::RichText::new(label_text)
+                            for cat in VoiceCategory::ALL {
+                                egui::CollapsingHeader::new(cat.label())
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for (idx, slot) in WEB_VOICE_SLOTS.iter().enumerate() {
+                                            if slot.category != *cat {
+                                                continue;
+                                            }
+                                            let is_active = engine == slot.engine
+                                                && (slot.engine != Engine::SfPiano
+                                                    || (sf_program == slot.sf_program
+                                                        && sf_bank == slot.sf_bank));
+                                            ui.horizontal(|ui| {
+                                                ui.label(if is_active { "●" } else { "○" });
+                                                let rich = if is_active {
+                                                    egui::RichText::new(slot.label)
                                                         .monospace()
                                                         .strong()
                                                         .color(egui::Color32::from_rgb(
                                                             255, 220, 120,
                                                         ))
                                                 } else {
-                                                    egui::RichText::new(label_text).monospace()
+                                                    egui::RichText::new(slot.label).monospace()
                                                 };
-                                                if ui.selectable_label(selected, rich).clicked() {
-                                                    sf_program = *prog;
-                                                    // Picking a melodic
-                                                    // patch implicitly
-                                                    // leaves drum mode.
-                                                    sf_bank = 0;
-                                                    changed = true;
+                                                if ui.selectable_label(is_active, rich).clicked() {
+                                                    clicked_slot = Some(idx);
                                                 }
-                                            }
-                                        });
-                                }
-                            });
+                                            });
+                                        }
+                                    });
+                            }
+                            // GM 128 patch picker collapsible — only
+                            // surfaced when SfPiano is the active voice
+                            // since program/bank are no-ops for every
+                            // other engine. Same shape as
+                            // `src/ui.rs:715`: drum-kit toggle on top,
+                            // family-collapsing list below, click =
+                            // live patch swap.
+                            if engine == Engine::SfPiano {
+                                ui.add_space(6.0);
+                                ui.separator();
+                                egui::CollapsingHeader::new("GM 128 patches")
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        let drum_on = sf_bank == 128;
+                                        let drum_label = if drum_on {
+                                            "Drum Kit (bank 128) [ON]"
+                                        } else {
+                                            "Drum Kit (bank 128) [off]"
+                                        };
+                                        if ui.selectable_label(drum_on, drum_label).clicked() {
+                                            let new_bank = if drum_on { 0 } else { 128 };
+                                            clicked_patch = Some((sf_program, new_bank));
+                                        }
+                                        for family in GM_FAMILIES.iter() {
+                                            let default_open = *family == "Pianos";
+                                            egui::CollapsingHeader::new(*family)
+                                                .default_open(default_open)
+                                                .show(ui, |ui| {
+                                                    for (prog, name, fam) in GM_INSTRUMENTS.iter() {
+                                                        if fam != family {
+                                                            continue;
+                                                        }
+                                                        let selected =
+                                                            sf_program == *prog && sf_bank != 128;
+                                                        let label_text =
+                                                            format!("[{:>3}] {}", prog, name);
+                                                        let rich = if selected {
+                                                            egui::RichText::new(label_text)
+                                                                .monospace()
+                                                                .strong()
+                                                                .color(egui::Color32::from_rgb(
+                                                                    255, 220, 120,
+                                                                ))
+                                                        } else {
+                                                            egui::RichText::new(label_text)
+                                                                .monospace()
+                                                        };
+                                                        if ui
+                                                            .selectable_label(selected, rich)
+                                                            .clicked()
+                                                        {
+                                                            // Picking
+                                                            // a melodic
+                                                            // patch
+                                                            // implicitly
+                                                            // leaves
+                                                            // drum mode.
+                                                            clicked_patch = Some((*prog, 0));
+                                                        }
+                                                    }
+                                                });
+                                        }
+                                    });
+                            }
                         });
                 });
 
-            // Apply changes outside the panel closure: persist the new
-            // program/bank in `LiveParams` for the audio render to
-            // observe, and immediately push the GM Bank Select + Program
-            // Change pair into the shared synth so the next keypress
-            // sounds the new patch instead of waiting on note-driven
-            // path. No-op when the synth hasn't loaded yet.
-            if changed {
-                {
-                    let mut lp = self.live.lock().unwrap();
-                    lp.sf_program = sf_program;
-                    lp.sf_bank = sf_bank;
-                }
-                if let Some(s) = self.synth.lock().unwrap().as_mut() {
-                    // CC 0 = Bank Select MSB. Per GM/GS spec, bank
-                    // change only takes effect on the next program
-                    // change so we always emit the pair together.
-                    s.process_midi_message(0, 0xB0, 0, sf_bank as i32);
-                    s.process_midi_message(0, 0xC0, sf_program as i32, 0);
-                }
-                self.push_event(format!("patch program={sf_program} bank={sf_bank}"));
+            if let Some(idx) = clicked_slot {
+                self.apply_voice_slot(&WEB_VOICE_SLOTS[idx]);
+            }
+            if let Some((p, b)) = clicked_patch {
+                self.apply_sf_patch(p, b);
             }
         }
 
@@ -1283,26 +1487,15 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     }
                 });
 
-                // Engine selector as a row of selectable labels,
-                // mirroring `src/ui.rs:139` on the native side. Short
-                // CLI-style labels (square / ks / piano-modal …) so
-                // the row stays compact across the full engine list;
-                // the long human-readable description shows below for
-                // the current selection.
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("engine:");
-                    for (eng, label, _desc) in ENGINES_FOR_WEB {
-                        let selected = live.engine == *eng;
-                        if ui.selectable_label(selected, *label).clicked() {
-                            live.engine = *eng;
-                        }
-                    }
-                    // Show the live SoundFont patch name beside the
-                    // engine selector when SfPiano is active so the
-                    // user always knows what timbre the next keypress
-                    // will produce — same shape as `src/ui.rs:150`.
-                    if live.engine == Engine::SfPiano {
-                        ui.separator();
+                // Live SoundFont patch readout when SfPiano is the
+                // active voice. Engine selection lives in the left
+                // voice browser (mirrors live-hotswap `src/ui.rs:538`),
+                // not in this top-bar — duplicating the row would
+                // give the user two places to swap engines and they'd
+                // drift out of sync.
+                if live.engine == Engine::SfPiano {
+                    ui.horizontal(|ui| {
+                        ui.label("patch:");
                         let prog = live.sf_program;
                         let bank = live.sf_bank;
                         let name = GM_INSTRUMENTS
@@ -1319,8 +1512,8 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                                 .monospace()
                                 .color(egui::Color32::from_rgb(255, 200, 80)),
                         );
-                    }
-                });
+                    });
+                }
                 drop(live);
 
                 // Manual panic / all-notes-off button. Always-visible
@@ -1355,12 +1548,10 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 // Description of the currently-selected engine,
                 // rendered on its own row as a wrapping `Label` so
                 // long sentences break cleanly on narrow viewports.
-                // (`horizontal_wrapped` + `add_space` would only indent
-                // the first wrapped line and break alignment on every
-                // subsequent line — Gemini medium thread on this
-                // diff.) Plain dim text, no faked column indent — the
-                // description is a description of the row above, not a
-                // column under the dropdown.
+                // The `ENGINES_FOR_WEB` table (kept around purely for
+                // these descriptions; engine selection now happens via
+                // the voice browser) maps each engine to a one-line
+                // explanation of what it actually does.
                 if !current_desc.is_empty() {
                     ui.add_space(2.0);
                     ui.add(
@@ -1391,15 +1582,14 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                 });
             });
 
-            // Left side panel: GM 128 patch picker for `Engine::SfPiano`.
-            // Mirrors the native build's `instruments` SidePanel — same
-            // collapsible-by-family layout, same drum-kit (bank 128)
-            // toggle, same "switch engine to sf-piano to use these"
-            // hint for the disabled state. Click an instrument to flip
-            // `live.sf_program` / `live.sf_bank` and push the GM Bank
-            // Select + Program Change pair into rustysynth so the next
-            // keypress sounds the new patch.
-            self.draw_instruments_panel(ctx);
+            // Left side panel: voice browser. Mirrors the native
+            // (live-hotswap) `voice_browser` SidePanel — categorised
+            // list of voice slots (Piano / Synth) where one click
+            // swaps engine + (for SF2 slots) program/bank in a single
+            // operation. When SfPiano is the active voice, a
+            // collapsible "GM 128 patches" sub-section appears below
+            // for live program switching.
+            self.draw_voice_browser(ctx);
 
             // Right side panel: rolling MIDI log. `recent_events` is
             // populated by note_on / note_off (covers both PC keyboard
