@@ -8,21 +8,34 @@
 //! Native-only modules (offline analysis, SFZ sampler, IR-WAV reverb
 //! loader, midir-driven dashboard) are gated behind the `native` Cargo
 //! feature so the wasm32 build for the GitHub Pages demo doesn't try to
-//! pull in midir / hound / rustfft / image / rustysynth.
+//! pull in midir / hound / rustfft / image / rustysynth / etc.
 
 pub mod gm;
+pub mod resample;
 pub mod reverb;
 pub mod soundboard;
 pub mod sympathetic;
 pub mod synth;
+pub mod voice_lib;
 pub mod voices;
 
+// Native-only modules: pull in midir / rustysynth / rustfft / hound /
+// game-music-emu / midly / symphonia which are gated out of the
+// wasm32 build via the `web` Cargo feature.
 #[cfg(feature = "native")]
 pub mod analysis;
+#[cfg(feature = "native")]
+pub mod chiptune_import;
+#[cfg(feature = "native")]
+pub mod drums;
+#[cfg(feature = "native")]
+pub mod dsp;
 #[cfg(feature = "native")]
 pub mod extract;
 #[cfg(feature = "native")]
 pub mod score;
+#[cfg(feature = "native")]
+pub mod sequencer;
 #[cfg(feature = "native")]
 pub mod sfz;
 #[cfg(feature = "native")]

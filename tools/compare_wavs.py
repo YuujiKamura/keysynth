@@ -226,6 +226,29 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
         diff = ref_lin - cand_lin
         residual_l2 = float(np.sqrt(np.mean(diff[f_mask, :] ** 2)))
 
+        # A-weighted residual_l2: same diff² but weighted per-frequency
+        # by the IEC 61672 A-curve (linear power weight = 10^(A_dB/10)).
+        # Ear-relevant: emphasises 500-5000 Hz where human sensitivity
+        # peaks, de-emphasises <100 Hz and >10 kHz. Diverges from the
+        # unweighted metric when modal+filter trades a low-band fix
+        # for mid-band buildup that the listener still hears.
+        f_safe = np.maximum(f_axis, 1.0)
+        f2 = f_safe ** 2
+        ra = (
+            (12194.0 ** 2) * (f_safe ** 4)
+            / (
+                (f2 + 20.6 ** 2)
+                * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
+                * (f2 + 12194.0 ** 2)
+            )
+        )
+        a_db = 20.0 * np.log10(np.maximum(ra, 1e-12)) + 2.00
+        a_w = 10.0 ** (a_db / 10.0)  # linear power weight
+        a_w_masked = np.where(f_mask, a_w, 0.0)[:, None]
+        weighted_sq = (diff ** 2) * a_w_masked
+        denom = float(np.sum(a_w_masked) * diff.shape[1])
+        residual_l2_aw = float(np.sqrt(np.sum(weighted_sq) / max(denom, 1e-12)))
+
         # Per-band energy ratio: ref total / cand total in linear sum.
         # Ratio > 1 means cand is QUIETER than ref (deficit), <1 means
         # cand is LOUDER (surplus).
@@ -237,7 +260,185 @@ def plot_compare(ref_path: Path, cand_path: Path, out_path: Path, label_ref: str
             (2000, 4000, "hi (2-4k)"),
             (4000, 8000, "very-hi (4-8k)"),
         ]
+        # Inter-partial floor: how much energy lives BETWEEN the partial
+        # peaks. Real recordings (SFZ Salamander) carry soundboard
+        # resonances + room reverb + sympathetic strings → continuous
+        # spectrum *between* partials. A pure modal bank produces ~0
+        # energy between peaks (the "dead inter-partial silence" Risset
+        # & Wessel called the missing piece of spectral fusion). Reported
+        # as the ratio of floor energy ref/cand: large positive dB means
+        # cand has a deader floor than ref ("lo-fi" signature).
+        ref_avg = ref_lin.mean(axis=1)
+        n_bins = ref_avg.shape[0]
+        # Detect partial peaks in the averaged ref spectrum: local max
+        # over ±10 bins, > 5 % of global max.
+        peak_window = 10
+        peak_thresh = 0.05 * float(ref_avg.max())
+        is_peak = np.zeros(n_bins, dtype=bool)
+        for i in range(peak_window, n_bins - peak_window):
+            local = ref_avg[i - peak_window : i + peak_window + 1]
+            if ref_avg[i] == local.max() and ref_avg[i] > peak_thresh:
+                is_peak[i] = True
+        # "Near peak" mask = peak ± 3 bins. Floor mask = the rest.
+        near_radius = 3
+        near_peak = np.zeros(n_bins, dtype=bool)
+        for p in np.where(is_peak)[0]:
+            near_peak[max(0, p - near_radius) : min(n_bins, p + near_radius + 1)] = True
+        floor_mask = (~near_peak) & f_mask
+        ref_floor_e = float(np.sum(ref_lin[floor_mask, :] ** 2))
+        cand_floor_e = float(np.sum(cand_lin[floor_mask, :] ** 2))
+        if cand_floor_e > 1e-12 and ref_floor_e > 1e-12:
+            floor_ratio_db = 10.0 * np.log10(ref_floor_e / cand_floor_e)
+        else:
+            floor_ratio_db = float("inf") if ref_floor_e > 1e-12 else float("-inf")
+
+        # Centroid trajectory MSE: spectral centroid SC(t) per frame
+        # (Σ f·|X(f,t)| / Σ |X(f,t)|), MSE between ref and cand
+        # trajectories. Captures dynamic brightness behaviour (Saitis &
+        # Weinzierl 2019) which static energy comparison averages away.
+        f_for_sc = f_axis[f_mask]
+        ref_masked = ref_lin[f_mask, :]
+        cand_masked = cand_lin[f_mask, :]
+        ref_sc = (ref_masked * f_for_sc[:, None]).sum(axis=0) / np.maximum(
+            ref_masked.sum(axis=0), 1e-12
+        )
+        cand_sc = (cand_masked * f_for_sc[:, None]).sum(axis=0) / np.maximum(
+            cand_masked.sum(axis=0), 1e-12
+        )
+        centroid_mse_hz = float(np.sqrt(np.mean((ref_sc - cand_sc) ** 2)))
+
+        # ----- Time-domain diagnostics (built so the assistant can spot
+        # perceptual issues on its own instead of waiting for user to
+        # report them — e.g., the 二拍 on quick taps and the chord 割れ
+        # that frame-averaged spectral metrics smear away).
+
+        # 1. Attack-event count in the first 200 ms. Real piano has ONE
+        # rising envelope edge per keypress (single hammer impact);
+        # any synth that produces 2+ peaks in that window has a
+        # structural double-tap signature.
+        env_win_ms = 10
+        env_win = int(sr * env_win_ms / 1000)
+        n_env_chunks = len(ref) // env_win
+
+        def envelope_db(samples: np.ndarray) -> np.ndarray:
+            chunked = samples[: n_env_chunks * env_win].reshape(
+                n_env_chunks, env_win
+            )
+            rms = np.sqrt(np.maximum(np.mean(chunked**2, axis=1), 1e-12))
+            return 20.0 * np.log10(rms)
+
+        ref_env_db = envelope_db(ref)
+        cand_env_db = envelope_db(cand)
+
+        def count_attack_events(env: np.ndarray, max_ms: int = 200) -> int:
+            """Count distinct envelope peaks within max_ms window.
+
+            A "peak" = local maximum within ±2 windows whose value sits
+            within 15 dB of the global peak in the analysis window.
+            Adjacent peaks closer than 30 ms are merged (single rise +
+            tiny ripple), so a clean single tap returns 1 and a real
+            double-tap (two distinct rises ≥ 30 ms apart) returns 2.
+            """
+            n_first = max(3, int(max_ms / env_win_ms))
+            window = env[: min(n_first, len(env))]
+            if len(window) < 3:
+                return 0
+            peak_global = float(window.max())
+            threshold = peak_global - 15.0
+            candidates: list[int] = []
+            for i in range(len(window)):
+                lo = max(0, i - 2)
+                hi = min(len(window), i + 3)
+                is_local_max = all(
+                    window[i] >= window[j] for j in range(lo, hi) if j != i
+                )
+                if is_local_max and window[i] > threshold:
+                    candidates.append(i)
+            # Merge candidates < 30 ms (3 windows at 10 ms) apart.
+            merged: list[int] = []
+            for c in candidates:
+                if not merged or c - merged[-1] >= 3:
+                    merged.append(c)
+            return len(merged)
+
+        def attack_peak_times_ms(env: np.ndarray, max_ms: int = 200) -> list[int]:
+            n_first = max(3, int(max_ms / env_win_ms))
+            window = env[: min(n_first, len(env))]
+            if len(window) < 3:
+                return []
+            peak_global = float(window.max())
+            threshold = peak_global - 15.0
+            candidates: list[int] = []
+            for i in range(len(window)):
+                lo = max(0, i - 2)
+                hi = min(len(window), i + 3)
+                is_local_max = all(
+                    window[i] >= window[j] for j in range(lo, hi) if j != i
+                )
+                if is_local_max and window[i] > threshold:
+                    candidates.append(i)
+            merged: list[int] = []
+            for c in candidates:
+                if not merged or c - merged[-1] >= 3:
+                    merged.append(c)
+            return [m * env_win_ms for m in merged]
+
+        ref_attacks = count_attack_events(ref_env_db)
+        cand_attacks = count_attack_events(cand_env_db)
+        ref_attack_times = attack_peak_times_ms(ref_env_db)
+        cand_attack_times = attack_peak_times_ms(cand_env_db)
+
+        # 2. Transient peak ratio (crest factor). Hard tanh saturation
+        # squashes peaks toward RMS, dropping crest factor; a clean
+        # signal stays high (10-15 dB on piano-like material). Lower
+        # than ref by >3 dB → likely tanh-clipping going on.
+        def crest_db(samples: np.ndarray) -> float:
+            peak = float(np.max(np.abs(samples)))
+            rms = float(np.sqrt(np.mean(samples**2)))
+            if rms < 1e-12:
+                return float("nan")
+            return 20.0 * np.log10(peak / rms)
+
+        ref_crest = crest_db(ref)
+        cand_crest = crest_db(cand)
+
+        # 3. Max instantaneous-peak history in 10 ms windows. Reports
+        # the peak block (block index where cand peak is highest); if
+        # peak occurs late and is high, sustained-chord pile-up. If
+        # peak is early, hammer attack dominant.
+        def peak_block_history(samples: np.ndarray) -> tuple[int, float, int]:
+            chunked = samples[: n_env_chunks * env_win].reshape(
+                n_env_chunks, env_win
+            )
+            block_peaks = np.max(np.abs(chunked), axis=1)
+            idx = int(np.argmax(block_peaks))
+            return idx, float(block_peaks[idx]), n_env_chunks
+
+        ref_peak_idx, ref_peak_val, _ = peak_block_history(ref)
+        cand_peak_idx, cand_peak_val, n_blocks = peak_block_history(cand)
+
         print(f"residual_l2={residual_l2:.6f}")
+        print(f"residual_l2_aw={residual_l2_aw:.6f}")
+        print(
+            f"inter_partial_floor: ref_e={ref_floor_e:.2e} cand_e={cand_floor_e:.2e} "
+            f"ref/cand={floor_ratio_db:+.1f} dB"
+        )
+        print(f"centroid_mse_hz={centroid_mse_hz:.1f}")
+        print(
+            f"attack_events_first_200ms: ref={ref_attacks} cand={cand_attacks}"
+            f"  ({'OK' if cand_attacks <= ref_attacks else 'CAND HAS EXTRA HITS'})"
+        )
+        print(f"  ref peaks at  : {ref_attack_times} ms")
+        print(f"  cand peaks at : {cand_attack_times} ms")
+        print(
+            f"crest_db: ref={ref_crest:.1f} cand={cand_crest:.1f} "
+            f"diff={cand_crest - ref_crest:+.1f} dB"
+            f"  ({'tanh-saturated' if cand_crest - ref_crest < -3.0 else 'OK'})"
+        )
+        print(
+            f"peak_block: ref @{ref_peak_idx * env_win_ms}ms (val={ref_peak_val:.3f})  "
+            f"cand @{cand_peak_idx * env_win_ms}ms (val={cand_peak_val:.3f})"
+        )
         for lo, hi, name in bands:
             band_mask = (f_axis >= lo) & (f_axis < hi)
             if band_mask.any():
