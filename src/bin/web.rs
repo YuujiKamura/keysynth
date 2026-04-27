@@ -572,17 +572,34 @@ mod imp {
                         }
                     }
                     ui.separator();
-                    if self.midi_requested.get() {
-                        // Already attempted (in-flight or succeeded) —
-                        // status label communicates state.
-                        ui.label(format!("MIDI: {}", self.midi_status.borrow()));
+                    // Status label is always shown so the previous
+                    // outcome (success / error / not requested) stays
+                    // visible even after `midi_requested` resets to
+                    // false on a permission-denied retry path.
+                    let status_owned = self.midi_status.borrow().clone();
+                    let is_error = status_owned.starts_with("error");
+                    if is_error {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 90, 90),
+                            format!("MIDI: {status_owned}"),
+                        );
                     } else {
+                        ui.label(format!("MIDI: {status_owned}"));
+                    }
+                    if !self.midi_requested.get() {
                         // Same prominent treatment as Start audio so
                         // it's clear MIDI input also needs an explicit
                         // user gesture (browser permission prompt).
+                        // After an error this stays visible alongside
+                        // the red error label so the user can retry.
+                        let label = if is_error {
+                            "🎹 Retry MIDI"
+                        } else {
+                            "🎹 Connect MIDI keyboard"
+                        };
                         let resp = ui.add(
                             egui::Button::new(
-                                egui::RichText::new("🎹 Connect MIDI keyboard")
+                                egui::RichText::new(label)
                                     .size(16.0)
                                     .color(egui::Color32::WHITE)
                                     .strong(),
@@ -1023,13 +1040,6 @@ mod imp {
         let on_message = Closure::<dyn FnMut(web_sys::MidiMessageEvent)>::new(
             move |ev: web_sys::MidiMessageEvent| {
                 let Ok(data) = ev.data() else { return };
-                // Diagnostic: log every raw 3-byte status message. UI
-                // thread, not audio callback, so format! + console::log
-                // are safe. Strip once we confirm MIDI is wired
-                // end-to-end on the live demo.
-                web_sys::console::log_1(
-                    &format!("keysynth-web: midi raw={:02X?}", data.as_slice()).into(),
-                );
                 if data.len() < 2 {
                     return;
                 }
@@ -1039,6 +1049,20 @@ mod imp {
                 // Velocity is data[2] for note_on/off; absent on some
                 // status types but we only branch on 0x80 / 0x90 below.
                 let velocity = if data.len() >= 3 { data[2] } else { 0 };
+                // Diagnostic: log raw bytes ONLY for note_on / note_off.
+                // Logging every inbound message swamps the browser
+                // console with MIDI clock (24 msg/quarter ≈ 48 msg/s
+                // at 120 BPM) and active-sensing chatter from
+                // sequencer-style controllers, jankifying the UI even
+                // though the audio thread is unaffected. Keep the
+                // signal-of-interest visible without spam. Strip once
+                // we've confirmed MIDI is wired end-to-end on the live
+                // demo across enough device models.
+                if matches!(kind, 0x80 | 0x90) {
+                    web_sys::console::log_1(
+                        &format!("keysynth-web: midi raw={:02X?}", data.as_slice()).into(),
+                    );
+                }
                 let msg = match kind {
                     0x90 if velocity > 0 => MidiMsg::NoteOn { note, velocity },
                     0x80 | 0x90 => MidiMsg::NoteOff { note },
