@@ -31,12 +31,15 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 mod imp {
 
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::{Arc, Mutex};
 
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::StreamConfig;
     use eframe::egui;
-    use wasm_bindgen::JsCast;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::{JsCast, JsValue};
 
     use keysynth::reverb::{self, Reverb};
     use keysynth::sympathetic::SympatheticBank;
@@ -103,6 +106,39 @@ mod imp {
         _stream: cpal::Stream,
     }
 
+    // ---------------------------------------------------------------------
+    // Web MIDI bridge
+    // ---------------------------------------------------------------------
+    //
+    // Browser fires MIDI events on the JS event loop; we translate each
+    // raw 3-byte status message into a `MidiMsg` and push it onto a shared
+    // inbox `Rc<RefCell<Vec<MidiMsg>>>`. The egui update loop drains the
+    // inbox once per frame and turns the messages into `note_on` /
+    // `note_off` calls against the existing voice pool. Single-threaded
+    // wasm32 → no Send/Sync requirement on the inbox, hence Rc/RefCell
+    // instead of Arc/Mutex.
+
+    #[derive(Clone, Copy, Debug)]
+    enum MidiMsg {
+        NoteOn { note: u8, velocity: u8 },
+        NoteOff { note: u8 },
+    }
+
+    type MidiInbox = Rc<RefCell<Vec<MidiMsg>>>;
+
+    /// Closures handed to the browser via `set_onmidimessage` /
+    /// `set_onstatechange`. We have to keep them alive for the life of
+    /// the page (the browser only holds a JsValue reference, which
+    /// doesn't keep the underlying Rust closure pinned), so park them
+    /// here as `Closure::into_js_value` can't be called while we still
+    /// want to drop them on `WebApp` teardown. Forgetting this is the
+    /// classic "MIDI works for one second then stops" wasm bug.
+    struct MidiHandles {
+        _access: web_sys::MidiAccess,
+        _on_message_closures: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>>,
+        _on_state_change: Closure<dyn FnMut(web_sys::MidiConnectionEvent)>,
+    }
+
     struct WebApp {
         voices: Arc<Mutex<Vec<Voice>>>,
         live: Arc<Mutex<LiveParams>>,
@@ -132,8 +168,18 @@ mod imp {
         /// Base MIDI note for the leftmost on-screen key. Defaults to C3 (48).
         base_note: u8,
         /// Status string for Web MIDI (e.g. "not requested" / "connected: ..."
-        /// / error).
-        midi_status: String,
+        /// / error). `Rc<RefCell<String>>` because the async MIDI handshake
+        /// (which lives outside any `&mut self` borrow) needs to write into
+        /// it and the egui update loop needs to read it.
+        midi_status: Rc<RefCell<String>>,
+        /// Inbox shared with browser MIDI callbacks. Producer = JS event
+        /// handlers (`onmidimessage`), consumer = `WebApp::update` once
+        /// per frame.
+        midi_inbox: MidiInbox,
+        /// True once `request_midi()` has fired its async handshake. Stops
+        /// us re-requesting on every UI button click while the browser is
+        /// still resolving the first promise.
+        midi_requested: bool,
     }
 
     impl Default for WebApp {
@@ -178,7 +224,9 @@ mod imp {
                 mouse_down_note: None,
                 pc_held: 0,
                 base_note: 48, // C3
-                midi_status: "not requested".to_string(),
+                midi_status: Rc::new(RefCell::new("not requested".to_string())),
+                midi_inbox: Rc::new(RefCell::new(Vec::new())),
+                midi_requested: false,
             }
         }
     }
@@ -205,6 +253,61 @@ mod imp {
                     self.audio_err = Some(e);
                 }
             }
+        }
+
+        /// Drain the MIDI inbox. Called once per egui frame so MIDI
+        /// events line up with the rest of the per-frame edge handling
+        /// (PC keyboard, on-screen mouse). Each drained message turns
+        /// into a `note_on` / `note_off` against the shared voice pool.
+        fn drain_midi_inbox(&mut self) {
+            // Take ownership of the queued messages in one swap so the
+            // inbox borrow doesn't overlap with self.note_on / note_off
+            // (which lock self.voices and self.live).
+            let drained: Vec<MidiMsg> = {
+                let mut q = self.midi_inbox.borrow_mut();
+                std::mem::take(&mut *q)
+            };
+            for msg in drained {
+                match msg {
+                    MidiMsg::NoteOn { note, velocity } => self.note_on(note, velocity),
+                    MidiMsg::NoteOff { note } => self.note_off(note),
+                }
+            }
+        }
+
+        /// Kick off the Web MIDI handshake. `navigator.requestMIDIAccess()`
+        /// returns a Promise we await via `wasm_bindgen_futures::spawn_local`;
+        /// once it resolves we attach `onmidimessage` handlers to every
+        /// input port and an `onstatechange` handler so devices plugged in
+        /// AFTER the request still get wired up.
+        ///
+        /// The captured `inbox` and `status` are `Rc` clones — they're the
+        /// only state the async block needs from `self`, and they live as
+        /// long as the page does. The resulting `MidiHandles` is leaked
+        /// (`Box::leak`) so the browser-side closures stay valid forever;
+        /// `WebApp` is itself page-lifetime so this isn't a real leak in
+        /// practice and it spares us a channel dance to ship the handles
+        /// back through a `&mut self` boundary.
+        fn request_midi(&mut self) {
+            if self.midi_requested {
+                return;
+            }
+            self.midi_requested = true;
+            *self.midi_status.borrow_mut() = "requesting...".to_string();
+            let inbox = self.midi_inbox.clone();
+            let status = self.midi_status.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match request_midi_access(inbox).await {
+                    Ok(handles) => {
+                        let n = handles._on_message_closures.len();
+                        *status.borrow_mut() = format!("{n} input(s) connected");
+                        Box::leak(Box::new(handles));
+                    }
+                    Err(e) => {
+                        *status.borrow_mut() = format!("error: {e}");
+                    }
+                }
+            });
         }
 
         fn note_on(&mut self, note: u8, velocity: u8) {
@@ -425,6 +528,7 @@ mod imp {
 
             if self.audio.is_some() {
                 self.handle_pc_keyboard(ctx);
+                self.drain_midi_inbox();
             }
 
             // Diagnostic: every ~30 frames (~0.5 s @ 60 fps) log the
@@ -460,7 +564,14 @@ mod imp {
                         self.start_audio();
                     }
                     ui.separator();
-                    ui.label(format!("MIDI: {}", self.midi_status));
+                    ui.label(format!("MIDI: {}", self.midi_status.borrow()));
+                    if !self.midi_requested && ui.button("Connect MIDI").clicked() {
+                        // Browser autoplay-style gating: requestMIDIAccess
+                        // also wants a user gesture to surface the
+                        // permission prompt, so bind it to a button click
+                        // rather than auto-firing on page load.
+                        self.request_midi();
+                    }
                 });
             });
 
@@ -763,6 +874,132 @@ mod imp {
                 web_sys::console::error_1(&format!("eframe start failed: {e:?}").into());
             }
         });
+    }
+
+    // ---------------------------------------------------------------------
+    // Web MIDI handshake
+    // ---------------------------------------------------------------------
+
+    /// Request MIDI access from the browser, attach an `onmidimessage`
+    /// handler to every input port, and set up `onstatechange` on the
+    /// `MidiAccess` so devices plugged in later also start producing
+    /// events. Returns a `MidiHandles` blob the caller must keep alive
+    /// for the lifetime of the page (the browser only stores function
+    /// references; if Rust drops the underlying `Closure`s the
+    /// references go dangling and MIDI silently stops).
+    async fn request_midi_access(inbox: MidiInbox) -> Result<MidiHandles, String> {
+        let window = web_sys::window().ok_or_else(|| "no window".to_string())?;
+        let nav: web_sys::Navigator = window.navigator();
+        // `requestMIDIAccess` is technically optional on the Navigator
+        // interface (Firefox without the flag returns undefined). Reach
+        // it via `Reflect::get` so we get a proper error message instead
+        // of a static-link compile dependency on the typed binding.
+        let request_fn = js_sys::Reflect::get(&nav, &JsValue::from_str("requestMIDIAccess"))
+            .map_err(|_| "navigator.requestMIDIAccess unavailable".to_string())?;
+        if request_fn.is_undefined() || request_fn.is_null() {
+            return Err("Web MIDI not supported in this browser".to_string());
+        }
+        let request_fn: js_sys::Function = request_fn
+            .dyn_into()
+            .map_err(|_| "requestMIDIAccess not callable".to_string())?;
+        let promise: js_sys::Promise = request_fn
+            .call0(&nav)
+            .map_err(|e| format!("requestMIDIAccess threw: {e:?}"))?
+            .dyn_into()
+            .map_err(|_| "requestMIDIAccess didn't return a Promise".to_string())?;
+        let access_jsv = wasm_bindgen_futures::JsFuture::from(promise)
+            .await
+            .map_err(|e| format!("MIDI access denied: {e:?}"))?;
+        let access: web_sys::MidiAccess = access_jsv
+            .dyn_into()
+            .map_err(|_| "MIDI access result wasn't a MIDIAccess".to_string())?;
+
+        // Walk every current input and attach a message handler.
+        let inputs = access.inputs();
+        let mut on_message_closures: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>> =
+            Vec::new();
+        let entries: js_sys::Iterator = inputs.entries();
+        loop {
+            let next = entries
+                .next()
+                .map_err(|e| format!("MIDIInputMap.entries iter failed: {e:?}"))?;
+            if next.done() {
+                break;
+            }
+            let pair: js_sys::Array = next.value().into();
+            // [key, value] — value is the MIDIInput.
+            let port_jsv = pair.get(1);
+            let port: web_sys::MidiInput = match port_jsv.dyn_into() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            attach_midi_handler(&port, inbox.clone(), &mut on_message_closures);
+        }
+
+        // Hot-plug: handle devices that connect after the access grant.
+        let inbox_state = inbox.clone();
+        let on_state_change = Closure::<dyn FnMut(web_sys::MidiConnectionEvent)>::new(
+            move |ev: web_sys::MidiConnectionEvent| {
+                let Some(port) = ev.port() else { return };
+                if port.type_() != web_sys::MidiPortType::Input {
+                    return;
+                }
+                if port.state() != web_sys::MidiPortDeviceState::Connected {
+                    return;
+                }
+                let Ok(input) = port.dyn_into::<web_sys::MidiInput>() else {
+                    return;
+                };
+                // Hot-plugged input → leak its handler too. Cheap; same
+                // page-lifetime story as the initial handles.
+                let mut sink: Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>> = Vec::new();
+                attach_midi_handler(&input, inbox_state.clone(), &mut sink);
+                for c in sink {
+                    Box::leak(Box::new(c));
+                }
+            },
+        );
+        access.set_onstatechange(Some(on_state_change.as_ref().unchecked_ref()));
+
+        Ok(MidiHandles {
+            _access: access,
+            _on_message_closures: on_message_closures,
+            _on_state_change: on_state_change,
+        })
+    }
+
+    /// Wire one MIDI input port: set its `onmidimessage` to a closure
+    /// that parses the 3-byte status message and pushes a `MidiMsg` onto
+    /// the inbox. Pushes the created `Closure` onto `closures` so the
+    /// caller keeps it alive — letting it drop here would dangle the
+    /// browser's stored function reference.
+    fn attach_midi_handler(
+        port: &web_sys::MidiInput,
+        inbox: MidiInbox,
+        closures: &mut Vec<Closure<dyn FnMut(web_sys::MidiMessageEvent)>>,
+    ) {
+        let on_message = Closure::<dyn FnMut(web_sys::MidiMessageEvent)>::new(
+            move |ev: web_sys::MidiMessageEvent| {
+                let Ok(data) = ev.data() else { return };
+                if data.len() < 2 {
+                    return;
+                }
+                let status = data[0];
+                let kind = status & 0xF0;
+                let note = data[1];
+                // Velocity is data[2] for note_on/off; absent on some
+                // status types but we only branch on 0x80 / 0x90 below.
+                let velocity = if data.len() >= 3 { data[2] } else { 0 };
+                let msg = match kind {
+                    0x90 if velocity > 0 => MidiMsg::NoteOn { note, velocity },
+                    0x80 | 0x90 => MidiMsg::NoteOff { note },
+                    _ => return,
+                };
+                inbox.borrow_mut().push(msg);
+            },
+        );
+        port.set_onmidimessage(Some(on_message.as_ref().unchecked_ref()));
+        closures.push(on_message);
     }
 
     fn pick_canvas(id: &str) -> web_sys::HtmlCanvasElement {
