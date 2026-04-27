@@ -14,4 +14,5 @@ pub mod piano_5am;
 pub mod piano_modal;
 pub mod placeholder;
 pub mod square;
+pub mod string_inharmonicity;
 pub mod sub;
