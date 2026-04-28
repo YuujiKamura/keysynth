@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "directory": "chord",
+  "description": "Strummed-chord samples (C / G / Am / F / Dm / E / A / D). WAV files fetched on demand; only the C_major_strum.mid fixture is committed.",
+  "format": {
+    "samplerate_hz": 44100,
+    "channels": "mono",
+    "bit_depth": 16,
+    "container": "WAV (RIFF/PCM) + Standard MIDI File (SMF) format-1"
+  },
+  "entries": [
+    {
+      "file_audio": "C_major_strum.wav",
+      "file_midi": "C_major_strum.mid",
+      "label": "C major",
+      "voicing": [
+        "C4",
+        "E4",
+        "G4",
+        "C5"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "CC0-1.0",
+      "source": "keysynth (this repo)",
+      "source_url": "https://github.com/YuujiKamura/keysynth",
+      "attribution": "Hand-authored 4-beat C major strum, dedicated CC0 1.0.",
+      "audio_available": false,
+      "midi_available": true,
+      "fixture": "deterministic SMF, format-1 single-track, PPQ=480"
+    },
+    {
+      "file_audio": "G_major_strum.wav",
+      "file_midi": "G_major_strum.mid",
+      "label": "G major",
+      "voicing": [
+        "G3",
+        "B3",
+        "D4",
+        "G4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "Am_strum.wav",
+      "file_midi": "Am_strum.mid",
+      "label": "A minor",
+      "voicing": [
+        "A3",
+        "C4",
+        "E4",
+        "A4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "F_major_strum.wav",
+      "file_midi": "F_major_strum.mid",
+      "label": "F major",
+      "voicing": [
+        "F3",
+        "A3",
+        "C4",
+        "F4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "Dm_strum.wav",
+      "file_midi": "Dm_strum.mid",
+      "label": "D minor",
+      "voicing": [
+        "D3",
+        "F3",
+        "A3",
+        "D4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "E_major_strum.wav",
+      "file_midi": "E_major_strum.mid",
+      "label": "E major",
+      "voicing": [
+        "E3",
+        "G#3",
+        "B3",
+        "E4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "A_major_strum.wav",
+      "file_midi": "A_major_strum.mid",
+      "label": "A major",
+      "voicing": [
+        "A3",
+        "C#4",
+        "E4",
+        "A4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    },
+    {
+      "file_audio": "D_major_strum.wav",
+      "file_midi": "D_major_strum.mid",
+      "label": "D major",
+      "voicing": [
+        "D3",
+        "F#3",
+        "A3",
+        "D4"
+      ],
+      "duration_s": 2.0,
+      "tempo_bpm": 120,
+      "stroke": "downstroke 4-beat strum",
+      "samplerate_hz": 44100,
+      "channels": "mono",
+      "bit_depth": 16,
+      "license": "BSD-3-Clause",
+      "source": "GuitarSet (comping passages, extracted)",
+      "source_url": "https://guitarset.weebly.com/",
+      "attribution": "GuitarSet (Xi, Bittner, Pauwels, Ye, Bello \u2014 ISMIR 2018), licensed BSD-3-Clause.",
+      "audio_available": false,
+      "midi_available": false
+    }
+  ]
+}

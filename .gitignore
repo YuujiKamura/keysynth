@@ -29,6 +29,7 @@ Thumbs.db
 # already-committed `.dispatch/` design notes (cp-design / soundboard /
 # voice-unify) stay tracked.
 .dispatch/guitar-brief.md
+.dispatch/guitar-corpus-brief.md
 
 # Logs / scratch
 *.log
@@ -48,6 +49,11 @@ samples/
 ir/
 reference/*.wav
 **/*.wav
+# Permissive guitar corpus: a single deterministic fixture WAV is
+# committed as the offline-test smoke target. All other WAVs under
+# bench-out/REF/guitar/{single_note,chord,corpus}/ are fetched on
+# demand by `bench-out/REF/guitar/fetch.sh`.
+!bench-out/REF/guitar/single_note/E2_open.wav
 # Whitelist the locked-in deterministic reference WAV (square C4) and its
 # README, even though the global **/*.wav rule above would otherwise hide
 # them. This is the only audio file we redistribute in the repo.

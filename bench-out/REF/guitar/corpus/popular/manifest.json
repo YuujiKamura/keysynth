@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "directory": "corpus/popular",
+  "description": "Slakh2100 guitar-stem slice (5 tracks). Only the guitar stem WAV + its single-channel guitar MIDI is referenced \u2014 the full multi-track mix is not redistributed.",
+  "entries": [
+    {
+      "file_midi": "slakh2100_track_00001_guitar.mid",
+      "file_audio": "slakh2100_track_00001_guitar.wav",
+      "track_id": "Track00001",
+      "stem_id": "S00",
+      "description": "Slakh2100 train split, track 00001, guitar stem",
+      "license": "CC-BY-4.0",
+      "source": "Slakh2100",
+      "source_url": "http://www.slakh.com/",
+      "attribution": "Slakh2100 (Manilow, Wichern, Seetharaman, Le Roux \u2014 WASPAA 2019), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+      "midi_available": false,
+      "audio_available": false
+    },
+    {
+      "file_midi": "slakh2100_track_00042_guitar.mid",
+      "file_audio": "slakh2100_track_00042_guitar.wav",
+      "track_id": "Track00042",
+      "stem_id": "S01",
+      "description": "Slakh2100 train split, track 00042, guitar stem",
+      "license": "CC-BY-4.0",
+      "source": "Slakh2100",
+      "source_url": "http://www.slakh.com/",
+      "attribution": "Slakh2100 (Manilow, Wichern, Seetharaman, Le Roux \u2014 WASPAA 2019), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+      "midi_available": false,
+      "audio_available": false
+    },
+    {
+      "file_midi": "slakh2100_track_00128_guitar.mid",
+      "file_audio": "slakh2100_track_00128_guitar.wav",
+      "track_id": "Track00128",
+      "stem_id": "S02",
+      "description": "Slakh2100 train split, track 00128, guitar stem",
+      "license": "CC-BY-4.0",
+      "source": "Slakh2100",
+      "source_url": "http://www.slakh.com/",
+      "attribution": "Slakh2100 (Manilow, Wichern, Seetharaman, Le Roux \u2014 WASPAA 2019), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+      "midi_available": false,
+      "audio_available": false
+    },
+    {
+      "file_midi": "slakh2100_track_00256_guitar.mid",
+      "file_audio": "slakh2100_track_00256_guitar.wav",
+      "track_id": "Track00256",
+      "stem_id": "S00",
+      "description": "Slakh2100 train split, track 00256, guitar stem",
+      "license": "CC-BY-4.0",
+      "source": "Slakh2100",
+      "source_url": "http://www.slakh.com/",
+      "attribution": "Slakh2100 (Manilow, Wichern, Seetharaman, Le Roux \u2014 WASPAA 2019), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+      "midi_available": false,
+      "audio_available": false
+    },
+    {
+      "file_midi": "slakh2100_track_00512_guitar.mid",
+      "file_audio": "slakh2100_track_00512_guitar.wav",
+      "track_id": "Track00512",
+      "stem_id": "S03",
+      "description": "Slakh2100 train split, track 00512, guitar stem",
+      "license": "CC-BY-4.0",
+      "source": "Slakh2100",
+      "source_url": "http://www.slakh.com/",
+      "attribution": "Slakh2100 (Manilow, Wichern, Seetharaman, Le Roux \u2014 WASPAA 2019), licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).",
+      "midi_available": false,
+      "audio_available": false
+    }
+  ]
+}

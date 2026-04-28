@@ -1,0 +1,71 @@
+Source: The Mutopia Project — free sheet music in the public domain
+URL:    https://www.mutopiaproject.org/
+About:  https://www.mutopiaproject.org/about.html
+
+License regimes used by the entries selected for this corpus
+(restricted to the permissive subset):
+
+  1. Public Domain — works whose copyright has expired worldwide.
+     Catalogued on Mutopia as "Public Domain". Treated equivalently
+     to CC0 for redistribution purposes.
+
+  2. Creative Commons CC0 1.0 Universal — explicit dedication of
+     a work (typesetting + arrangement) to the public domain.
+     URL: https://creativecommons.org/publicdomain/zero/1.0/
+
+  3. Creative Commons Attribution (CC-BY) 3.0 / 4.0 — attribution
+     required, redistribution permitted including commercial use.
+     URL: https://creativecommons.org/licenses/by/3.0/
+     URL: https://creativecommons.org/licenses/by/4.0/
+
+  4. Creative Commons Attribution-ShareAlike (CC-BY-SA) 3.0 / 4.0 —
+     attribution and ShareAlike required.
+     URL: https://creativecommons.org/licenses/by-sa/3.0/
+     URL: https://creativecommons.org/licenses/by-sa/4.0/
+
+EXCLUDED from this corpus on purpose:
+  - Any Mutopia entry tagged Creative Commons NonCommercial (CC-BY-NC*).
+  - Any entry tagged "Permissions: not for redistribution" or carrying
+    typesetter-imposed restrictions beyond the four regimes above.
+
+Per-piece attribution + license type is recorded in
+bench-out/REF/guitar/corpus/classical/manifest.json under the
+`license`, `attribution`, and `mutopia_id` fields. The Mutopia
+catalogue page URL for each piece is the canonical provenance link
+and is also stored per-entry.
+
+Dataset summary:
+  - Public-domain classical / Renaissance / Baroque guitar literature
+  - LilyPond source + auto-rendered MIDI per piece (we use the MIDI
+    only — LilyPond → MIDI is part of Mutopia's automated build)
+  - Total catalogue spans hundreds of pieces; this corpus selects ~10
+    canonical works with definite public-domain composer status
+    (Bach, Sor, Tárrega, Carcassi, Giuliani, Carulli) typeset by
+    contributors who released their typesetting under Public Domain
+    or CC0.
+
+Selected pieces (from the Mutopia "Guitar" instrument tag; full list
+with mutopia_id and per-piece license is in
+bench-out/REF/guitar/corpus/classical/manifest.json):
+
+  - J.S. Bach, BWV 1006a (Lute Suite no. 4 in E major) — Prelude
+  - F. Sor, Op. 35 No. 22 (Études) — Andantino
+  - F. Tárrega, "Lágrima" — Preludio
+  - F. Tárrega, "Adelita" — Mazurka
+  - M. Carcassi, Op. 60 No. 1 (25 Études Mélodiques) — Allegro
+  - M. Giuliani, Op. 50 No. 1 (Le Papillon) — Andantino
+  - F. Carulli, Op. 121 No. 1 (Solfèges) — Andantino
+  - J.S. Bach, BWV 996 — Bourrée (transcription for guitar)
+  - F. Sor, Op. 31 No. 2 (Leçons Progressives) — Andantino
+  - D. Aguado, "Estudio en Mi menor"
+
+Use in this corpus:
+  Only the auto-rendered .mid files are reproduced (downloaded on
+  demand by fetch.sh). For each piece we also fetch a synthesised
+  reference WAV produced by Mutopia's own LilyPond → MIDI → fluidsynth
+  pipeline (where available); failing that, fetch.sh leaves the MIDI
+  in place and the WAV slot empty (the manifest.json marks
+  `audio_available: false`).
+
+  LilyPond .ly source files are NOT mirrored — they sit at the
+  upstream URL listed in manifest.json `source_url`.

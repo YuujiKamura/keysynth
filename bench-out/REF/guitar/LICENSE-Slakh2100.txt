@@ -1,0 +1,52 @@
+Source: Slakh — Synthesized Lakh Dataset
+URL:    http://www.slakh.com/
+Repo:   https://github.com/ethman/slakh-utils
+Paper:  E. Manilow, G. Wichern, P. Seetharaman, J. Le Roux, "Cutting
+        Music Source Separation Some Slakh: A Dataset to Study the Impact
+        of Training Data Quality and Quantity," 2019 IEEE Workshop on
+        Applications of Signal Processing to Audio and Acoustics
+        (WASPAA), New Paltz, NY, USA, 2019.
+DOI:    https://doi.org/10.1109/WASPAA.2019.8937170
+
+License: Creative Commons Attribution 4.0 International (CC BY 4.0).
+URL:     https://creativecommons.org/licenses/by/4.0/
+
+Summary of CC BY 4.0 (informative — full text at the URL above):
+
+    You are free to:
+      Share — copy and redistribute the material in any medium or format
+      Adapt — remix, transform, and build upon the material
+      for any purpose, even commercially.
+
+    Under the following terms:
+      Attribution — You must give appropriate credit, provide a link
+        to the license, and indicate if changes were made.
+      No additional restrictions — You may not apply legal terms or
+        technological measures that legally restrict others from doing
+        anything the license permits.
+
+Attribution required by this corpus (carried in manifest.json
+`attribution` field per file):
+
+    "Slakh2100, by Manilow, Wichern, Seetharaman, Le Roux,
+     licensed CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)."
+
+Dataset summary:
+  - 2100 multi-track MIDI compositions rendered through high-quality
+    sample-based synthesis
+  - Per-instrument stems (drums, bass, guitar, piano, strings, etc.)
+  - Total size ~145 GB — too large to mirror in this repo
+
+Use in this corpus:
+  Slakh2100 distributes a `metadata.yaml` per track listing instrument
+  classes. We index the metadata only and select up to 5 tracks whose
+  guitar stem is the dominant solo voice for inclusion under
+  bench-out/REF/guitar/corpus/popular/. Only the guitar stem WAV +
+  the corresponding MIDI track from the multi-track .mid (extracted
+  to a single-track guitar MIDI via `mido`) are referenced.
+
+  WAV files are NOT redistributed. The `fetch.sh --slakh-sample N`
+  mode downloads the Nth selected guitar stem on demand; without
+  the flag only metadata is materialised. The MIDI ground truth and
+  the manifest.json entries (track id, channel, source URL, attribution
+  string) ARE committed.
