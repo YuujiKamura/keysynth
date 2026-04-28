@@ -150,3 +150,9 @@ bench-out/CHIPTUNE/
 Salamander/
 sfz-libraries/
 .claude/worktrees/
+
+# Dispatch / planning artifacts (per-deck briefs, PR draft bodies, codex target dirs)
+.dispatch/
+pr_body.md
+target-codex/
+target-claude/
