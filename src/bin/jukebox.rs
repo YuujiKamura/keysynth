@@ -35,6 +35,11 @@ use symphonia::core::probe::Hint;
 enum Format {
     Wav,
     Mp3,
+    /// Standard MIDI File. The decoder cannot play these directly — a
+    /// click on a Mid track triggers a lazy `preview_cache` render
+    /// through the user's currently selected voice, which produces a
+    /// WAV that the standard decoder path can play.
+    Mid,
 }
 
 impl Format {
@@ -42,6 +47,7 @@ impl Format {
         match ext.to_ascii_lowercase().as_str() {
             "wav" => Some(Format::Wav),
             "mp3" => Some(Format::Mp3),
+            "mid" | "midi" => Some(Format::Mid),
             _ => None,
         }
     }
@@ -143,6 +149,105 @@ fn classify_source(path: &Path, piece: &str) -> &'static str {
     "keysynth"
 }
 
+/// Pick a default voice for a MIDI track based on filename heuristic.
+/// Piano-leaning composer prefixes (mozart, satie, albeniz, bach, ...)
+/// route through `piano-modal`; everything else through the STK guitar
+/// voice. A future revision should read `bench-out/songs/manifest.json`
+/// `suggested_voice` field instead, but the heuristic keeps this PR
+/// scoped to the cache infrastructure (issue #62 Phase 2).
+fn default_voice_for_midi(path: &Path) -> &'static str {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    const PIANO_PREFIXES: &[&str] = &[
+        "mozart_",
+        "satie_",
+        "albeniz_",
+        "chopin_",
+        "beethoven_",
+        "schubert_",
+        "scarlatti_",
+    ];
+    if PIANO_PREFIXES.iter().any(|p| stem.starts_with(p)) {
+        "piano-modal"
+    } else {
+        "guitar-stk"
+    }
+}
+
+/// Where to find the `render_midi` binary that the cache subprocess
+/// calls. Both jukebox and render_midi live in the same target
+/// directory, so we anchor at `current_exe()` and replace the file
+/// name. Returns `None` if the executable cannot be discovered.
+fn render_midi_binary_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidates = if cfg!(windows) {
+        vec!["render_midi.exe"]
+    } else {
+        vec!["render_midi"]
+    };
+    candidates
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Build the `CacheKey` for a MIDI file under the default voice
+/// heuristic. Pulled out of the resolve flow so the synchronous cache
+/// hit check and the background render-and-store path share the same
+/// key construction.
+fn build_midi_cache_key(midi_path: &Path) -> keysynth::preview_cache::CacheKey {
+    let voice_id = default_voice_for_midi(midi_path);
+    keysynth::preview_cache::CacheKey {
+        song_path: midi_path.to_path_buf(),
+        voice_id: voice_id.to_string(),
+        // Voice .dll mtime tracking is wired in `preview_cache::CacheKey`
+        // itself (and exercised by the unit tests); the GUI side just
+        // doesn't track which .dll is currently loaded yet, so we go
+        // through the "builtin" hash bucket. When the GUI grows a voice
+        // selector with hot-reload status this should plug in the real
+        // .dll path so rebuild → cache invalidate flows automatically.
+        voice_dll: None,
+        render_params: keysynth::preview_cache::RenderParams::default(),
+    }
+}
+
+fn open_preview_cache() -> Result<keysynth::preview_cache::Cache, String> {
+    let cache_dir = PathBuf::from("bench-out/cache");
+    keysynth::preview_cache::Cache::new(&cache_dir, 1_073_741_824) // 1 GiB
+        .map_err(|e| format!("Cache::new {}: {e}", cache_dir.display()))
+}
+
+/// Cache-only lookup, never spawns a render. Returns `Ok(Some(path))`
+/// if there's already a rendered WAV for the (song, voice) pair.
+/// Used by the GUI thread for the synchronous fast path before
+/// deciding whether to spawn a background render.
+fn lookup_midi_in_preview_cache(midi_path: &Path) -> Result<Option<PathBuf>, String> {
+    let cache = open_preview_cache()?;
+    let key = build_midi_cache_key(midi_path);
+    cache.lookup(&key).map_err(|e| format!("lookup: {e}"))
+}
+
+/// Synchronous render-and-store. Called from a background thread so
+/// the GUI stays responsive while `render_midi` synthesises
+/// (typically 1–10 s for a short piece). Returns the on-disk WAV
+/// path of the freshly-cached render. Cache hits short-circuit
+/// inside `render_to_cache` so a stale background thread that fires
+/// after a peer thread already populated the entry returns
+/// immediately.
+fn render_midi_blocking(midi_path: &Path) -> Result<PathBuf, String> {
+    let voice_id = default_voice_for_midi(midi_path);
+    let cache = open_preview_cache()?;
+    let key = build_midi_cache_key(midi_path);
+    let bin = render_midi_binary_path()
+        .ok_or_else(|| "render_midi binary not found alongside jukebox".to_string())?;
+    keysynth::preview_cache::render_to_cache(&cache, &key, voice_id, &bin)
+        .map_err(|e| format!("render_to_cache: {e}"))
+}
+
 fn parse_track(path: &Path) -> Option<Track> {
     let stem = path.file_stem()?.to_str()?.to_string();
     let ext = path.extension().and_then(|s| s.to_str())?;
@@ -191,7 +296,9 @@ fn scan_dirs(dirs: &[&Path]) -> Vec<Track> {
                 Some(e) => e.to_ascii_lowercase(),
                 None => continue,
             };
-            if ext != "wav" && ext != "mp3" {
+            // wav / mp3: decode-and-play directly. mid: list now,
+            // lazy-render on user click (issue #62 Phase 2).
+            if ext != "wav" && ext != "mp3" && ext != "mid" && ext != "midi" {
                 continue;
             }
             if let Some(t) = parse_track(&p) {
@@ -988,6 +1095,27 @@ struct Jukebox {
     /// Mirror of mixer.state's track count, set when the user hits
     /// "+ track" or "×".
     slot_count: usize,
+    /// Pending background render. Set when the user clicks a MIDI
+    /// track on cache miss; the GUI thread spawns a worker that calls
+    /// `render_to_cache` and signals completion through this channel.
+    /// `update()` polls the receiver every frame and finalises the
+    /// playback hand-off once a path arrives. The `tracks` index is
+    /// kept so the user can see which row is being rendered, and so
+    /// finished renders for stale clicks (user already moved on) don't
+    /// clobber the currently-playing track.
+    pending_render: Option<PendingRender>,
+}
+
+/// One in-flight MIDI → WAV render dispatched from the GUI thread.
+struct PendingRender {
+    track_idx: usize,
+    label: String,
+    started: std::time::Instant,
+    rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
+    /// JoinHandle is parked here so the worker thread isn't detached
+    /// (it still runs to completion if dropped, but holding the handle
+    /// is the standard lifecycle pattern).
+    _handle: std::thread::JoinHandle<()>,
 }
 
 fn list_output_devices() -> Vec<String> {
@@ -1023,6 +1151,7 @@ impl Jukebox {
             current_device,
             slot_file_idx: vec![None; initial_slots],
             slot_count: initial_slots,
+            pending_render: None,
         })
     }
 
@@ -1068,6 +1197,116 @@ impl Jukebox {
             None => return,
         };
         let label = format!("[{}] {}_{}", track.source, track.piece, track.engine);
+
+        // For MIDI tracks we go through the lazy preview cache (issue
+        // #62 Phase 2). Two paths:
+        //   - cache hit  → load synchronously on the GUI thread; the
+        //                  stat + open is fast (sub-millisecond).
+        //   - cache miss → spawn a background render worker. The
+        //                  worker runs `render_midi` as a subprocess
+        //                  (1–10 s for a typical short piece) without
+        //                  touching the audio callback or the UI
+        //                  thread. `update()` polls the channel and
+        //                  starts playback once the WAV is ready.
+        let playable_path: PathBuf = if track.format == Format::Mid {
+            match lookup_midi_in_preview_cache(&track.path) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    self.spawn_midi_render(idx, label);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "jukebox: preview_cache lookup {}: {e}",
+                        track.path.display(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            track.path.clone()
+        };
+        self.load_resolved_track(idx, label, playable_path);
+    }
+
+    /// Spawn a background thread that renders `tracks[idx]` through the
+    /// preview-cache subprocess path. Stores the pending state on
+    /// `self.pending_render`; `poll_pending_render` (called from
+    /// `update()`) finalises the playback hand-off when the worker
+    /// finishes.
+    fn spawn_midi_render(&mut self, idx: usize, label: String) {
+        let path = match self.tracks.get(idx) {
+            Some(t) => t.path.clone(),
+            None => return,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_for_thread = path.clone();
+        let handle = std::thread::Builder::new()
+            .name("preview-render".into())
+            .spawn(move || {
+                let result = render_midi_blocking(&path_for_thread);
+                // Receiver drop on the GUI side is non-fatal: we just
+                // discard the rendered path. The cache file itself
+                // already lives at its hashed location, so a future
+                // click will see the cache hit.
+                let _ = tx.send(result);
+            })
+            .expect("spawn preview-render thread");
+        eprintln!(
+            "jukebox: render queued ({}) — voice={} (background thread)",
+            path.display(),
+            default_voice_for_midi(&path),
+        );
+        self.pending_render = Some(PendingRender {
+            track_idx: idx,
+            label,
+            started: std::time::Instant::now(),
+            rx,
+            _handle: handle,
+        });
+    }
+
+    /// Drain the pending-render channel. Called once per egui frame.
+    /// Non-blocking: if the worker hasn't finished, returns
+    /// immediately so the UI can keep redrawing at 60 fps. When the
+    /// worker delivers a result, we load the WAV into slot 0 and
+    /// start playback.
+    fn poll_pending_render(&mut self) {
+        let pending = match self.pending_render.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return, // still rendering
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker died without sending; clear and bail.
+                self.pending_render = None;
+                return;
+            }
+        };
+        let pending = self.pending_render.take().expect("guarded above");
+        let elapsed_ms = pending.started.elapsed().as_millis();
+        match result {
+            Ok(wav_path) => {
+                eprintln!(
+                    "jukebox: render done ({}) in {} ms",
+                    wav_path.display(),
+                    elapsed_ms,
+                );
+                self.load_resolved_track(pending.track_idx, pending.label, wav_path);
+            }
+            Err(e) => {
+                eprintln!("jukebox: render failed: {e}");
+            }
+        }
+    }
+
+    /// Inner half of `preview()` after the path has been resolved.
+    /// Pulled out so both the synchronous (cache hit) and asynchronous
+    /// (cache miss → background render) paths reach the same playback
+    /// state without duplicating mixer-locking boilerplate.
+    fn load_resolved_track(&mut self, idx: usize, label: String, playable_path: PathBuf) {
         // Ensure we have at least one slot.
         {
             let mut st = self.mixer.state.lock().unwrap();
@@ -1077,22 +1316,17 @@ impl Jukebox {
                 self.slot_count = st.tracks.len();
             }
         }
-        // Stop everything first so we don't pile previews.
         self.stop_all();
         {
             let mut st = self.mixer.state.lock().unwrap();
-            // Solo slot 0 implicitly by muting other slots' is_playing
-            // for this preview. (We don't toggle their stored .solo /
-            // .muted so the user's mixer setup survives.)
             for (i, t) in st.tracks.iter_mut().enumerate() {
                 if i == 0 {
-                    if let Err(e) = t.load(&track.path, label.clone()) {
-                        eprintln!("jukebox: load {}: {e}", track.path.display());
+                    if let Err(e) = t.load(&playable_path, label.clone()) {
+                        eprintln!("jukebox: load {}: {e}", playable_path.display());
                         return;
                     }
                     t.is_playing = true;
                 } else {
-                    // Don't auto-play other slots in preview mode.
                     t.is_playing = false;
                 }
             }
@@ -1231,6 +1465,12 @@ fn vu_meter_bar(ui: &mut egui::Ui, label: &str, peak: f32, rms: f32) {
 impl eframe::App for Jukebox {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        // Lazy-MIDI render: drain the background-render channel before
+        // anything else so a finished render becomes the active track
+        // for THIS frame (no extra one-frame latency between worker
+        // completion and audible playback).
+        self.poll_pending_render();
 
         // Apply pending file-load changes from combo boxes.
         self.sync_slot_files();

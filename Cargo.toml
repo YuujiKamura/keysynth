@@ -50,6 +50,10 @@ native = [
     # Native-only: discovery is filesystem-scoped and never runs in
     # the wasm browser build.
     "dep:toml",
+    # sha2: SHA-256 for the preview-cache key hash (issue #62 Phase 2).
+    # Native-only because the cache renders to disk via subprocess
+    # invocation of render_midi.
+    "dep:sha2",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -113,6 +117,11 @@ cp-core = { path = "cp-core", optional = true }
 # manifests for GUI-side discovery (see `voice_lib::discover_plugin_voices`).
 # Default features are fine — we only need top-level `toml::from_str`.
 toml = { version = "0.8", optional = true }
+# sha2: SHA-256 for `preview_cache` cache-key hashing (issue #62 Phase 2).
+# Stable, no-std-friendly, default features only. Native-only because the
+# preview_cache module itself is gated to `native` (depends on hound +
+# subprocess invocation of render_midi).
+sha2 = { version = "0.10", optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
