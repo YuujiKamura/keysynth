@@ -11,11 +11,12 @@
 //! and ABI-safety story (each constructed voice pins its `Arc<Library>` so
 //! the lib stays mapped until the voice drops, even after a swap).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,12 @@ use libloading::{Library, Symbol};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::synth::{ReleaseEnvelope, VoiceImpl};
+
+/// Slot name used by the watcher path. Existing single-slot users
+/// (the file-watcher in `voices_live/`) read and write through this
+/// name so behaviour is identical to PR #40 when no CP client touches
+/// the slot map.
+pub const DEFAULT_SLOT: &str = "default";
 
 /// ABI version expected by the host. Must match the value returned by
 /// `keysynth_live_abi_version` in the loaded library. Bumped on any
@@ -256,21 +263,62 @@ impl Status {
 
 /// Public handle to the reloader. Cheap to clone; everything inside is
 /// reference-counted so multiple subsystems (MIDI callback, audio
-/// callback, egui side panel) read from the same shared state.
+/// callback, egui side panel, CP server) read from the same shared
+/// state.
+///
+/// Multi-slot model (PR for `feat(cp)` extends PR #40):
+///   - `slots`: name → factory map. Holds every loaded voice, both the
+///     "default" slot owned by the file watcher AND any slots a CP
+///     client added via `ksctl load` / `ksctl build`.
+///   - `active_slot`: name of the slot the next `make_voice` resolves
+///     to. The audio thread reads this lock-free.
+///   - `current`: legacy mirror of the active slot's factory, kept so
+///     the existing GUI status panel keeps working without a special
+///     case for "no watcher".
 #[derive(Clone)]
 pub struct Reloader {
-    /// Currently-loaded factory. `None` until the first successful build.
-    /// MIDI thread reads this on every note_on; watcher thread stores
-    /// new factories here. ArcSwap is wait-free.
+    /// Active-slot factory mirror. Still valid for callers that only
+    /// care about "the currently-active live voice" (the GUI side
+    /// panel). MIDI thread no longer reads this directly — it goes
+    /// through `make_voice` which reads `active_slot` first.
     pub current: Arc<ArcSwap<Option<Arc<LiveFactory>>>>,
-    /// Status string for GUI side panel.
+    /// Status of the watcher's most recent build. CP-driven loads also
+    /// update this so the status panel reflects the latest event from
+    /// any source.
     pub status: Arc<arc_swap::ArcSwap<Status>>,
     /// Sends "rebuild now" requests to the watcher thread (used by the
-    /// optional Ctrl+R keybind and the initial startup build).
+    /// optional Ctrl+R keybind, the initial startup build, and CP's
+    /// `build` op for the default slot).
     rebuild_tx: Sender<RebuildRequest>,
     /// Path to the `voices_live/` cargo project root, surfaced in the
-    /// GUI for clarity.
+    /// GUI for clarity. CP `build` ops can target arbitrary roots
+    /// without going through the watcher.
     pub crate_root: PathBuf,
+    /// Multi-slot factory pool. Keyed by user-chosen names ("A",
+    /// "default", anything goes). Behind a Mutex because writes
+    /// (load/unload/build_into_slot) are infrequent — sub-millisecond
+    /// lock acquisition is fine in the audio thread on note_on.
+    slots: Arc<Mutex<HashMap<String, SlotEntry>>>,
+    /// Name of the active slot. ArcSwap so the audio thread sees the
+    /// new active without taking a lock. Initialised to `DEFAULT_SLOT`.
+    active_slot: Arc<ArcSwap<String>>,
+}
+
+/// One entry in the slot map.
+#[derive(Clone)]
+struct SlotEntry {
+    factory: Arc<LiveFactory>,
+    /// Wall-clock time the factory was loaded (for the `list` op).
+    loaded_at_unix_ms: u128,
+}
+
+/// Slot metadata returned by `list_slots()`. Surfaced over the wire by
+/// CP's `list` op.
+#[derive(Clone, Debug)]
+pub struct SlotInfo {
+    pub name: String,
+    pub dll_path: PathBuf,
+    pub loaded_at_unix_ms: u128,
 }
 
 #[derive(Debug, Clone)]
@@ -287,6 +335,8 @@ impl Reloader {
     pub fn spawn(crate_root: PathBuf) -> Self {
         let current: Arc<ArcSwap<Option<Arc<LiveFactory>>>> = Arc::new(ArcSwap::from_pointee(None));
         let status = Arc::new(ArcSwap::from_pointee(Status::Idle));
+        let slots: Arc<Mutex<HashMap<String, SlotEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let active_slot = Arc::new(ArcSwap::from_pointee(DEFAULT_SLOT.to_string()));
 
         let (rebuild_tx, rebuild_rx) = mpsc::channel::<RebuildRequest>();
 
@@ -302,10 +352,14 @@ impl Reloader {
             })
             .expect("spawn fswatch thread");
 
-        // Build worker.
+        // Build worker. Writes its results into both the legacy
+        // `current` ArcSwap (for back-compat) AND the multi-slot map
+        // (under `DEFAULT_SLOT`) so CP clients see the watcher's
+        // factory in `list` output.
         let current_for_worker = current.clone();
         let status_for_worker = status.clone();
         let crate_root_for_worker = crate_root.clone();
+        let slots_for_worker = slots.clone();
         thread::Builder::new()
             .name("live-reload-builder".into())
             .spawn(move || {
@@ -314,6 +368,7 @@ impl Reloader {
                     rebuild_rx,
                     current_for_worker,
                     status_for_worker,
+                    slots_for_worker,
                 );
             })
             .expect("spawn builder thread");
@@ -329,24 +384,30 @@ impl Reloader {
             status,
             rebuild_tx,
             crate_root,
+            slots,
+            active_slot,
         }
     }
 
-    /// Force a rebuild (Ctrl+R from the GUI, or other manual trigger).
+    /// Force a rebuild of the watched `crate_root` (Ctrl+R from the GUI,
+    /// or other manual trigger).
     pub fn request_rebuild(&self, reason: &str) {
         let _ = self.rebuild_tx.send(RebuildRequest {
             reason: reason.into(),
         });
     }
 
-    /// Construct a voice from the currently-loaded factory, or return
-    /// `None` if no factory is loaded yet (initial build hasn't finished
-    /// or the latest build errored). Caller falls back to silence in
-    /// that case.
+    /// Construct a voice from the *active slot's* factory, or return
+    /// `None` if the active slot has no factory loaded (initial build
+    /// pending, slot empty, slot unloaded). Caller falls back to
+    /// silence.
     pub fn make_voice(&self, sr: f32, freq: f32, vel: u8) -> Option<Box<dyn VoiceImpl + Send>> {
-        let guard = self.current.load();
-        let opt: &Option<Arc<LiveFactory>> = &**guard;
-        opt.as_ref().map(|fac| fac.make_voice(sr, freq, vel))
+        let active = self.active_slot.load();
+        let factory = {
+            let map = self.slots.lock().ok()?;
+            map.get(&**active).map(|s| s.factory.clone())
+        };
+        factory.map(|f| f.make_voice(sr, freq, vel))
     }
 
     /// Snapshot the current status for GUI rendering.
@@ -354,14 +415,159 @@ impl Reloader {
         (**self.status.load()).clone()
     }
 
-    /// Snapshot the currently-loaded factory's metadata (path + load
-    /// time). Used by the side panel.
+    /// Snapshot the active-slot factory's metadata (path + load time).
+    /// Used by the GUI side panel.
     pub fn current_meta(&self) -> Option<(PathBuf, Instant)> {
         let guard = self.current.load();
         let opt: &Option<Arc<LiveFactory>> = &**guard;
         opt.as_ref()
             .map(|fac| (fac.dll_path.clone(), fac.loaded_at))
     }
+
+    // -----------------------------------------------------------------
+    // Multi-slot API (used by the CP server).
+    // -----------------------------------------------------------------
+
+    /// Name of the active slot. Cheap (one ArcSwap load + clone).
+    pub fn active_slot_name(&self) -> String {
+        (**self.active_slot.load()).clone()
+    }
+
+    /// Switch the active slot. Errors if `name` doesn't exist in the
+    /// slot map — switching to an empty name would silence Engine::Live
+    /// without explanation, which is the failure mode the brief warns
+    /// against.
+    pub fn set_active(&self, name: &str) -> Result<(), String> {
+        let map = self.slots.lock().map_err(|e| e.to_string())?;
+        if !map.contains_key(name) {
+            return Err(format!("no such slot '{name}'"));
+        }
+        // Mirror the chosen slot's factory into `current` so the GUI's
+        // existing status block tracks it.
+        let factory = map.get(name).map(|s| s.factory.clone());
+        drop(map);
+        self.active_slot.store(Arc::new(name.to_string()));
+        self.current.store(Arc::new(factory));
+        Ok(())
+    }
+
+    /// Insert / replace a factory in the named slot. If `name` is the
+    /// active slot, also update the legacy `current` mirror so the
+    /// GUI status panel reflects it.
+    pub fn set_slot(&self, name: &str, factory: Arc<LiveFactory>) -> Result<(), String> {
+        let entry = SlotEntry {
+            factory: factory.clone(),
+            loaded_at_unix_ms: now_unix_ms(),
+        };
+        {
+            let mut map = self.slots.lock().map_err(|e| e.to_string())?;
+            map.insert(name.to_string(), entry);
+        }
+        if **self.active_slot.load() == *name {
+            self.current.store(Arc::new(Some(factory)));
+        }
+        Ok(())
+    }
+
+    /// Remove a slot. If it was the active slot, the active stays
+    /// pointing at the now-missing name and `make_voice` returns
+    /// `None` (silence) until the user `set`s another slot. This
+    /// matches the brief: "switching to an empty slot" silences the
+    /// voice rather than crashing.
+    pub fn unset_slot(&self, name: &str) -> Result<(), String> {
+        let mut map = self.slots.lock().map_err(|e| e.to_string())?;
+        if map.remove(name).is_none() {
+            return Err(format!("no such slot '{name}'"));
+        }
+        if **self.active_slot.load() == *name {
+            // Drop the legacy mirror too — keeps the side-panel honest.
+            self.current.store(Arc::new(None));
+        }
+        Ok(())
+    }
+
+    /// Snapshot of every slot's metadata for the `list` op.
+    pub fn list_slots(&self) -> Vec<SlotInfo> {
+        let map = match self.slots.lock() {
+            Ok(m) => m,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<SlotInfo> = map
+            .iter()
+            .map(|(name, entry)| SlotInfo {
+                name: name.clone(),
+                dll_path: entry.factory.dll_path.clone(),
+                loaded_at_unix_ms: entry.loaded_at_unix_ms,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Build the cargo crate at `crate_root` and stash its produced
+    /// factory under slot `name`. Used by CP `build` op for
+    /// arbitrary crate paths (the watcher's `request_rebuild` path
+    /// only knows about the single watched crate).
+    ///
+    /// Status field is updated alongside so the GUI panel reflects the
+    /// most recent build attempt regardless of who triggered it.
+    pub fn build_into_slot(
+        &self,
+        crate_root: &Path,
+        name: &str,
+    ) -> Result<Arc<LiveFactory>, String> {
+        let started = Instant::now();
+        self.status.store(Arc::new(Status::Building {
+            since: started,
+            reason: format!("cp build → slot '{name}'"),
+        }));
+        match build_and_load(crate_root) {
+            Ok(factory) => {
+                let arc = Arc::new(factory);
+                let dll_path = arc.dll_path.clone();
+                let duration = started.elapsed();
+                self.set_slot(name, arc.clone())?;
+                self.status.store(Arc::new(Status::Ok {
+                    at: Instant::now(),
+                    duration,
+                    dll_path,
+                }));
+                Ok(arc)
+            }
+            Err(msg) => {
+                self.status.store(Arc::new(Status::Err {
+                    at: Instant::now(),
+                    message: msg.clone(),
+                }));
+                Err(msg)
+            }
+        }
+    }
+
+    /// Load an already-built `.dll` / `.so` / `.dylib` into a slot.
+    /// Used by CP `load` op for pre-built artifacts.
+    pub fn load_dll_into_slot(
+        &self,
+        dll_path: &Path,
+        name: &str,
+    ) -> Result<Arc<LiveFactory>, String> {
+        let factory = LiveFactory::load(dll_path)?;
+        let arc = Arc::new(factory);
+        self.set_slot(name, arc.clone())?;
+        self.status.store(Arc::new(Status::Ok {
+            at: Instant::now(),
+            duration: Duration::from_millis(0),
+            dll_path: arc.dll_path.clone(),
+        }));
+        Ok(arc)
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn run_fs_watcher(src_dir: &Path, tx: Sender<RebuildRequest>) -> notify::Result<()> {
@@ -423,6 +629,7 @@ fn run_build_worker(
     rx: Receiver<RebuildRequest>,
     current: Arc<ArcSwap<Option<Arc<LiveFactory>>>>,
     status: Arc<ArcSwap<Status>>,
+    slots: Arc<Mutex<HashMap<String, SlotEntry>>>,
 ) {
     while let Ok(req) = rx.recv() {
         // Drain coalesced rebuild requests so a flurry of fs events only
@@ -439,7 +646,22 @@ fn run_build_worker(
             Ok(factory) => {
                 let dll_path = factory.dll_path.clone();
                 let duration = started.elapsed();
-                current.store(Arc::new(Some(Arc::new(factory))));
+                let arc = Arc::new(factory);
+                // Write into the multi-slot map under DEFAULT_SLOT so
+                // CP `list` shows the watcher-built voice alongside any
+                // CP-loaded slots.
+                if let Ok(mut map) = slots.lock() {
+                    map.insert(
+                        DEFAULT_SLOT.to_string(),
+                        SlotEntry {
+                            factory: arc.clone(),
+                            loaded_at_unix_ms: now_unix_ms(),
+                        },
+                    );
+                }
+                // Mirror into legacy `current` so callers that only
+                // wanted "the watched factory" keep working unchanged.
+                current.store(Arc::new(Some(arc)));
                 status.store(Arc::new(Status::Ok {
                     at: Instant::now(),
                     duration,
@@ -457,14 +679,18 @@ fn run_build_worker(
                     at: Instant::now(),
                     message: msg,
                 }));
-                // Do NOT touch `current`. The previous factory (if any)
-                // stays live, so held + new notes keep working.
+                // Do NOT touch `current` or `slots`. The previous
+                // factory (if any) stays live, so held + new notes
+                // keep working.
             }
         }
     }
 }
 
-fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
+/// Build a sibling cargo crate and load its cdylib output into a fresh
+/// `LiveFactory`. Public so the CP server's `build` op can re-use it
+/// for arbitrary crate roots without going through the watcher.
+pub fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
     let manifest = crate_root.join("Cargo.toml");
     if !manifest.exists() {
         return Err(format!(
@@ -474,12 +700,18 @@ fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
     }
     let target_dir = crate_root.join("target");
 
+    // --message-format=json so we can read the produced cdylib path
+    // straight out of cargo's structured output. This works for any
+    // crate name (CP `build` ops can target arbitrary crates whose
+    // package name we don't know in advance), unlike the old
+    // hard-coded `keysynth_voices_live.dll` heuristic.
     let output = Command::new("cargo")
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
         .arg("--target-dir")
         .arg(&target_dir)
+        .arg("--message-format=json")
         .output()
         .map_err(|e| format!("cargo invocation failed: {e}"))?;
 
@@ -492,10 +724,16 @@ fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
         return Err(format!("cargo build failed:\n{trimmed}"));
     }
 
-    let dll_path = expected_dll_path(&target_dir);
+    let dll_path = parse_cdylib_path_from_cargo_json(&output.stdout)
+        .ok_or_else(|| {
+            format!(
+                "build succeeded but no cdylib artifact found in cargo --message-format=json output (target_dir = {})",
+                target_dir.display()
+            )
+        })?;
     if !dll_path.exists() {
         return Err(format!(
-            "build succeeded but DLL not found at {}",
+            "cargo reported cdylib at {} but the file is missing",
             dll_path.display()
         ));
     }
@@ -510,16 +748,51 @@ fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
     LiveFactory::load(&unique)
 }
 
-fn expected_dll_path(target_dir: &Path) -> PathBuf {
-    // Default cargo profile is `dev`, output goes to `target/debug/`.
-    let dir = target_dir.join("debug");
-    if cfg!(target_os = "windows") {
-        dir.join("keysynth_voices_live.dll")
-    } else if cfg!(target_os = "macos") {
-        dir.join("libkeysynth_voices_live.dylib")
-    } else {
-        dir.join("libkeysynth_voices_live.so")
+/// Walk cargo's `--message-format=json` stdout looking for the most
+/// recent `compiler-artifact` whose target advertises `cdylib`. Returns
+/// the on-disk path to that artifact's first cdylib filename. The
+/// "most recent" preference matters in workspaces where a single
+/// `cargo build` produces multiple cdylibs — the last one in the
+/// output is the top-level package's, which is what we want.
+fn parse_cdylib_path_from_cargo_json(stdout: &[u8]) -> Option<PathBuf> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    let mut found: Option<PathBuf> = None;
+    for line in text.lines() {
+        if !line.starts_with('{') {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let kinds = v
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array());
+        let is_cdylib = match kinds {
+            Some(arr) => arr.iter().any(|x| x.as_str() == Some("cdylib")),
+            None => false,
+        };
+        if !is_cdylib {
+            continue;
+        }
+        let filenames = v.get("filenames").and_then(|f| f.as_array());
+        if let Some(arr) = filenames {
+            // Prefer the .dll / .so / .dylib over the .lib / .exp /
+            // .pdb sidecars cargo also lists on Windows.
+            let preferred: Option<&str> = arr.iter().filter_map(|x| x.as_str()).find(|p| {
+                let lower = p.to_ascii_lowercase();
+                lower.ends_with(".dll") || lower.ends_with(".so") || lower.ends_with(".dylib")
+            });
+            if let Some(p) = preferred {
+                found = Some(PathBuf::from(p));
+            }
+        }
     }
+    found
 }
 
 fn unique_dll_copy(src: &Path) -> Result<PathBuf, String> {
@@ -601,18 +874,24 @@ mod tests {
         assert_eq!(writer_done.load(Ordering::SeqCst), 50);
     }
 
-    /// expected_dll_path is OS-correct.
+    /// Cargo's --message-format=json output is parsed correctly:
+    /// picks the cdylib filename from a real-shape JSON line.
     #[test]
-    fn expected_dll_path_picks_right_extension() {
-        let p = expected_dll_path(Path::new("/x/target"));
-        let last = p.file_name().unwrap().to_string_lossy().into_owned();
-        if cfg!(target_os = "windows") {
-            assert!(last.ends_with(".dll"));
-        } else if cfg!(target_os = "macos") {
-            assert!(last.ends_with(".dylib"));
-        } else {
-            assert!(last.ends_with(".so"));
-        }
+    fn parse_cdylib_from_cargo_json_picks_dynamic_lib() {
+        // Synthetic: matches the schema cargo emits today (2025+).
+        let line = r#"{"reason":"compiler-artifact","package_id":"x","manifest_path":"/m","target":{"kind":["cdylib"],"crate_types":["cdylib"],"name":"foo","src_path":"/x"},"profile":{"opt_level":"1","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["/tmp/foo.dll","/tmp/foo.dll.lib","/tmp/foo.pdb"],"executable":null,"fresh":true}"#;
+        let stdout = format!("{line}\n").into_bytes();
+        let path = parse_cdylib_path_from_cargo_json(&stdout).unwrap();
+        assert!(path.to_string_lossy().ends_with(".dll"));
+    }
+
+    /// `.lib` / `.exp` sidecar lines without a matching `.dll` should
+    /// be ignored — we only return the actual loadable image.
+    #[test]
+    fn parse_cdylib_ignores_non_artifact_lines() {
+        let stdout =
+            b"random non-json prefix\n{\"reason\":\"build-finished\",\"success\":true}\n".to_vec();
+        assert!(parse_cdylib_path_from_cargo_json(&stdout).is_none());
     }
 
     /// Building from the actual `voices_live/` crate produces a loadable
