@@ -582,6 +582,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sf_program: args.sf2_program,
         sf_bank: args.sf2_bank,
         mix_mode: args.mix_mode,
+        pedal_sustain: 0.0,
     }));
     let dash: Arc<Mutex<DashState>> = Arc::new(Mutex::new(DashState::new(args.engine)));
 
@@ -777,6 +778,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut p = live_for_midi.lock().unwrap();
                         p.master = (p.master + delta_ticks as f32 * 0.1).clamp(0.0, 10.0);
                     }
+                    // CC 64 = MIDI sustain pedal (Tier 2.3, issue #32).
+                    // Standard piano MIDI: a value of 0 releases the
+                    // pedal, ≥ 64 engages it. We map the full 0..127
+                    // range into a continuous 0.0..1.0 so half-pedal
+                    // controllers (or pedal-curves on the host side)
+                    // can drive a partial damper lift.
+                    64 => {
+                        let mut p = live_for_midi.lock().unwrap();
+                        p.pedal_sustain = cc_val as f32 / 127.0;
+                    }
                     _ => {}
                 }
             }
@@ -825,9 +836,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.build_output_stream(
             cfg,
             move |out: &mut [f32], _| {
-                let (master, wet, engine, mix_mode) = {
+                let (master, wet, engine, mix_mode, pedal) = {
                     let lp = live_arc.lock().unwrap();
-                    (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
+                    (
+                        lp.master,
+                        lp.reverb_wet,
+                        lp.engine,
+                        lp.mix_mode,
+                        lp.pedal_sustain,
+                    )
                 };
                 audio_callback(
                     out,
@@ -846,6 +863,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     engine,
                     mix_mode,
                     &mut mono_compressed,
+                    pedal,
                 );
             },
             err_fn,
@@ -871,9 +889,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [i16], _| {
-                    let (master, wet, engine, mix_mode) = {
+                    let (master, wet, engine, mix_mode, pedal) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
+                        (
+                            lp.master,
+                            lp.reverb_wet,
+                            lp.engine,
+                            lp.mix_mode,
+                            lp.pedal_sustain,
+                        )
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -895,6 +919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         engine,
                         mix_mode,
                         &mut mono_compressed,
+                        pedal,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -921,9 +946,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             device.build_output_stream(
                 &stream_cfg,
                 move |out: &mut [u16], _| {
-                    let (master, wet, engine, mix_mode) = {
+                    let (master, wet, engine, mix_mode, pedal) = {
                         let lp = live_arc.lock().unwrap();
-                        (lp.master, lp.reverb_wet, lp.engine, lp.mix_mode)
+                        (
+                            lp.master,
+                            lp.reverb_wet,
+                            lp.engine,
+                            lp.mix_mode,
+                            lp.pedal_sustain,
+                        )
                     };
                     if interleaved_scratch.len() != out.len() {
                         interleaved_scratch.resize(out.len(), 0.0);
@@ -945,6 +976,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         engine,
                         mix_mode,
                         &mut mono_compressed,
+                        pedal,
                     );
                     for (dst, &src) in out.iter_mut().zip(interleaved_scratch.iter()) {
                         let clamped = src.clamp(-1.0, 1.0);
@@ -1077,6 +1109,12 @@ fn audio_callback(
     // "compressed" path (bus B). Caller-owned so we don't allocate on
     // the audio thread.
     mono_compressed: &mut Vec<f32>,
+    // Tier 2.3 (issue #32). Snapshot of `LiveParams::pedal_sustain`
+    // taken once per buffer by the caller; we propagate it to every
+    // voice via `set_pedal_sustain` so released voices ring on while
+    // the sustain pedal is held. Non-piano voices ignore the value
+    // (default trait impl is a no-op).
+    pedal_sustain: f32,
 ) {
     // Flush-To-Zero + Denormals-Are-Zero on the audio thread.
     //
@@ -1118,6 +1156,11 @@ fn audio_callback(
     {
         let mut pool = voices.lock().unwrap();
         for v in pool.iter_mut() {
+            // Tier 2.3: refresh the per-voice pedal snapshot once per
+            // audio buffer. Cheap (no-op for non-piano voices) and lets
+            // CC 64 transitions take effect at the buffer boundary
+            // rather than waiting for the next note_on.
+            v.inner.set_pedal_sustain(pedal_sustain);
             v.inner.render_add(mono.as_mut_slice());
         }
         pool.retain(|v| !v.inner.is_done());
