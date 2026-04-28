@@ -78,6 +78,22 @@ pub unsafe fn live_new(engine: Engine, sr: f32, freq: f32, vel: u8) -> *mut c_vo
     Box::into_raw(v) as *mut c_void
 }
 
+/// Construct a plugin pointer around an externally-built voice.
+///
+/// Used by plugins whose voice does not have an `Engine` variant in the
+/// host (issue #44 multi-family roadmap — voices_live/guitar is the
+/// first such plugin). The plugin builds a `Box<dyn VoiceImpl + Send>`
+/// with its own constructor, then hands it to this helper for the same
+/// PluginVoice / live_drop lifecycle the enum-routed plugins use.
+///
+/// # Safety
+/// Must only be called from the plugin's exported `keysynth_live_new`.
+/// The returned pointer must be freed exactly once via `live_drop`.
+pub unsafe fn live_new_boxed(voice: Box<dyn VoiceImpl + Send>) -> *mut c_void {
+    let v = Box::new(PluginVoice { inner: voice });
+    Box::into_raw(v) as *mut c_void
+}
+
 /// Add the voice's contribution into `buf[..n]` (mono, additive — never
 /// overwrites the buffer, matching the host-side contract).
 ///

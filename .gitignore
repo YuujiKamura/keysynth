@@ -22,6 +22,14 @@ Thumbs.db
 # Local state from oh-my-claudecode plugin
 .omc/
 
+# Per-PR brief from the dispatch chain — the spawning issue (e.g. #44
+# for the multi-family roadmap) carries the canonical task brief; the
+# working-tree copy of the latest brief is just the dispatcher's
+# hand-off envelope and shouldn't bloat the repo. Existing
+# already-committed `.dispatch/` design notes (cp-design / soundboard /
+# voice-unify) stay tracked.
+.dispatch/guitar-brief.md
+
 # Logs / scratch
 *.log
 *.tmp
@@ -48,6 +56,14 @@ reference/*.wav
 !bench-out/REF/README.md
 !bench-out/REF/sfz_salamander_multi/
 !bench-out/REF/sfz_salamander_multi/**
+# Guitar reference samples (issue #44 — first non-piano voice family).
+# Downloaded on demand by `tools/fetch-guitar-refs.sh` from the
+# CC0-licensed Discord SFZ GM Bank. Repo carries the LICENSE.txt and
+# README.md so provenance travels even when the WAVs are absent;
+# the WAVs themselves stay un-committed per the multi-family brief.
+!bench-out/REF/guitar/
+!bench-out/REF/guitar/LICENSE.txt
+!bench-out/REF/guitar/README.md
 # CP E2E demo log: tests/cp_e2e_demo.sh writes the captured PR evidence
 # here. Whitelist the directory so run.log is checkable, but keep the
 # rendered WAVs and keysynth's verbose stderr tail local-only.

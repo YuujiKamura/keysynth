@@ -1,0 +1,36 @@
+[package]
+name = "keysynth_voice_guitar"
+version = "0.1.0"
+edition = "2021"
+description = "voices_live plugin: steel-string acoustic guitar physical model (issue #44 — first non-piano voice family)."
+publish = false
+
+# Self-contained workspace root, same reasoning as the other
+# `voices_live/<name>/` plugins: keysynth's top-level `[workspace]`
+# excludes `voices_live` and everything under it, and an empty
+# `[workspace]` here makes that explicit so the `target/cp-tests/`
+# scratch-copy pattern used by `tests/cp_smoke.rs` keeps working.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Path-dep on the parent keysynth crate. `default-features = false`
+# strips the `native` feature stack so the plugin compiles only the
+# DSP primitives in `keysynth::synth` and `keysynth::voices` plus the
+# C-ABI helpers in `keysynth::live_abi`. Same dep shape as
+# `voices_live/piano/Cargo.toml`.
+keysynth = { path = "../..", default-features = false }
+
+[profile.dev]
+opt-level = 1
+debug = 0
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = false
+incremental = true
+codegen-units = 16
