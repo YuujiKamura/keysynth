@@ -4,6 +4,40 @@ Real-time MIDI keyboard → speaker synth. Single-binary Rust app with an egui
 dashboard, written as a Phase-1 physical-modelling experiment after the Python
 prototype hit GIL / GC / API issues.
 
+## Vision
+
+The long-term aim is **research-grade physical modelling for the full GM 128
+program list** — every GM patch produced by parameter-driven synthesised
+physics, not by samples. The piano work
+([#32](https://github.com/YuujiKamura/keysynth/issues/32)) is the bootstrap;
+once that substrate is solid, other instrument families
+([#44](https://github.com/YuujiKamura/keysynth/issues/44)) follow at sharply
+lower per-instrument cost: bowed/plucked strings, brass + reeds, air-jet
+woodwinds, tuned + membrane + plate percussion. ~10 DSP families cover ~80%
+of GM. Same DSP code feeds native (cpal) and web (Kira / cpal-wasm-bindgen).
+
+To make iteration on these models fast, voices are built as **swappable
+plugins**:
+
+- `cp-core` ([#41](https://github.com/YuujiKamura/keysynth/pull/41)) — a
+  vendor-neutral JSON-RPC 2.0 Control Protocol substrate (`std + serde +
+  tokio`, no third-party RPC SDK), a peer of
+  [deckpilot](https://github.com/YuujiKamura/deckpilot) at the JSON-RPC
+  layer the way deckpilot is at the ConPTY layer.
+- `ksctl` — CLI client over the CP, can `load` / `set` / `render` / `build`
+  voice slots while the GUI keeps playing.
+- `voices_live/` — voice cdylibs that GUI can `dlopen` and atomically swap.
+  Source-edit → cargo rebuild → live reload, ~70 ms swap latency
+  ([#40](https://github.com/YuujiKamura/keysynth/pull/40)).
+
+This means model iteration without GUI restart, A/B comparison via external
+CLI, and a clear path for AI-driven dispatch chains to extend the family
+catalogue without touching the GUI host.
+
+The repo's identity, then: **synthesised GM through AI-agent
+collaboration**, not "another Karplus-Strong demo". The engine list below
+is the current state, not the destination.
+
 ## Engines
 
 | `--engine` | Approach | Character |
