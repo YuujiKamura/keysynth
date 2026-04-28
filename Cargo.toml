@@ -280,3 +280,14 @@ required-features = ["native"]
 name = "ksctl"
 path = "src/bin/ksctl.rs"
 required-features = ["native"]
+
+# chord_pad binary: real-time chord-trigger surface for the STK guitar
+# voice (and any other voices_live/* family). Dual input: PC keyboard
+# (egui keystrokes → diatonic chord triggers) and USB MIDI (midir
+# note_on/off → single-note voices). Built specifically because A/B
+# listening in jukebox cannot replace hand-played feedback when
+# auditioning a new physical-model guitar.
+[[bin]]
+name = "chord_pad"
+path = "src/bin/chord_pad.rs"
+required-features = ["native"]
