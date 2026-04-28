@@ -10,8 +10,9 @@
 //!   - Stronger allpass dispersion -> more inharmonicity (piano stretch tuning)
 
 use super::super::synth::{
-    piano_hammer_excitation, piano_hammer_width, KsString, ReleaseEnvelope, VoiceImpl,
+    piano_hammer_excitation, piano_hammer_width, KsString, ReleaseEnvelope, SmallFir, VoiceImpl,
 };
+use super::bridge_admittance::make_bridge_admittance_fir;
 use super::hammer_stulov::{self, HammerParams};
 use super::longitudinal::LongitudinalString;
 use super::mistuning_table::{curve_for_midi, MistuneCurve, MIN_HALF_SPREAD_CENTS};
@@ -233,7 +234,23 @@ pub struct PianoVoice {
     /// every sample and feeds back into the strings via `coupling_per_string`
     /// for physical bridge coupling (Bank/Lehtonen DWS).
     soundboard: crate::soundboard::Soundboard,
+    /// DC-gain scalar for the bridge round-trip. Identical to the legacy
+    /// `coupling_per_string` field in pre-T2.2 builds. The FIR shapes the
+    /// frequency response *around* this scalar; the FIR itself is
+    /// DC-normalised so the audible coupling at low frequencies stays
+    /// numerically identical to the pre-T2.2 baseline.
     coupling_per_string: f32,
+    /// T2.2 frequency-dependent bridge admittance, soundboard → string
+    /// direction. Filters the soundboard's previous-sample output before
+    /// it enters each string's `inject_feedback`. Stateful — must NOT be
+    /// `Clone`d into a "shared" instance across the two directions.
+    bridge_fir_return: SmallFir<6>,
+    /// T2.2 frequency-dependent bridge admittance, string → soundboard
+    /// direction. Filters the averaged string drive before
+    /// `Soundboard::process` consumes it. Separate state from
+    /// `bridge_fir_return` so the two directions of the bridge round-trip
+    /// each see their own delay line.
+    bridge_fir_drive: SmallFir<6>,
     dry_gain: f32,
     wet_gain: f32,
     long_gain: f32,
@@ -373,6 +390,8 @@ impl PianoVoice {
             release: ReleaseEnvelope::new(preset.release_sec, sr),
             soundboard,
             coupling_per_string: preset.coupling_per_string,
+            bridge_fir_return: make_bridge_admittance_fir(),
+            bridge_fir_drive: make_bridge_admittance_fir(),
             dry_gain: preset.dry_gain,
             wet_gain: preset.wet_gain,
             long_gain: preset.long_gain,
@@ -384,6 +403,17 @@ impl PianoVoice {
             // the update entirely (no inter-string beating to drive).
             detune_update_period: if preset.string_count <= 1 { 0 } else { 32 },
         }
+    }
+
+    /// Test-only hook: replace both bridge-admittance FIR coefficient
+    /// vectors so the integration suite can A/B against the legacy flat-
+    /// scalar coupling (`[1.0, 0, 0, 0, 0, 0]`) without `git stash`-ing
+    /// the whole T2.2 patch. NOT part of the public DSP API — voice
+    /// presets remain the canonical way to vary bridge behaviour.
+    #[doc(hidden)]
+    pub fn override_bridge_fir_for_testing(&mut self, coefs: [f32; 6]) {
+        self.bridge_fir_return = SmallFir::new(coefs);
+        self.bridge_fir_drive = SmallFir::new(coefs);
     }
 
     /// Compute and apply the per-string fractional-delay update for the
@@ -450,7 +480,17 @@ impl VoiceImpl for PianoVoice {
             // 1. Inject the previous-sample soundboard output back into
             //    every string via the bridge. One-sample delay keeps the
             //    feedback loop strictly causal (no algebraic loop).
-            let fb = self.soundboard.last_output() * self.coupling_per_string;
+            //
+            //    T2.2 frequency-dependent admittance: the soundboard
+            //    output runs through `bridge_fir_return` before being
+            //    scaled by the per-preset DC coupling. The FIR is
+            //    DC-normalised, so at low frequencies the injected
+            //    feedback equals the pre-T2.2 scalar baseline; only the
+            //    high-frequency component is attenuated to match the
+            //    Suzuki/Giordano admittance rolloff.
+            let board_prev = self.soundboard.last_output();
+            let board_filtered = self.bridge_fir_return.process(board_prev);
+            let fb = board_filtered * self.coupling_per_string;
             if fb != 0.0 {
                 for s in &mut self.strings {
                     s.inject_feedback(fb);
@@ -468,7 +508,14 @@ impl VoiceImpl for PianoVoice {
             }
             let s_avg = s_sum * string_norm;
             // 3. Drive the soundboard with the averaged string output.
-            let board_out = self.soundboard.process(s_avg);
+            //    T2.2: the same admittance shape applies to the string →
+            //    bridge direction. Mathematically the round-trip loop
+            //    transfer function therefore picks up |H(ω)|^2 instead
+            //    of |H(ω)|, which is exactly what bidirectional
+            //    admittance physics predicts (the bridge attenuates
+            //    energy moving in either direction).
+            let s_avg_filtered = self.bridge_fir_drive.process(s_avg);
+            let board_out = self.soundboard.process(s_avg_filtered);
             // 4. Mix dry strings + wet soundboard + longitudinal into the audio bus.
             let env = self.release.step();
             *sample += (s_avg * dry_gain + board_out * wet_gain + s_long_total * long_gain) * env;
