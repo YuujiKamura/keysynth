@@ -44,6 +44,8 @@ pub mod live_reload;
 pub mod preview_cache;
 #[cfg(feature = "native")]
 pub mod score;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub mod scripting;
 #[cfg(feature = "native")]
 pub mod sequencer;
 #[cfg(feature = "native")]
