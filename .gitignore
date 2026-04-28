@@ -70,7 +70,8 @@ reference/*.wav
 !bench-out/cp-e2e/
 !bench-out/cp-e2e/run.log
 bench-out/cp-e2e/*.wav
-bench-out/cp-e2e/keysynth.stderr.log
+bench-out/cp-e2e/*.stderr.log
+bench-out/cp-e2e/*-body.md
 # Voice-unify E2E demo log: tests/voice_unify_e2e.sh writes the
 # captured PR evidence here. Same policy as cp-e2e: whitelist the log,
 # keep WAVs / latency tsv / stderr local-only.
