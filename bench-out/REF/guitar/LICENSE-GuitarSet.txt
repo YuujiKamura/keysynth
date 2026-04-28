@@ -1,0 +1,66 @@
+Source: GuitarSet — A Dataset for Guitar Transcription
+URL:    https://guitarset.weebly.com/
+Repo:   https://github.com/marl/GuitarSet
+Paper:  Q. Xi, R.M. Bittner, J. Pauwels, X. Ye, J.P. Bello, "GuitarSet:
+        A Dataset for Guitar Transcription," in 19th International
+        Society for Music Information Retrieval Conference (ISMIR 2018),
+        Paris, France, 2018.
+DOI:    https://doi.org/10.5281/zenodo.3371780
+
+License: BSD 3-Clause License (verbatim follows below).
+
+Quoted from the upstream repository LICENSE file:
+
+    BSD 3-Clause License
+
+    Copyright (c) 2018, Music and Audio Research Laboratory (MARL)
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    3. Neither the name of the copyright holder nor the names of its
+       contributors may be used to endorse or promote products derived
+       from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
+
+Dataset summary:
+  - 360 audio clips × 30 seconds, ~5 GB total
+  - Multiple microphones (hex pickup + reference mic) per clip
+  - Aligned MIDI ground truth + chord labels
+  - Six players, varied styles (rock / singer-songwriter / jazz / bossa
+    nova / funk)
+
+Use in this corpus:
+  Single-note samples (each open string + selected fretted positions)
+  are extracted from GuitarSet's solo passages and normalised to
+  44.1 kHz / mono / 16-bit PCM under bench-out/REF/guitar/single_note/.
+  Strummed-chord samples are extracted from comping passages under
+  bench-out/REF/guitar/chord/. The MIDI files are pulled directly
+  from the per-clip jam annotations.
+
+  WAV files are NOT redistributed in this repository. They are
+  fetched on demand by `bench-out/REF/guitar/fetch.sh`. The MIDI
+  ground truth and the manifest.json provenance entries IS committed
+  alongside this LICENSE file so the audit trail is preserved.
