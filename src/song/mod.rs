@@ -114,6 +114,35 @@ impl Quality {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Voicing {
+    Close,
+    Piano,
+    Guitar,
+    Open,
+}
+
+impl Voicing {
+    pub fn parse(input: &str) -> Result<Self, ParseError> {
+        match input {
+            "close" => Ok(Self::Close),
+            "piano" => Ok(Self::Piano),
+            "guitar" => Ok(Self::Guitar),
+            "open" => Ok(Self::Open),
+            other => Err(ParseError::new(format!("unsupported voicing '{}'", other))),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Close => "close",
+            Self::Piano => "piano",
+            Self::Guitar => "guitar",
+            Self::Open => "open",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chord {
     pub root: PitchClass,
@@ -121,13 +150,89 @@ pub struct Chord {
 }
 
 impl Chord {
-    pub fn voice(&self) -> Vec<u8> {
+    pub fn voice(&self, voicing: Voicing) -> Vec<u8> {
+        match voicing {
+            Voicing::Close => self.close_voice(),
+            Voicing::Piano => self.piano_voice(),
+            Voicing::Guitar => self.guitar_voice(),
+            Voicing::Open => self.open_voice(),
+        }
+    }
+
+    fn close_voice(&self) -> Vec<u8> {
         let root_midi = centered_root_midi(self.root);
         self.quality
             .intervals()
             .iter()
             .map(|interval| root_midi + interval)
             .collect()
+    }
+
+    fn piano_voice(&self) -> Vec<u8> {
+        let mut notes = Vec::with_capacity(self.quality.intervals().len() + 1);
+        notes.push(bass_root_midi(self.root));
+        notes.extend(self.close_voice());
+        notes
+    }
+
+    fn guitar_voice(&self) -> Vec<u8> {
+        const OPEN_STRINGS: [u8; 6] = [40, 45, 50, 55, 59, 64];
+
+        OPEN_STRINGS
+            .iter()
+            .map(|open_string| self.lowest_chord_tone_at_or_above(*open_string))
+            .collect()
+    }
+
+    fn open_voice(&self) -> Vec<u8> {
+        let bass_root = bass_root_midi(self.root);
+        let (third, fifth, seventh) = self.structure_intervals();
+        let mut notes = vec![
+            bass_root,
+            bass_root + fifth,
+            bass_root + third + 12,
+            bass_root + fifth + 12,
+        ];
+        if let Some(seventh) = seventh {
+            notes.push(bass_root + seventh + 12);
+        }
+        notes.push(bass_root + 24);
+        notes.push(bass_root + third + 24);
+        notes
+    }
+
+    fn structure_intervals(&self) -> (u8, u8, Option<u8>) {
+        let intervals = self.quality.intervals();
+        let third = intervals.get(1).copied().unwrap_or(4);
+        let fifth = intervals.get(2).copied().unwrap_or(7);
+        let seventh = if intervals.len() >= 5 {
+            intervals.get(3).copied()
+        } else {
+            None
+        };
+        (third, fifth, seventh)
+    }
+
+    fn chord_tone_intervals(&self) -> Vec<u8> {
+        let mut intervals = Vec::new();
+        for interval in self.quality.intervals() {
+            let normalized = interval % 12;
+            if !intervals.contains(&normalized) {
+                intervals.push(normalized);
+            }
+        }
+        intervals
+    }
+
+    fn lowest_chord_tone_at_or_above(&self, floor: u8) -> u8 {
+        let chord_tones = self.chord_tone_intervals();
+        for note in floor..=127 {
+            let relative_pc = (12 + note % 12 - self.root.as_u8()) % 12;
+            if chord_tones.contains(&relative_pc) {
+                return note;
+            }
+        }
+        unreachable!("a chord tone must exist within one octave above any guitar string");
     }
 }
 
@@ -370,4 +475,8 @@ fn centered_root_midi(root: PitchClass) -> u8 {
     } else {
         48 + pc
     }
+}
+
+fn bass_root_midi(root: PitchClass) -> u8 {
+    36 + root.as_u8()
 }
