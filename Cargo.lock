@@ -680,6 +680,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cp-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cpal"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1672,6 +1680,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "console_error_panic_hook",
+ "cp-core",
  "cpal",
  "ctrlc",
  "eframe",
