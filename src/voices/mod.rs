@@ -3,6 +3,7 @@
 //! primitives (`KsString`, `ReleaseEnvelope`, hammer/pluck excitations,
 //! `Adsr`) stay in `synth` and are imported here.
 
+pub mod bridge_admittance;
 pub mod fm;
 pub mod hammer_stulov;
 pub mod koto;
