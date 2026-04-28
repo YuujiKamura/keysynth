@@ -1,11 +1,19 @@
 //! egui dashboard for keysynth.
 //!
 //! Layout:
-//!   - Left side panel: voice browser (Piano / Synth / Custom categories,
-//!     each containing selectable `VoiceSlot`s — modal presets, SFZ
-//!     samplers, SF2 SoundFonts, synth engines, user-saved Custom
-//!     presets). Selecting a slot hot-swaps engine + ModalParams +
-//!     asset in one operation; the next note_on picks up the new voice.
+//!   - Left side panel: voice browser (Piano / Guitar / Synth / Samples /
+//!     Custom categories, each containing selectable `VoiceSlot`s — Tier
+//!     1+2 piano variants, the modeled-guitar pair (STK port + KS+IR
+//!     legacy), the lightweight synth set, sample-based SFZ / SF2 pianos,
+//!     and user-saved presets). Each slot carries an editorial tier
+//!     (`Recommend::Best/Stable/Experimental`) shown as a small label
+//!     after the slot name; entries within a category are sorted by tier
+//!     so the recommended pick floats to the top. Selecting a slot
+//!     hot-swaps engine + ModalParams + asset in one operation; the
+//!     next note_on picks up the new voice. For named live slots
+//!     (Guitar STK / Guitar KS) the apply path also asks the reloader
+//!     to make that slot active, building the `voices_live/<subdir>/`
+//!     crate on demand if no factory has been loaded yet.
 //!   - Top panel: master / reverb / mix mode (always-relevant globals).
 //!   - Central panel: ModalParams sliders (when piano-modal active),
 //!     SF program picker (when sf-piano active), CC controls, held
@@ -31,7 +39,7 @@ use crate::synth::{
     make_voice, midi_to_freq, modal_params, set_modal_params, set_modal_physics, DashState, Engine,
     LiveParams, MixMode, ModalParams, Voice, VoiceImpl,
 };
-use crate::voice_lib::{Category, VoiceLibrary, VoiceSlot};
+use crate::voice_lib::{Category, Recommend, VoiceLibrary, VoiceSlot};
 
 /// Bundle passed from `main` into `run_app`. Holds the long-lived audio /
 /// MIDI handles so they aren't dropped while the GUI is open.
@@ -108,11 +116,33 @@ struct KeysynthApp {
 
 impl KeysynthApp {
     fn new(ctx: AppContext) -> Self {
+        // Plugin discovery root: `Reloader::spawn` is called with the
+        // `voices_live/` directory, so `reloader.crate_root` already
+        // is that root. Fall back to the hard-coded `voices_live`
+        // relative path when no reloader exists (release tarball,
+        // --no-cp invocation) so the GUI still catalogs whatever
+        // plugin manifests are reachable from the cwd.
+        let voices_live_root: Option<PathBuf> = ctx
+            .live_reloader
+            .as_ref()
+            .map(|r| r.crate_root.clone())
+            .or_else(|| {
+                let p = PathBuf::from("voices_live");
+                p.is_dir().then_some(p)
+            });
+
         let library = VoiceLibrary::load(
             ctx.startup_sfz_path.as_deref(),
             ctx.startup_sf2_path.as_deref(),
             ctx.startup_engine,
+            voices_live_root.as_deref(),
         );
+        // Audit line for the GUI organize PR: surfaces the catalog
+        // count at startup so the discovery test and the manual smoke
+        // verify share a single observable. Filter to `builtin == true`
+        // so the count isn't inflated by user-saved Custom presets.
+        let builtin_count = library.slots.iter().filter(|s| s.builtin).count();
+        eprintln!("voice_lib: {builtin_count} builtins loaded");
         // Seed loaded-asset trackers from main's auto-discovery so the
         // first click on the matching browser entry is a no-op (no
         // 5-second SFZ decode for an already-loaded sample set).
@@ -264,6 +294,51 @@ impl KeysynthApp {
                 }
             }
             _ => {}
+        }
+
+        // 4. Named live-slot bridge. Engine::Live with a `live_slot_name`
+        //    means the user picked one of the modeled-guitar entries (or
+        //    any future named cdylib voice). Try `set_active(name)` first
+        //    — that's a constant-time pointer swap if the slot has
+        //    already been built. If the slot is unknown to the reloader
+        //    we kick off a background `build_into_slot` so the cargo
+        //    compile doesn't freeze the UI thread; the existing live
+        //    status panel surfaces "building..." → "loaded in N ms" /
+        //    "ERR <msg>" feedback verbatim. Slots without a
+        //    `live_slot_name` (the legacy "Live (hot edit)" entry) fall
+        //    through unchanged — the reloader keeps watching whatever
+        //    `crate_root` it was spawned against.
+        if slot.engine == Engine::Live {
+            if let (Some(reloader), Some(slot_name)) =
+                (self.ctx.live_reloader.clone(), slot.live_slot_name.clone())
+            {
+                if reloader.set_active(&slot_name).is_ok() {
+                    self.set_msg_ok(format!("live slot '{slot_name}' active"));
+                } else if let Some(subdir) = slot.live_crate_subdir.clone() {
+                    // `reloader.crate_root` is the `voices_live/` root
+                    // (Reloader::spawn is given that path), so each
+                    // plugin crate lives at `<root>/<subdir>/`.
+                    let crate_root = reloader.crate_root.join(&subdir);
+                    self.set_msg_ok(format!(
+                        "building '{slot_name}' from {} ...",
+                        crate_root.display()
+                    ));
+                    let reloader_bg = reloader.clone();
+                    let slot_for_bg = slot_name.clone();
+                    std::thread::spawn(move || {
+                        if reloader_bg
+                            .build_into_slot(&crate_root, &slot_for_bg)
+                            .is_ok()
+                        {
+                            let _ = reloader_bg.set_active(&slot_for_bg);
+                        }
+                    });
+                } else {
+                    self.set_msg_err(format!(
+                        "live slot '{slot_name}' has no crate subdir; cannot build"
+                    ));
+                }
+            }
         }
     }
 
@@ -558,13 +633,27 @@ impl eframe::App for KeysynthApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for category in Category::ALL {
+                            // Collect indices belonging to this category and
+                            // sort them Best→Stable→Experimental. Stable
+                            // sort by index keeps the declared order from
+                            // `voice_lib::builtins()` as the tie-breaker so
+                            // e.g. `Piano` still renders above `Piano Modal`
+                            // even though both are Best.
+                            let mut idxs: Vec<usize> = self
+                                .library
+                                .slots
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, s)| s.category == *category)
+                                .map(|(i, _)| i)
+                                .collect();
+                            idxs.sort_by_key(|i| self.library.slots[*i].recommend.rank());
+
                             egui::CollapsingHeader::new(category.label())
                                 .default_open(true)
                                 .show(ui, |ui| {
-                                    for (idx, slot) in self.library.slots.iter().enumerate() {
-                                        if slot.category != *category {
-                                            continue;
-                                        }
+                                    for idx in idxs {
+                                        let slot = &self.library.slots[idx];
                                         let is_active = self.library.active == idx;
                                         let in_rename = self.pending_rename == Some(idx);
                                         ui.horizontal(|ui| {
@@ -595,6 +684,32 @@ impl eframe::App for KeysynthApp {
                                                 if resp.clicked() {
                                                     clicked_slot = Some(idx);
                                                 }
+                                                // Editorial tier as a small
+                                                // colored label trailing the
+                                                // slot name. Color cues:
+                                                // green=Best, gray=Stable,
+                                                // amber=Experimental — same
+                                                // palette the live status
+                                                // panel uses below.
+                                                let (rec_color, rec_text) = match slot.recommend {
+                                                    Recommend::Best => (
+                                                        egui::Color32::from_rgb(120, 220, 120),
+                                                        slot.recommend.label(),
+                                                    ),
+                                                    Recommend::Stable => (
+                                                        egui::Color32::from_rgb(170, 170, 170),
+                                                        slot.recommend.label(),
+                                                    ),
+                                                    Recommend::Experimental => (
+                                                        egui::Color32::from_rgb(220, 200, 100),
+                                                        slot.recommend.label(),
+                                                    ),
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(rec_text)
+                                                        .small()
+                                                        .color(rec_color),
+                                                );
                                                 if !slot.builtin {
                                                     resp.context_menu(|ui| {
                                                         if ui.button("Rename").clicked() {
@@ -610,11 +725,28 @@ impl eframe::App for KeysynthApp {
                                                 }
                                             }
                                         });
+                                        // One-line description under the
+                                        // label, indented and dimmed so it
+                                        // doesn't compete with the click
+                                        // target. Empty for legacy / user
+                                        // slots — rendering skips those.
+                                        if !slot.description.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(16.0);
+                                                ui.label(
+                                                    egui::RichText::new(&slot.description)
+                                                        .small()
+                                                        .color(egui::Color32::from_rgb(
+                                                            150, 150, 150,
+                                                        )),
+                                                );
+                                            });
+                                        }
                                     }
                                     // Per-category action buttons.
                                     ui.add_space(2.0);
                                     match category {
-                                        Category::Piano => {
+                                        Category::Samples => {
                                             ui.horizontal(|ui| {
                                                 if ui.small_button("+ Load SFZ...").clicked() {
                                                     want_load_sfz = true;
@@ -629,7 +761,7 @@ impl eframe::App for KeysynthApp {
                                                 want_save_custom = true;
                                             }
                                         }
-                                        Category::Synth => {}
+                                        Category::Piano | Category::Guitar | Category::Synth => {}
                                     }
                                 });
                         }

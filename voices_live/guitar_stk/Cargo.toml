@@ -5,6 +5,12 @@ edition = "2021"
 description = "voices_live plugin: Synthesis Toolkit (STK) Guitar/Twang port — second steel-string acoustic guitar voice (issue #52, A/B oracle for voices_live/guitar)."
 publish = false
 
+[package.metadata.keysynth-voice]
+display_name = "Guitar (STK)"
+category = "Guitar"
+recommend = "Best"
+description = "Stanford Synthesis Toolkit port, well-balanced output"
+
 # Self-contained workspace root, same reasoning as the other
 # `voices_live/<name>/` plugins: keysynth's top-level `[workspace]`
 # excludes `voices_live` and everything under it, and an empty

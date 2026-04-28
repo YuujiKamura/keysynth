@@ -5,6 +5,12 @@ edition = "2021"
 description = "voices_live plugin: Engine::Piano5AM (containerised 2026-04-25 05:38 piano snapshot)."
 publish = false
 
+[package.metadata.keysynth-voice]
+display_name = "Piano 5AM"
+category = "Piano"
+recommend = "Stable"
+description = "long-decay snapshot variant"
+
 [workspace]
 
 [lib]

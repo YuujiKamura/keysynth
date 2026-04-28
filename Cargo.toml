@@ -43,6 +43,13 @@ native = [
     # third-party RPC dependencies (std + serde + serde_json only)
     # — see `cp-core/README.md` for the substrate philosophy.
     "dep:cp-core",
+    # toml: parses `[package.metadata.keysynth-voice]` blocks out of
+    # `voices_live/<name>/Cargo.toml` so new voice plugins show up in
+    # the GUI side panel by simply landing a directory + metadata —
+    # no edits to `voice_lib.rs` / `ui.rs` / Engine enum required.
+    # Native-only: discovery is filesystem-scoped and never runs in
+    # the wasm browser build.
+    "dep:toml",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -102,6 +109,10 @@ arc-swap = { version = "1.7", optional = true }
 # of the studio (ghostty-win, photo-ai-lisp, etc.) without taking on
 # someone else's protocol opinions.
 cp-core = { path = "cp-core", optional = true }
+# toml: read `[package.metadata.keysynth-voice]` from voice plugin
+# manifests for GUI-side discovery (see `voice_lib::discover_plugin_voices`).
+# Default features are fine — we only need top-level `toml::from_str`.
+toml = { version = "0.8", optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
