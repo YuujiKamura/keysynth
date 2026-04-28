@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use midly::num::{u15, u24, u28, u4, u7};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
 
+use keysynth::library_db::{LibraryDb, SongFilter, SongSort};
 use keysynth::song::{parse_progression_with_key, Chord, Key, Voicing};
 use keysynth::synth::{midi_to_freq, Engine, VoiceImpl};
 use keysynth::voices::guitar::GuitarVoice;
@@ -39,8 +40,21 @@ impl VoiceChoice {
             "sf-piano" => Ok(Self::Engine(Engine::SfPiano)),
             "sfz-piano" => Ok(Self::Engine(Engine::SfzPiano)),
             "guitar" => Ok(Self::Guitar),
+            // The library DB stores manifest-level suggested_voice
+            // strings ("guitar-stk", "piano-stk", ...) that name a
+            // voices_live/<id>/ cdylib slot rather than a static
+            // Engine variant. kssong has no live-reload path of its
+            // own, so we route those onto the closest static voice:
+            // guitar-stk → GuitarVoice (the in-tree STK guitar port),
+            // piano-stk  → Engine::Piano (in-tree KS+modal hybrid).
+            // This means "kssong --recommended-voice guitar-stk" picks
+            // a Tárrega piece and renders it through the offline
+            // guitar voice, which is the closest stand-in available
+            // without spinning up the live_reload subsystem.
+            "guitar-stk" => Ok(Self::Guitar),
+            "piano-stk" => Ok(Self::Engine(Engine::Piano)),
             other => Err(format!(
-                "unknown --voice: {other} (piano|piano-modal|piano-thick|piano-lite|piano-5am|guitar|square|ks|ks-rich|fm|sub|koto|sf-piano|sfz-piano)"
+                "unknown --voice: {other} (piano|piano-modal|piano-thick|piano-lite|piano-5am|guitar|guitar-stk|square|ks|ks-rich|fm|sub|koto|sf-piano|sfz-piano)"
             )),
         }
     }
@@ -48,8 +62,16 @@ impl VoiceChoice {
 
 #[derive(Debug)]
 struct PlayArgs {
-    progression: String,
+    /// Either a literal chord progression ("C - G - Am - F") or `None`
+    /// when the song is being chosen from the library DB via the
+    /// composer/era/tag/recommended-voice flags.
+    progression: Option<String>,
     voice: VoiceChoice,
+    /// True when --voice was not passed by the user — lets the
+    /// library-DB path opportunistically pick the song's
+    /// suggested_voice (e.g. guitar-stk for Tárrega) instead of the
+    /// generic Engine::Piano default.
+    voice_was_default: bool,
     voicing: Voicing,
     bpm: u32,
     bars: Option<usize>,
@@ -57,14 +79,30 @@ struct PlayArgs {
     out_path: PathBuf,
     sfz_path: Option<PathBuf>,
     modal_lut_path: Option<PathBuf>,
+    /// Optional library-DB filter. When any field is `Some`, kssong
+    /// switches from "render the supplied progression" to "find the
+    /// first matching song in bench-out/library.db and render its
+    /// MIDI". Mutually exclusive with the progression positional in
+    /// the sense that one or the other must produce notes.
+    db_filter: SongFilter,
+}
+
+fn db_filter_active(f: &SongFilter) -> bool {
+    f.composer.is_some()
+        || f.era.is_some()
+        || f.instrument.is_some()
+        || f.tag.is_some()
+        || f.recommended_voice.is_some()
 }
 
 fn print_help() {
     eprintln!(
-        "kssong - one-line chord progression renderer\n\n\
+        "kssong - chord-progression + library-DB song renderer\n\n\
          usage:\n  \
-         kssong play \"C - G - Am - F\" --voice piano --bpm 120 --out out.wav\n\n\
-         play options:\n  \
+         kssong play \"C - G - Am - F\" --voice piano --bpm 120 --out out.wav\n  \
+         kssong play --composer bach --voice piano-modal --out bach.wav\n  \
+         kssong play --recommended-voice guitar-stk --out tarrega.wav\n\n\
+         play options (chord-progression mode):\n  \
          --voice NAME      piano|piano-modal|piano-thick|piano-lite|piano-5am|guitar|square|ks|ks-rich|fm|sub|koto|sf-piano|sfz-piano\n  \
          --voicing MODE    close|piano|guitar|open (default close)\n  \
          --bpm N           tempo in beats per minute (default 120)\n  \
@@ -72,7 +110,16 @@ fn print_help() {
          --key KEY         base key for roman numerals (example: C, F#, Bb)\n  \
          --sfz PATH        required when --voice sfz-piano\n  \
          --modal-lut PATH  optional modal LUT override for piano-modal\n  \
-         --out PATH        output WAV path (required)"
+         --out PATH        output WAV path (required)\n\n\
+         play options (library-DB mode, issue #66):\n  \
+         --composer NAME           pick a song matching composer key (\"bach\", \"tarrega\")\n  \
+         --era ERA                 Baroque|Classical|Romantic|Modern|Traditional\n  \
+         --tag TAG                 song tag from manifest.json\n  \
+         --recommended-voice V     song whose `suggested_voice` is V (e.g. guitar-stk)\n  \
+         When any of the four flags above is set, --voice / --voicing default to\n  \
+         the song's suggested voice if --voice is not given.\n  \
+         Bench-out/library.db is auto-rebuilt from manifest.json before the query.\n  \
+         --voicing/--voice still apply on top to override the engine."
     );
 }
 
@@ -92,10 +139,17 @@ fn parse_args() -> Result<PlayArgs, String> {
         return Err(format!("unknown subcommand: {subcommand}"));
     }
 
-    let progression = iter
-        .next()
-        .ok_or_else(|| "play requires a chord progression string".to_string())?;
+    // The first positional after "play" is treated as the chord
+    // progression unless it starts with "--", in which case the user
+    // has gone straight into library-DB mode (no progression at all).
+    let mut iter = iter.peekable();
+    let progression: Option<String> = match iter.peek() {
+        Some(arg) if arg.starts_with("--") => None,
+        Some(_) => iter.next(),
+        None => None,
+    };
     let mut voice = VoiceChoice::Engine(Engine::Piano);
+    let mut voice_was_default = true;
     let mut voicing = Voicing::Close;
     let mut bpm = DEFAULT_BPM;
     let mut bars = None;
@@ -103,12 +157,17 @@ fn parse_args() -> Result<PlayArgs, String> {
     let mut out_path: Option<PathBuf> = None;
     let mut sfz_path = None;
     let mut modal_lut_path = None;
+    let mut db_filter = SongFilter {
+        sort: SongSort::ByComposer,
+        ..Default::default()
+    };
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--voice" | "--engine" => {
                 let value = iter.next().ok_or("--voice needs a value")?;
                 voice = VoiceChoice::parse(&value)?;
+                voice_was_default = false;
             }
             "--voicing" => {
                 let value = iter.next().ok_or("--voicing needs a value")?;
@@ -150,6 +209,22 @@ fn parse_args() -> Result<PlayArgs, String> {
                     iter.next().ok_or("--modal-lut needs a value")?,
                 ));
             }
+            "--composer" => {
+                db_filter.composer = Some(iter.next().ok_or("--composer needs a value")?);
+            }
+            "--era" => {
+                db_filter.era = Some(iter.next().ok_or("--era needs a value")?);
+            }
+            "--instrument" => {
+                db_filter.instrument = Some(iter.next().ok_or("--instrument needs a value")?);
+            }
+            "--tag" => {
+                db_filter.tag = Some(iter.next().ok_or("--tag needs a value")?);
+            }
+            "--recommended-voice" => {
+                db_filter.recommended_voice =
+                    Some(iter.next().ok_or("--recommended-voice needs a value")?);
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -158,9 +233,18 @@ fn parse_args() -> Result<PlayArgs, String> {
         }
     }
 
+    if progression.is_none() && !db_filter_active(&db_filter) {
+        return Err(
+            "play requires either a chord progression string or one of \
+             --composer / --era / --tag / --instrument / --recommended-voice"
+                .to_string(),
+        );
+    }
+
     Ok(PlayArgs {
         progression,
         voice,
+        voice_was_default,
         voicing,
         bpm,
         bars,
@@ -168,6 +252,7 @@ fn parse_args() -> Result<PlayArgs, String> {
         out_path: out_path.ok_or("--out is required")?,
         sfz_path,
         modal_lut_path,
+        db_filter,
     })
 }
 
@@ -342,8 +427,15 @@ fn render_to_wav(args: &PlayArgs, midi_bytes: &[u8]) -> Result<(), String> {
     render_midi_impl::write_wav_stereo(&args.out_path, &left, &right)
 }
 
-fn run_play(args: PlayArgs) -> Result<(), String> {
-    let chords = parse_progression_with_key(&args.progression, args.key)
+fn run_play(mut args: PlayArgs) -> Result<(), String> {
+    if db_filter_active(&args.db_filter) {
+        return run_play_from_library(&mut args);
+    }
+    let progression = args
+        .progression
+        .as_ref()
+        .ok_or("play requires a chord progression or a library-DB filter")?;
+    let chords = parse_progression_with_key(progression, args.key)
         .map_err(|e| format!("progression parse: {e}"))?;
     let total_bars = args.bars.unwrap_or(chords.len());
     let expanded = expand_progression(&chords, total_bars);
@@ -357,6 +449,99 @@ fn run_play(args: PlayArgs) -> Result<(), String> {
         args.voicing.as_str()
     );
     Ok(())
+}
+
+/// Library-DB rendering path (issue #66). Opens bench-out/library.db,
+/// re-imports manifest.json so the catalog is up to date, runs the
+/// supplied filter, and renders the first match through the existing
+/// render_midi path. The MIDI file from the manifest is loaded
+/// verbatim — kssong's chord-progression generator is bypassed.
+///
+/// Domain note: when the user only specifies a filter (no --voice),
+/// the song's `suggested_voice` from the manifest wins. That's the
+/// editorial pick from PR #63 — Tárrega + Bach guitar pieces lean on
+/// guitar-stk; Mozart / Satie / Albéniz lean on piano-modal. Picking
+/// up that hint by default is the whole point of having the metadata
+/// in the DB, so kssong honours it unless the user overrides.
+fn run_play_from_library(args: &mut PlayArgs) -> Result<(), String> {
+    let db_path = PathBuf::from("bench-out/library.db");
+    let manifest = PathBuf::from("bench-out/songs/manifest.json");
+    let voices_live = PathBuf::from("voices_live");
+    let mut db = LibraryDb::open(&db_path).map_err(|e| format!("library_db open: {e}"))?;
+    db.migrate().map_err(|e| format!("library_db migrate: {e}"))?;
+    if manifest.is_file() {
+        db.import_songs(&manifest)
+            .map_err(|e| format!("library_db import_songs: {e}"))?;
+    } else {
+        return Err(format!(
+            "library_db: missing manifest at {} — run `keysynth_db rebuild` from a checkout",
+            manifest.display()
+        ));
+    }
+    if voices_live.is_dir() {
+        let _ = db.import_voices(&voices_live);
+    }
+
+    let songs = db
+        .query_songs(&args.db_filter)
+        .map_err(|e| format!("library_db query: {e}"))?;
+    let song = songs.into_iter().next().ok_or_else(|| {
+        format!(
+            "library_db: no song matched filter {{composer={:?}, era={:?}, instrument={:?}, \
+             tag={:?}, recommended_voice={:?}}}",
+            args.db_filter.composer,
+            args.db_filter.era,
+            args.db_filter.instrument,
+            args.db_filter.tag,
+            args.db_filter.recommended_voice,
+        )
+    })?;
+
+    if args.voice_was_default {
+        if let Some(suggested) = &song.suggested_voice {
+            match VoiceChoice::parse(suggested) {
+                Ok(v) => {
+                    args.voice = v;
+                    eprintln!("kssong: using song's suggested voice '{suggested}'");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "kssong: ignoring suggested_voice {suggested:?} ({e}); \
+                         keeping default piano. Pass --voice to override."
+                    );
+                }
+            }
+        }
+    }
+
+    let midi_bytes = std::fs::read(&song.midi_path).map_err(|e| {
+        format!(
+            "library_db: read MIDI {}: {e}",
+            song.midi_path.display()
+        )
+    })?;
+    render_to_wav_bytes(args, &midi_bytes)?;
+    eprintln!(
+        "kssong: wrote {} from library_db song={} ({}, {})",
+        args.out_path.display(),
+        song.id,
+        song.composer,
+        song.era.as_deref().unwrap_or("?"),
+    );
+    let voice_label = match args.voice {
+        VoiceChoice::Engine(e) => format!("{e:?}"),
+        VoiceChoice::Guitar => "Guitar".to_string(),
+    };
+    let _ = db.record_play(&song.id, &voice_label, None);
+    Ok(())
+}
+
+/// Wrap `render_to_wav` for the library-DB path. `render_to_wav`
+/// already takes `&PlayArgs + &[u8]`, so this is a thin alias to keep
+/// both call sites symmetrical and to leave a single insertion point
+/// if a future patch wants to record render duration on the play row.
+fn render_to_wav_bytes(args: &PlayArgs, midi_bytes: &[u8]) -> Result<(), String> {
+    render_to_wav(args, midi_bytes)
 }
 
 fn main() {

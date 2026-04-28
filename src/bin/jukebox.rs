@@ -10,10 +10,13 @@
 //! tracked as a frame cursor so loop / mute / solo / pan / volume are
 //! sample-accurate (no per-track Sink, no start-skew).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use keysynth::library_db::{LibraryDb, Song, SongFilter, SongSort, VoiceFilter};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -1104,6 +1107,18 @@ struct Jukebox {
     /// finished renders for stale clicks (user already moved on) don't
     /// clobber the currently-playing track.
     pending_render: Option<PendingRender>,
+    /// DB-backed song metadata index keyed by file stem
+    /// (e.g. "bach_bwv999_prelude"). Lookup-only — the catalog is
+    /// rebuilt at startup from `bench-out/songs/manifest.json` so the
+    /// GUI never writes here. Populated to `None` on environments
+    /// without a writable bench-out/library.db (e.g. read-only mount,
+    /// CI image without the dir) so the rest of the app stays
+    /// functional.
+    song_index: HashMap<String, Song>,
+    /// Total voice rows reported by `keysynth-db` at startup. Surfaces
+    /// in the header so the user can see at-a-glance whether discovery
+    /// found the expected modeled-voices set.
+    db_voice_count: usize,
 }
 
 /// One in-flight MIDI → WAV render dispatched from the GUI thread.
@@ -1116,6 +1131,56 @@ struct PendingRender {
     /// (it still runs to completion if dropped, but holding the handle
     /// is the standard lifecycle pattern).
     _handle: std::thread::JoinHandle<()>,
+}
+
+/// Open `bench-out/library.db`, refresh the songs/voices import from
+/// disk, and return a stem-keyed song index plus the total voice row
+/// count. Failures are non-fatal: an unwritable DB just yields an
+/// empty index so the jukebox keeps working without DB metadata. The
+/// stderr log line documents the fallback for the operator.
+fn load_library_db_index() -> (HashMap<String, Song>, usize) {
+    let db_path = PathBuf::from("bench-out/library.db");
+    let manifest = PathBuf::from("bench-out/songs/manifest.json");
+    let voices_live = PathBuf::from("voices_live");
+    let mut db = match LibraryDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "jukebox: library_db open failed ({}): {e} — running without DB metadata",
+                db_path.display()
+            );
+            return (HashMap::new(), 0);
+        }
+    };
+    if let Err(e) = db.migrate() {
+        eprintln!("jukebox: library_db migrate failed: {e}");
+        return (HashMap::new(), 0);
+    }
+    if manifest.is_file() {
+        if let Err(e) = db.import_songs(&manifest) {
+            eprintln!("jukebox: library_db import_songs failed: {e}");
+        }
+    }
+    if voices_live.is_dir() {
+        if let Err(e) = db.import_voices(&voices_live) {
+            eprintln!("jukebox: library_db import_voices failed: {e}");
+        }
+    }
+    let songs = db
+        .query_songs(&SongFilter {
+            sort: SongSort::ByComposer,
+            ..Default::default()
+        })
+        .unwrap_or_default();
+    let voice_count = db
+        .query_voices(&VoiceFilter::default())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let mut index = HashMap::new();
+    for s in songs {
+        index.insert(s.id.clone(), s);
+    }
+    (index, voice_count)
 }
 
 fn list_output_devices() -> Vec<String> {
@@ -1133,8 +1198,49 @@ fn list_output_devices() -> Vec<String> {
 
 impl Jukebox {
     fn new(dirs: Vec<PathBuf>) -> Result<Self, String> {
+        let (song_index, db_voice_count) = load_library_db_index();
         let dir_refs: Vec<&Path> = dirs.iter().map(|p| p.as_path()).collect();
-        let tracks = scan_dirs(&dir_refs);
+        let mut tracks = scan_dirs(&dir_refs);
+        // For bench-out/songs/* MIDI tracks the DB is the source of
+        // truth for piece display: it carries composer / era / license
+        // metadata that the on-disk filename can't. Replace the
+        // filename-derived `piece` with the DB title for any MIDI row
+        // whose stem matches a manifest entry.
+        if !song_index.is_empty() {
+            for t in tracks.iter_mut() {
+                if t.format != Format::Mid {
+                    continue;
+                }
+                if let Some(song) = song_index.get(&t.label) {
+                    t.piece = song.id.clone();
+                }
+            }
+            // Resort: songs whose stem is in the DB sort by composer
+            // (DB-driven order); everything else keeps the filename
+            // ordering after them. Matches `SongFilter { sort:
+            // ByComposer }` from the brief while preserving the
+            // iterH / CHIPTUNE rendering rows the DB doesn't know
+            // about.
+            tracks.sort_by(|a, b| {
+                let ka = song_index.get(&a.label).map(|s| s.composer_key.clone());
+                let kb = song_index.get(&b.label).map(|s| s.composer_key.clone());
+                match (ka, kb) {
+                    (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.piece.cmp(&b.piece)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.piece.cmp(&b.piece).then_with(|| a.engine.cmp(&b.engine)),
+                }
+            });
+        }
+        // Diagnostic line consumed by E2E gate 7 — proves the DB path
+        // is reachable from the GUI binary even on an air-gapped /
+        // headless launch. Kept on stdout (not stderr) so a
+        // `keysynth jukebox | head -1` smoke captures it cheaply.
+        println!(
+            "jukebox: library_db catalog \u{2192} {} songs / {} voices",
+            song_index.len(),
+            db_voice_count,
+        );
         let devices = list_output_devices();
         let initial_slots = 2usize;
         let state = Arc::new(Mutex::new(MixerState::new(initial_slots)));
@@ -1152,6 +1258,8 @@ impl Jukebox {
             slot_file_idx: vec![None; initial_slots],
             slot_count: initial_slots,
             pending_render: None,
+            song_index,
+            db_voice_count,
         })
     }
 
@@ -1192,6 +1300,25 @@ impl Jukebox {
     /// muted-as-they-are, and starts the transport. Reuses the mixer
     /// machinery so we don't have a parallel rodio path.
     fn preview(&mut self, idx: usize) {
+        // Cancel any in-flight render that's not for the track the
+        // user just clicked. Without this, switching from a slow
+        // uncached MIDI back to a cached track would cause the late
+        // render to clobber the freshly-loaded playback when it
+        // eventually completes — see issue #66 PR review feedback
+        // ("再生中に他の曲が再生切り替え出来なくなる"). The old worker
+        // thread keeps running but its result is discarded, since
+        // dropping the receiver here turns its `tx.send` into a no-op
+        // SendError. The cache file still gets populated, so a future
+        // click on the cancelled track lands as an instant cache hit.
+        if let Some(pending) = self.pending_render.as_ref() {
+            if pending.track_idx != idx {
+                eprintln!(
+                    "jukebox: cancelling pending render for track #{} — user switched to #{}",
+                    pending.track_idx, idx
+                );
+                self.pending_render = None;
+            }
+        }
         let track = match self.tracks.get(idx) {
             Some(t) => t.clone(),
             None => return,
@@ -1358,6 +1485,11 @@ impl Jukebox {
     fn rescan(&mut self) {
         let dir_refs: Vec<&Path> = self.refresh_dirs.iter().map(|p| p.as_path()).collect();
         self.tracks = scan_dirs(&dir_refs);
+        // Re-import the DB so a fresh manifest.json edit (or a new
+        // voices_live/<name>/) shows up without restarting the jukebox.
+        let (index, voice_count) = load_library_db_index();
+        self.song_index = index;
+        self.db_voice_count = voice_count;
     }
 
     /// Append a new empty mix slot. UI callable.
@@ -1521,7 +1653,17 @@ impl eframe::App for Jukebox {
                     self.rescan();
                 }
                 ui.separator();
-                ui.label(format!("{} tracks", self.tracks.len()));
+                let db_label = format!(
+                    "{} tracks · DB: {} songs / {} voices",
+                    self.tracks.len(),
+                    self.song_index.len(),
+                    self.db_voice_count,
+                );
+                ui.label(db_label).on_hover_text(
+                    "DB counts come from bench-out/library.db (issue #66 — \
+                     materialized index over voices_live/* + bench-out/songs/manifest.json). \
+                     Hover any song row for full composer / era / license metadata.",
+                );
                 ui.separator();
                 ui.label("filter:");
                 ui.text_edit_singleline(&mut self.filter);
@@ -1925,18 +2067,58 @@ impl eframe::App for Jukebox {
                                 for &i in indices {
                                     let t = &self.tracks[i];
                                     let active = self.selected == Some(i) && any_playing;
+                                    let is_rendering = self
+                                        .pending_render
+                                        .as_ref()
+                                        .map(|p| p.track_idx == i)
+                                        .unwrap_or(false);
                                     let label = if active {
-                                        format!("▶ {}", t.engine)
+                                        format!("\u{25B6} {}", t.engine)
+                                    } else if is_rendering {
+                                        format!("\u{231B} {}", t.engine)
                                     } else {
                                         t.engine.clone()
                                     };
+                                    let mut hover = format!(
+                                        "{} ({} KB)",
+                                        t.path.display(),
+                                        t.size_kb
+                                    );
+                                    if let Some(song) = self.song_index.get(&t.label) {
+                                        // DB-backed metadata. Newline-
+                                        // separated so egui's hover
+                                        // tooltip wraps it properly,
+                                        // and ordered the way a user
+                                        // skims (title -> composer ->
+                                        // era / instrument / license).
+                                        hover.push_str("\n\n");
+                                        hover.push_str(&song.title);
+                                        hover.push('\n');
+                                        hover.push_str(&song.composer);
+                                        if let Some(era) = &song.era {
+                                            hover.push_str(&format!("  ·  {era}"));
+                                        }
+                                        hover.push_str(&format!(
+                                            "  ·  {}",
+                                            song.instrument
+                                        ));
+                                        hover.push_str(&format!(
+                                            "  ·  {}",
+                                            song.license
+                                        ));
+                                        if let Some(v) = &song.suggested_voice {
+                                            hover.push_str(&format!(
+                                                "\nsuggested voice: {v}"
+                                            ));
+                                        }
+                                        if let Some(ctx) = &song.context {
+                                            hover.push_str("\n\n");
+                                            hover.push_str(ctx);
+                                        }
+                                    }
                                     if ui
                                         .selectable_label(active, label)
-                                        .on_hover_text(format!(
-                                            "{} ({} KB)",
-                                            t.path.display(),
-                                            t.size_kb
-                                        ))
+                                        .on_hover_text(hover)
                                         .clicked()
                                     {
                                         *to_play = Some(i);
