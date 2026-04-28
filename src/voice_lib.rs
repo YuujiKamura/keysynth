@@ -24,6 +24,15 @@ pub enum Category {
     Piano,
     Synth,
     Custom,
+    /// CP-managed slot: a `voices_live/<name>/` cdylib that ksctl
+    /// (or any other CP client) has loaded into the running
+    /// `Reloader`'s slot pool. Entries in this category are
+    /// **dynamic** — `VoiceLibrary::refresh_cp_slots` syncs them
+    /// from `Reloader::list_slots()` on every frame, so adding
+    /// (`ksctl build`) or removing (`ksctl unload`) a slot
+    /// pops up / disappears from the browser without a GUI
+    /// restart.
+    CpSlot,
 }
 
 impl Category {
@@ -32,10 +41,16 @@ impl Category {
             Category::Piano => "Piano",
             Category::Synth => "Other (synth)",
             Category::Custom => "Custom",
+            Category::CpSlot => "CP Slot",
         }
     }
 
-    pub const ALL: &'static [Category] = &[Category::Piano, Category::Synth, Category::Custom];
+    pub const ALL: &'static [Category] = &[
+        Category::Piano,
+        Category::Synth,
+        Category::Custom,
+        Category::CpSlot,
+    ];
 }
 
 /// One selectable voice in the browser.
@@ -143,6 +158,26 @@ impl VoiceSlot {
             // Custom category so it sits next to user-saved presets and
             // doesn't clutter the Piano family with a synth-style entry.
             category: Category::Custom,
+            engine: Engine::Live,
+            params: None,
+            asset_path: None,
+            sf_program: None,
+            sf_bank: None,
+            modal_physics: false,
+            builtin: true,
+        }
+    }
+
+    /// Construct a slot that targets a CP-managed `Reloader` slot
+    /// by name. `apply_slot` for these flips the engine to
+    /// `Engine::Live` and calls `reloader.set_active(name)` so
+    /// the next note_on routes through the named cdylib in the
+    /// pool. Always built-in (the user can't rename / remove a CP
+    /// slot through the GUI; that's `ksctl unload`'s job).
+    pub fn cp_slot(name: &str) -> Self {
+        Self {
+            label: name.to_string(),
+            category: Category::CpSlot,
             engine: Engine::Live,
             params: None,
             asset_path: None,
@@ -329,6 +364,92 @@ impl VoiceLibrary {
 
     pub fn active_slot(&self) -> Option<&VoiceSlot> {
         self.slots.get(self.active)
+    }
+
+    /// Sync `Category::CpSlot` browser entries against the live
+    /// `Reloader` slot pool surfaced by ksctl / CP clients.
+    ///
+    /// Native-only: the wasm32 / GitHub Pages build doesn't have a
+    /// `live_reload` module compiled in, so the CP browser category
+    /// is entirely a native concern.
+    #[cfg(feature = "native")]
+    ///
+    /// `cp_slot_names` should be the names returned by
+    /// `Reloader::list_slots()` (just the `name` fields). The watcher
+    /// "default" slot is ignored — that one already has a dedicated
+    /// "Live (hot edit)" Custom-category entry seeded by `builtins()`,
+    /// and shadowing it as a CP slot would let the user click two
+    /// different browser entries that ultimately do the same thing.
+    ///
+    /// Sync rules (idempotent — safe to call every frame):
+    ///   - For each name in `cp_slot_names` not already in the
+    ///     library as a `Category::CpSlot`: append a new
+    ///     `VoiceSlot::cp_slot(name)`. Order: alphabetical by name,
+    ///     so `ksctl build` order doesn't influence the browser.
+    ///   - For each existing `Category::CpSlot` whose label is no
+    ///     longer in `cp_slot_names`: remove it. If the removed
+    ///     entry was active, the active index falls back to the
+    ///     last library slot — the GUI will then click any builtin
+    ///     to recover.
+    ///
+    /// Returns `(added, removed)` counts so the caller can log a
+    /// one-line "popped up: piano, gone: piano_modal" status.
+    pub fn refresh_cp_slots(&mut self, cp_slot_names: &[String]) -> (usize, usize) {
+        // Active-slot label, captured before mutation so we can
+        // re-derive the index after add/remove churn (indices shift).
+        let active_label = self.slots.get(self.active).map(|s| s.label.clone());
+
+        // Names to display, sorted, dedup, default filtered.
+        let mut wanted: Vec<String> = cp_slot_names
+            .iter()
+            .filter(|n| n.as_str() != crate::live_reload::DEFAULT_SLOT)
+            .cloned()
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+
+        // What's currently on display.
+        let existing: std::collections::HashSet<String> = self
+            .slots
+            .iter()
+            .filter(|s| s.category == Category::CpSlot)
+            .map(|s| s.label.clone())
+            .collect();
+        let wanted_set: std::collections::HashSet<String> = wanted.iter().cloned().collect();
+
+        // Drop stale CP entries.
+        let before = self.slots.len();
+        self.slots
+            .retain(|s| s.category != Category::CpSlot || wanted_set.contains(&s.label));
+        let removed = before - self.slots.len();
+
+        // Append fresh CP entries (sorted) at the end so they cluster
+        // under the CpSlot collapsing header. The browser already
+        // groups by category at render time, so positional order
+        // inside `slots` only matters for stable hashing/test asserts.
+        let mut added = 0;
+        for name in &wanted {
+            if !existing.contains(name) {
+                self.slots.push(VoiceSlot::cp_slot(name));
+                added += 1;
+            }
+        }
+
+        // Restore the active index by label match. If the previously
+        // active slot was removed (CP unload of the active slot),
+        // clamp to a valid index.
+        if let Some(label) = active_label {
+            self.active = self
+                .slots
+                .iter()
+                .position(|s| s.label == label)
+                .unwrap_or(0);
+        }
+        if self.active >= self.slots.len() {
+            self.active = self.slots.len().saturating_sub(1);
+        }
+
+        (added, removed)
     }
 }
 

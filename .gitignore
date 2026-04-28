@@ -63,6 +63,13 @@ bench-out/cp-e2e/keysynth.stderr.log
 bench-out/voice-unify/*.wav
 bench-out/voice-unify/keysynth.stderr.log
 bench-out/voice-unify/reload_latency.tsv
+# CP-GUI bridge E2E demo log: tests/cp_gui_integration_e2e.sh writes
+# the captured PR evidence here. Whitelist the log; rendered WAVs and
+# verbose keysynth stderr stay local-only.
+!bench-out/cp-gui/
+!bench-out/cp-gui/run.log
+bench-out/cp-gui/*.wav
+bench-out/cp-gui/keysynth.stderr.log
 **/*.flac
 **/*.aif
 **/*.aiff

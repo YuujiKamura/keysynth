@@ -1,0 +1,48 @@
+=== cp_gui_integration_e2e.sh starting at 2026-04-28T02:11:20Z ===
+TARGET_DIR    = F:\\rust-targets
+KEYSYNTH_BIN  = F:\\rust-targets/release/keysynth.exe
+KSCTL_BIN     = F:\\rust-targets/release/ksctl.exe
+
+=== spawn keysynth --engine live --cp (GUI process) ===
+keysynth pid=26442
+
+=== wait for CP server on 127.0.0.1:5597 ===
+CP server ready after 0s
+
+=== baseline ksctl list ===
+slot       active dll
+default    *      C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify\voices_live\target\debug\keysynth_voices_live-live-1777342281620530300.dll
+
+=== step 1: ksctl build piano slot ===
+slot piano: built + loaded in 2147 ms
+dll: C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify\voices_live/piano\target\debug\keysynth_voice_piano-live-1777342284376633000.dll
+
+=== step 2: ksctl list after build ===
+slot       active dll
+default    *      C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify\voices_live\target\debug\keysynth_voices_live-live-1777342281620530300.dll
+piano             C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify\voices_live/piano\target\debug\keysynth_voice_piano-live-1777342284376633000.dll
+OK: piano slot visible to GUI library refresh
+
+=== step 3: ksctl set piano + render ===
+slot piano: ok
+rendered 326400 frames (6.80 s) → bench-out/cp-gui/cpgui_piano.wav
+active slot:  piano
+fingerprint:  fnv1a64:28bd89f2dfb8272e
+
+=== step 4: ksctl set default + render ===
+slot default: ok
+rendered 336000 frames (7.00 s) → bench-out/cp-gui/cpgui_default.wav
+active slot:  default
+fingerprint:  fnv1a64:80731065b5d07f53
+
+=== step 5: ksctl unload piano ===
+slot piano: ok
+slot       active dll
+default    *      C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify\voices_live\target\debug\keysynth_voices_live-live-1777342281620530300.dll
+OK: piano slot gone after ksctl unload
+
+=== assertions ===
+piano    sha256=4dca7eee69accb9698b1dc2a9c046df7174740c89a5a5bbc2db87f9e22feb479   size=652844   path=bench-out/cp-gui/cpgui_piano.wav
+default  sha256=59635265fc8559a95c6635a30d496b042ecd223fb9383dea1337f4dc571e3ba9 size=672044 path=bench-out/cp-gui/cpgui_default.wav
+
+CP-GUI BRIDGE PASS — see bench-out/cp-gui/

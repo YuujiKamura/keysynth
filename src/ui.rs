@@ -206,6 +206,23 @@ impl KeysynthApp {
         };
         self.library.active = idx;
 
+        // 0. CP-managed slot: route through the Reloader's active-slot
+        //    pointer so the next note_on resolves to the named cdylib.
+        //    Errors here are user-visible (slot was unloaded between
+        //    refresh and click) but non-fatal — we still flip the
+        //    engine to Live and let the silent fallback play out.
+        if slot.category == Category::CpSlot {
+            if let Some(reloader) = self.ctx.live_reloader.as_ref() {
+                if let Err(e) = reloader.set_active(&slot.label) {
+                    self.set_msg_err(format!("CP slot '{}' activate failed: {e}", slot.label));
+                } else {
+                    self.set_msg_ok(format!("CP slot '{}' active", slot.label));
+                }
+            } else {
+                self.set_msg_err("CP slot click ignored: live_reloader unavailable".to_string());
+            }
+        }
+
         // 1. Engine swap (cheap, just a write to LiveParams).
         {
             let mut lp = self.ctx.live.lock().unwrap();
@@ -353,6 +370,16 @@ const QWERTY_VELOCITY: u8 = 100;
 impl eframe::App for KeysynthApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(16));
+
+        // Sync CP-managed slots into the voice browser. Cheap: one
+        // Mutex acquire on the slot map + a HashSet diff. The browser
+        // is rendered later in this frame, so the user sees a
+        // freshly-loaded `ksctl build --slot X` entry within one
+        // repaint tick (~16 ms) of CP server confirming the build.
+        if let Some(reloader) = self.ctx.live_reloader.as_ref() {
+            let names: Vec<String> = reloader.list_slots().into_iter().map(|s| s.name).collect();
+            self.library.refresh_cp_slots(&names);
+        }
 
         // QWERTY → voice pool injection.
         let (engine, sr_hz) = {
@@ -630,6 +657,19 @@ impl eframe::App for KeysynthApp {
                                             }
                                         }
                                         Category::Synth => {}
+                                        // CP-managed slots: no per-category
+                                        // action button. Add / remove is
+                                        // ksctl's job; the GUI only renders
+                                        // what the Reloader pool advertises.
+                                        Category::CpSlot => {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Add via: ksctl build --slot <name> --src <crate>",
+                                                )
+                                                .small()
+                                                .color(egui::Color32::from_rgb(140, 140, 150)),
+                                            );
+                                        }
                                     }
                                 });
                         }
