@@ -15,6 +15,9 @@ category = "Guitar"
 recommend = "Experimental"
 description = "original KS + body IR — low audio level, kept as A/B oracle"
 slot_name = "guitar_ks"
+# Plucked-string voice: same rationale as voices_live/guitar_stk.
+# note-off must NOT call trigger_release(); natural decay only.
+decay_model = "natural"
 
 # Self-contained workspace root, same reasoning as the other
 # `voices_live/<name>/` plugins: keysynth's top-level `[workspace]`

@@ -19,6 +19,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
+use crate::voice_lib::DecayModel;
+
 pub mod voices {
     //! Re-exported for callers that prefer `keysynth::synth::voices::...`.
     pub use crate::voices::*;
@@ -411,6 +413,14 @@ pub struct LiveParams {
     /// 64 message; the audio thread snapshots it once per buffer and
     /// passes the value into each voice's `set_pedal_sustain`.
     pub pedal_sustain: f32,
+    /// Note-off semantics for the active voice slot. Written by
+    /// `ui::App::apply_slot` from the picked `VoiceSlot::decay_model`,
+    /// read by the MIDI callback's note-off arm to decide whether the
+    /// pool should call `trigger_release()` (damper) or skip the call
+    /// entirely (natural decay — plucked-string voices). Defaults to
+    /// `Damper` so binaries that never touch the GUI catalog (e.g.
+    /// render_midi) keep their pre-PR release behaviour.
+    pub decay_model: DecayModel,
 }
 
 /// Live-tunable parameters for `Engine::PianoModal`. Shared via a
