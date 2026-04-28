@@ -5,6 +5,12 @@ edition = "2021"
 description = "voices_live plugin: Engine::PianoLite (3-string + 12-mode lite body)."
 publish = false
 
+[package.metadata.keysynth-voice]
+display_name = "Piano Lite"
+category = "Piano"
+recommend = "Stable"
+description = "fewer modes, lighter CPU"
+
 [workspace]
 
 [lib]

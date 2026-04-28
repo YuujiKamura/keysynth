@@ -5,6 +5,17 @@ edition = "2021"
 description = "voices_live plugin: Engine::Piano (KS+modal hybrid + Stulov + Fletcher inharmonicity)."
 publish = false
 
+# GUI side-panel metadata. `keysynth::voice_lib::discover_plugin_voices`
+# scans `voices_live/<name>/Cargo.toml` for this block at startup, so
+# new voice plugins appear in the browser by landing the directory +
+# this metadata only — no edits to `voice_lib.rs` / `ui.rs` / Engine
+# enum / top-level Cargo deps.
+[package.metadata.keysynth-voice]
+display_name = "Piano"
+category = "Piano"
+recommend = "Best"
+description = "Tier 1+2 KS+modal hybrid (hammer, mistuning, bridge, pedal)"
+
 # Self-contained workspace root. Same reasoning as
 # `voices_live/Cargo.toml`: keysynth's top-level `[workspace]` excludes
 # voices_live and everything under it, so this crate already isn't a

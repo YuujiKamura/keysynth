@@ -5,6 +5,12 @@ edition = "2021"
 description = "voices_live plugin: Engine::PianoModal (32-partial LUT projection)."
 publish = false
 
+[package.metadata.keysynth-voice]
+display_name = "Piano Modal"
+category = "Piano"
+recommend = "Best"
+description = "32-partial LUT projection from Salamander references"
+
 [workspace]
 
 [lib]

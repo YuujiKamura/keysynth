@@ -5,6 +5,12 @@ edition = "2021"
 description = "voices_live plugin: Engine::PianoThick (7-string + 12-mode lite body, dry-dominant mix)."
 publish = false
 
+[package.metadata.keysynth-voice]
+display_name = "Piano Thick"
+category = "Piano"
+recommend = "Stable"
+description = "wider detune, brighter character"
+
 [workspace]
 
 [lib]

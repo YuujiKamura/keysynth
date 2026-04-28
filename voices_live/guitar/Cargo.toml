@@ -5,6 +5,17 @@ edition = "2021"
 description = "voices_live plugin: steel-string acoustic guitar physical model (issue #44 — first non-piano voice family)."
 publish = false
 
+# `slot_name` overrides the directory-derived default ("guitar") so
+# this plugin surfaces as `live:guitar_ks` in the GUI catalog. Lets
+# the STK port live alongside it under the unambiguous `live:guitar_stk`
+# without either side having to rename its on-disk crate dir.
+[package.metadata.keysynth-voice]
+display_name = "Guitar (KS)"
+category = "Guitar"
+recommend = "Experimental"
+description = "original KS + body IR — low audio level, kept as A/B oracle"
+slot_name = "guitar_ks"
+
 # Self-contained workspace root, same reasoning as the other
 # `voices_live/<name>/` plugins: keysynth's top-level `[workspace]`
 # excludes `voices_live` and everything under it, and an empty
