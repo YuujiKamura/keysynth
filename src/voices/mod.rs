@@ -5,6 +5,7 @@
 
 pub mod bridge_admittance;
 pub mod fm;
+pub mod guitar;
 pub mod hammer_stulov;
 pub mod koto;
 pub mod ks;

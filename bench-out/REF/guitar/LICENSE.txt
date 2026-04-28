@@ -1,0 +1,41 @@
+Source: Discord SFZ GM Bank — "026-Acoustic Guitar (steel)" patch
+URL:    https://github.com/sfzinstruments/Discord-SFZ-GM-Bank
+Patch:  Discord GM/Melodic/026-Acoustic Guitar (steel)/
+Donor:  Jeff Learman
+Source instrument: 2017 Martin HD-28 Vintage Series (steel-string acoustic)
+
+License (verbatim from .sfz header):
+
+    // GM Acoustic Guitar
+    // 2017 Martin HD28 Vintage Series
+    // Author: Jeff Learman, for Kinwie's Discord SFZ GM:
+    //         https://github.com/kinwie/Discord-SFZ-GM-Bank
+    // License: Creative Commons CC0
+
+The Discord SFZ GM Bank repository README further restricts contributors:
+
+    "Only CC0, CC-BY, and equivalent licences are allowed.
+     More restrictive licenses are not allowed."
+
+Files in this directory:
+
+  MartinGM2_040__E2_1.wav   — open low E    (MIDI 40, 82.41 Hz)
+  MartinGM2_046_Bb2_1.wav   — Bb2 fretted   (MIDI 46, 116.54 Hz)
+  MartinGM2_052__E3_1.wav   — E3 fretted    (MIDI 52, 164.81 Hz)
+  MartinGM2_055__G3_1.wav   — open G3       (MIDI 55, 196.00 Hz)
+  MartinGM2_058_Bb3_1.wav   — Bb3 fretted   (MIDI 58, 233.08 Hz)
+  MartinGM2_061_Db4_1.wav   — Db4 fretted   (MIDI 61, 277.18 Hz; closest sample to C4)
+  MartinGM2_064__E4_1.wav   — open high E   (MIDI 64, 329.63 Hz)
+
+These are the closest samples in the bank to the open-string set
+{E2, A2, D3, G3, B3, E4} that the guitar voice unit tests exercise.
+A2 / D3 / B3 are unavailable in the bank (no per-fret coverage at
+those exact MIDI notes); the Bb2 / Db3 / Bb3 entries above sit one
+semitone below each missing target and are used as the nearest-
+neighbour reference in `tests/guitar_e2e.rs`.
+
+These WAV files are NOT committed to the repository — they are
+downloaded on demand by `tools/fetch-guitar-refs.sh` when the
+`tests/guitar_e2e.rs` integration tests are run. The license file
+itself IS committed so the provenance and CC0 declaration travel
+with the source tree even when the WAVs aren't present.

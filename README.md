@@ -16,6 +16,12 @@ lower per-instrument cost: bowed/plucked strings, brass + reeds, air-jet
 woodwinds, tuned + membrane + plate percussion. ~10 DSP families cover ~80%
 of GM. Same DSP code feeds native (cpal) and web (Kira / cpal-wasm-bindgen).
 
+The first non-piano family — **steel-string acoustic guitar** — landed via
+`voices_live/guitar/` (issue #44 milestone 1), validating that the
+piano-built substrate (CP / cdylib hot-reload / `KsString` / Fletcher
+inharmonicity machinery) is reusable as-is for a different instrument
+without bumping the host ABI or adding an `Engine` variant.
+
 To make iteration on these models fast, voices are built as **swappable
 plugins**:
 
