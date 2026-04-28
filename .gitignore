@@ -43,6 +43,13 @@ reference/*.wav
 !bench-out/REF/README.md
 !bench-out/REF/sfz_salamander_multi/
 !bench-out/REF/sfz_salamander_multi/**
+# CP E2E demo log: tests/cp_e2e_demo.sh writes the captured PR evidence
+# here. Whitelist the directory so run.log is checkable, but keep the
+# rendered WAVs and keysynth's verbose stderr tail local-only.
+!bench-out/cp-e2e/
+!bench-out/cp-e2e/run.log
+bench-out/cp-e2e/*.wav
+bench-out/cp-e2e/keysynth.stderr.log
 **/*.flac
 **/*.aif
 **/*.aiff

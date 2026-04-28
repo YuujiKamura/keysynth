@@ -157,8 +157,9 @@ fn parse_args() -> Result<Args, String> {
                     "piano-lite" => Engine::PianoLite,
                     "piano-5am" => Engine::Piano5AM,
                     "piano-modal" => Engine::PianoModal,
+                    "live" => Engine::Live,
                     other => return Err(format!(
-                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick|piano-lite|piano-5am|piano-modal)"
+                        "unknown engine: {other} (square|ks|ks-rich|sub|fm|piano|koto|sf-piano|sfz-piano|piano-thick|piano-lite|piano-5am|piano-modal|live)"
                     )),
                 };
             }
@@ -419,42 +420,63 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if ports.is_empty() {
-        return Err("no MIDI input ports found - keyboard plugged in?".into());
-    }
-
+    // MIDI is optional — `keysynth --cp` is a valid headless config on
+    // machines with no MIDI hardware (CI, Docker, or just a desktop
+    // without a keyboard plugged in). When `--port NAME` is explicitly
+    // requested but the device isn't there, that's still a hard error;
+    // silently falling back would mask a typo. With no `--port` flag,
+    // an empty port list logs a one-line note and continues to audio +
+    // CP setup so the egui PC keyboard and the CP server are both
+    // reachable. The MIDI callback connection (`_conn`) and the chosen
+    // port handle therefore become `Option`s; the audio + CP paths
+    // never read them anyway.
     let chosen_port = if let Some(want) = &args.port {
-        ports
-            .iter()
-            .find(|p| midi_in.port_name(p).map(|n| n == *want).unwrap_or(false))
-            .ok_or_else(|| {
-                let available: Vec<String> = ports
-                    .iter()
-                    .filter_map(|p| midi_in.port_name(p).ok())
-                    .collect();
-                format!("port {want:?} not found. Available: {available:?}")
-            })?
-            .clone()
+        if ports.is_empty() {
+            return Err(format!("port {want:?} not found. Available: []").into());
+        }
+        Some(
+            ports
+                .iter()
+                .find(|p| midi_in.port_name(p).map(|n| n == *want).unwrap_or(false))
+                .ok_or_else(|| {
+                    let available: Vec<String> = ports
+                        .iter()
+                        .filter_map(|p| midi_in.port_name(p).ok())
+                        .collect();
+                    format!("port {want:?} not found. Available: {available:?}")
+                })?
+                .clone(),
+        )
+    } else if ports.is_empty() {
+        None
     } else {
         // Prefer an AKAI device when no --port was given. Live workflow
         // is "boot the keysynth GUI with the AKAI MPK plugged in", and
         // the OS may enumerate IAC / loopback / virtual ports ahead of
         // the physical keyboard depending on driver load order.
-        ports
-            .iter()
-            .find(|p| {
-                midi_in
-                    .port_name(p)
-                    .map(|n| {
-                        n.to_ascii_uppercase().contains("AKAI")
-                            || n.to_ascii_uppercase().contains("MPK")
-                    })
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .unwrap_or_else(|| ports[0].clone())
+        Some(
+            ports
+                .iter()
+                .find(|p| {
+                    midi_in
+                        .port_name(p)
+                        .map(|n| {
+                            n.to_ascii_uppercase().contains("AKAI")
+                                || n.to_ascii_uppercase().contains("MPK")
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .unwrap_or_else(|| ports[0].clone()),
+        )
     };
-    let port_name = midi_in.port_name(&chosen_port)?;
+    let port_name = match &chosen_port {
+        Some(p) => midi_in.port_name(p)?,
+        None => {
+            eprintln!("keysynth: no MIDI input — running CP / PC keyboard only");
+            "(no MIDI)".to_string()
+        }
+    };
 
     // -- Audio output --
     let host = cpal::default_host();
@@ -576,199 +598,202 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // != 0 was already applied at SF2 load time -- still cheap).
     let mut last_applied_program: u16 = u16::MAX;
     let mut last_applied_bank: u16 = u16::MAX;
-    let _conn = midi_in.connect(
-        &chosen_port,
-        "keysynth-in",
-        move |_stamp, raw, _| {
-            if raw.is_empty() {
+    // Build the MIDI callback closure regardless of whether a port is
+    // available — when `chosen_port` is None we just don't connect it,
+    // and the `_conn: Option<...>` stays `None` (no callback runs).
+    let midi_callback = move |_stamp: u64, raw: &[u8], _: &mut ()| {
+        if raw.is_empty() {
+            return;
+        }
+        let status = raw[0];
+        let msg_type = status & 0xF0;
+        let channel = status & 0x0F;
+
+        // Program Change is a 2-byte message: status + program.
+        // Handle BEFORE the >=3 guard below, otherwise it gets dropped.
+        if msg_type == 0xC0 {
+            if raw.len() < 2 {
                 return;
             }
-            let status = raw[0];
-            let msg_type = status & 0xF0;
-            let channel = status & 0x0F;
+            let program = raw[1].min(127);
+            {
+                let mut lp = live_for_midi.lock().unwrap();
+                lp.sf_program = program;
+            }
+            {
+                let mut d = dash_for_midi.lock().unwrap();
+                d.push_event(format!("PC ch{channel} prog={program}"));
+            }
+            return;
+        }
 
-            // Program Change is a 2-byte message: status + program.
-            // Handle BEFORE the >=3 guard below, otherwise it gets dropped.
-            if msg_type == 0xC0 {
-                if raw.len() < 2 {
-                    return;
-                }
-                let program = raw[1].min(127);
-                {
-                    let mut lp = live_for_midi.lock().unwrap();
-                    lp.sf_program = program;
-                }
+        if raw.len() < 3 {
+            return;
+        }
+        let note = raw[1];
+        let velocity = raw[2];
+
+        match msg_type {
+            0x90 if velocity > 0 => {
                 {
                     let mut d = dash_for_midi.lock().unwrap();
-                    d.push_event(format!("PC ch{channel} prog={program}"));
+                    d.active_notes.insert((channel, note));
+                    d.push_event(format!("note_on  ch{channel} n{note} v{velocity}"));
                 }
-                return;
-            }
+                let freq = midi_to_freq(note);
+                // Read currently-selected engine + GM patch fresh each
+                // note so GUI changes apply immediately to subsequent
+                // keypresses.
+                let (engine, want_program, want_bank) = {
+                    let lp = live_for_midi.lock().unwrap();
+                    (lp.engine, lp.sf_program, lp.sf_bank)
+                };
 
-            if raw.len() < 3 {
-                return;
-            }
-            let note = raw[1];
-            let velocity = raw[2];
-
-            match msg_type {
-                0x90 if velocity > 0 => {
-                    {
-                        let mut d = dash_for_midi.lock().unwrap();
-                        d.active_notes.insert((channel, note));
-                        d.push_event(format!("note_on  ch{channel} n{note} v{velocity}"));
-                    }
-                    let freq = midi_to_freq(note);
-                    // Read currently-selected engine + GM patch fresh each
-                    // note so GUI changes apply immediately to subsequent
-                    // keypresses.
-                    let (engine, want_program, want_bank) = {
-                        let lp = live_for_midi.lock().unwrap();
-                        (lp.engine, lp.sf_program, lp.sf_bank)
-                    };
-
-                    // Drive the shared SoundFont synth too if we're in
-                    // sf-piano (or whenever a synth is loaded -- harmless
-                    // for other engines because the placeholder is what
-                    // routes audio for them, not the synth).
-                    if engine == Engine::SfzPiano {
-                        if let Some(player) = sfz_for_midi.lock().unwrap().as_mut() {
-                            player.note_on(channel, note, velocity);
-                        }
-                    } else if engine == Engine::SfPiano {
-                        if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
-                            // Push Bank Select + Program Change ONLY when
-                            // the desired pair has actually changed since
-                            // last note. Order: Bank Select (CC 0 MSB)
-                            // first, then Program Change -- bank select
-                            // takes effect on the next PC per GM/GS spec.
-                            if (want_bank as u16) != last_applied_bank
-                                || (want_program as u16) != last_applied_program
-                            {
-                                synth.process_midi_message(
-                                    channel as i32,
-                                    0xB0,
-                                    0,
-                                    want_bank as i32,
-                                );
-                                synth.process_midi_message(
-                                    channel as i32,
-                                    0xC0,
-                                    want_program as i32,
-                                    0,
-                                );
-                                last_applied_bank = want_bank as u16;
-                                last_applied_program = want_program as u16;
-                            }
-                            synth.note_on(channel as i32, note as i32, velocity as i32);
-                        }
-                    }
-
-                    let inner: Box<dyn VoiceImpl> =
-                        make_voice(engine, sr_for_voices, freq, velocity);
-                    let v = Voice {
-                        key: (channel, note),
-                        inner,
-                    };
-                    let mut pool = voices_for_midi.lock().unwrap();
-                    if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
-                        *slot = v;
-                    } else {
-                        // Hard cap voice pool to bound CPU/memory growth under
-                        // sustained MIDI input. When at cap, prefer evicting an
-                        // already-released voice; fall back to the oldest entry.
-                        //
-                        // Pre-2026-04-25: most VoiceImpls forgot to override
-                        // `is_releasing` (only SfPianoPlaceholder did). The
-                        // released-voice scan therefore returned None on
-                        // every Piano/Ks/etc. voice and `unwrap_or(0)`
-                        // killed slot 0 — often a still-sustained note,
-                        // perceived as "no sound after pressing many keys".
-                        // ReleaseEnvelope-based VoiceImpl trait now provides
-                        // is_releasing() by default, so the scan finds a
-                        // real candidate as long as ANY voice in the pool
-                        // has been released.
-                        const MAX_VOICES: usize = 32;
-                        if pool.len() >= MAX_VOICES {
-                            let evict_idx = pool
-                                .iter()
-                                .position(|x| x.inner.is_done() || x.inner.is_releasing())
-                                .unwrap_or(0);
-                            pool.remove(evict_idx);
-                        }
-                        pool.push(v);
-                    }
-                }
-                0x80 | 0x90 => {
-                    // Note off, or note_on with velocity 0 (running-status note off)
-                    {
-                        let mut d = dash_for_midi.lock().unwrap();
-                        d.active_notes.remove(&(channel, note));
-                        d.push_event(format!("note_off ch{channel} n{note}"));
-                    }
-                    // Forward note-off to the shared synth too so its envelope
-                    // moves into release. We can't tell from here whether this
-                    // particular note was an sf-piano voice without scanning
-                    // the pool, but rustysynth ignores note_off for inactive
-                    // notes, so the call is safe and cheap.
-                    if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
-                        synth.note_off(channel as i32, note as i32);
-                    }
-                    // Forward to SFZ player too. Like rustysynth above, this
-                    // is safe whether or not sfz-piano is the active engine —
-                    // an inactive note_off is a no-op inside the player.
+                // Drive the shared SoundFont synth too if we're in
+                // sf-piano (or whenever a synth is loaded -- harmless
+                // for other engines because the placeholder is what
+                // routes audio for them, not the synth).
+                if engine == Engine::SfzPiano {
                     if let Some(player) = sfz_for_midi.lock().unwrap().as_mut() {
-                        player.note_off(channel, note);
+                        player.note_on(channel, note, velocity);
                     }
-                    let mut pool = voices_for_midi.lock().unwrap();
-                    if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
-                        slot.inner.trigger_release();
+                } else if engine == Engine::SfPiano {
+                    if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
+                        // Push Bank Select + Program Change ONLY when
+                        // the desired pair has actually changed since
+                        // last note. Order: Bank Select (CC 0 MSB)
+                        // first, then Program Change -- bank select
+                        // takes effect on the next PC per GM/GS spec.
+                        if (want_bank as u16) != last_applied_bank
+                            || (want_program as u16) != last_applied_program
+                        {
+                            synth.process_midi_message(channel as i32, 0xB0, 0, want_bank as i32);
+                            synth.process_midi_message(
+                                channel as i32,
+                                0xC0,
+                                want_program as i32,
+                                0,
+                            );
+                            last_applied_bank = want_bank as u16;
+                            last_applied_program = want_program as u16;
+                        }
+                        synth.note_on(channel as i32, note as i32, velocity as i32);
                     }
                 }
-                0xB0 => {
-                    // Control Change. raw[1] = CC number, raw[2] = value (0..127).
-                    let cc_num = note; // (raw[1])
-                    let cc_val = velocity; // (raw[2])
-                    {
-                        let mut d = dash_for_midi.lock().unwrap();
-                        d.cc_raw.insert(cc_num, cc_val);
-                        *d.cc_count.entry(cc_num).or_insert(0) += 1;
-                        d.push_event(format!("CC{cc_num}={cc_val} ch{channel}"));
-                    }
 
-                    // MPK mini 3 K1-K8 are ROTARY ENCODERS in relative mode:
-                    //   1..63   = +N step(s) clockwise
-                    //   65..127 = -N step(s) counter-clockwise (encoded as 128-N)
-                    // Standard MIDI Volume (CC 7) is absolute (a "real" pot).
-                    let delta_ticks: i32 = match cc_val {
-                        0 | 64 => 0,
-                        1..=63 => cc_val as i32,
-                        65..=127 => -(128 - cc_val as i32),
-                        _ => 0, // MIDI CC values are 0..127 in spec; defensive
-                    };
-
-                    match cc_num {
-                        // CC 7 = absolute MIDI Volume (rare on MPK).
-                        // Top out at 10.0 to match the GUI slider + CC70 range.
-                        // tanh soft-clip handles saturation past ~3.
-                        7 => {
-                            let new_master = (cc_val as f32 / 127.0) * 10.0;
-                            live_for_midi.lock().unwrap().master = new_master;
-                        }
-                        // CC 70 = MPK K1 (relative encoder by default).
-                        // 1 tick = +/- 0.1 master gain, clamped 0..10.0.
-                        70 => {
-                            let mut p = live_for_midi.lock().unwrap();
-                            p.master = (p.master + delta_ticks as f32 * 0.1).clamp(0.0, 10.0);
-                        }
-                        _ => {}
+                let inner: Box<dyn VoiceImpl> = make_voice(engine, sr_for_voices, freq, velocity);
+                let v = Voice {
+                    key: (channel, note),
+                    inner,
+                };
+                let mut pool = voices_for_midi.lock().unwrap();
+                if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
+                    *slot = v;
+                } else {
+                    // Hard cap voice pool to bound CPU/memory growth under
+                    // sustained MIDI input. When at cap, prefer evicting an
+                    // already-released voice; fall back to the oldest entry.
+                    //
+                    // Pre-2026-04-25: most VoiceImpls forgot to override
+                    // `is_releasing` (only SfPianoPlaceholder did). The
+                    // released-voice scan therefore returned None on
+                    // every Piano/Ks/etc. voice and `unwrap_or(0)`
+                    // killed slot 0 — often a still-sustained note,
+                    // perceived as "no sound after pressing many keys".
+                    // ReleaseEnvelope-based VoiceImpl trait now provides
+                    // is_releasing() by default, so the scan finds a
+                    // real candidate as long as ANY voice in the pool
+                    // has been released.
+                    const MAX_VOICES: usize = 32;
+                    if pool.len() >= MAX_VOICES {
+                        let evict_idx = pool
+                            .iter()
+                            .position(|x| x.inner.is_done() || x.inner.is_releasing())
+                            .unwrap_or(0);
+                        pool.remove(evict_idx);
                     }
+                    pool.push(v);
                 }
-                _ => {}
             }
-        },
-        (),
-    )?;
+            0x80 | 0x90 => {
+                // Note off, or note_on with velocity 0 (running-status note off)
+                {
+                    let mut d = dash_for_midi.lock().unwrap();
+                    d.active_notes.remove(&(channel, note));
+                    d.push_event(format!("note_off ch{channel} n{note}"));
+                }
+                // Forward note-off to the shared synth too so its envelope
+                // moves into release. We can't tell from here whether this
+                // particular note was an sf-piano voice without scanning
+                // the pool, but rustysynth ignores note_off for inactive
+                // notes, so the call is safe and cheap.
+                if let Some(synth) = synth_for_midi.lock().unwrap().as_mut() {
+                    synth.note_off(channel as i32, note as i32);
+                }
+                // Forward to SFZ player too. Like rustysynth above, this
+                // is safe whether or not sfz-piano is the active engine —
+                // an inactive note_off is a no-op inside the player.
+                if let Some(player) = sfz_for_midi.lock().unwrap().as_mut() {
+                    player.note_off(channel, note);
+                }
+                let mut pool = voices_for_midi.lock().unwrap();
+                if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
+                    slot.inner.trigger_release();
+                }
+            }
+            0xB0 => {
+                // Control Change. raw[1] = CC number, raw[2] = value (0..127).
+                let cc_num = note; // (raw[1])
+                let cc_val = velocity; // (raw[2])
+                {
+                    let mut d = dash_for_midi.lock().unwrap();
+                    d.cc_raw.insert(cc_num, cc_val);
+                    *d.cc_count.entry(cc_num).or_insert(0) += 1;
+                    d.push_event(format!("CC{cc_num}={cc_val} ch{channel}"));
+                }
+
+                // MPK mini 3 K1-K8 are ROTARY ENCODERS in relative mode:
+                //   1..63   = +N step(s) clockwise
+                //   65..127 = -N step(s) counter-clockwise (encoded as 128-N)
+                // Standard MIDI Volume (CC 7) is absolute (a "real" pot).
+                let delta_ticks: i32 = match cc_val {
+                    0 | 64 => 0,
+                    1..=63 => cc_val as i32,
+                    65..=127 => -(128 - cc_val as i32),
+                    _ => 0, // MIDI CC values are 0..127 in spec; defensive
+                };
+
+                match cc_num {
+                    // CC 7 = absolute MIDI Volume (rare on MPK).
+                    // Top out at 10.0 to match the GUI slider + CC70 range.
+                    // tanh soft-clip handles saturation past ~3.
+                    7 => {
+                        let new_master = (cc_val as f32 / 127.0) * 10.0;
+                        live_for_midi.lock().unwrap().master = new_master;
+                    }
+                    // CC 70 = MPK K1 (relative encoder by default).
+                    // 1 tick = +/- 0.1 master gain, clamped 0..10.0.
+                    70 => {
+                        let mut p = live_for_midi.lock().unwrap();
+                        p.master = (p.master + delta_ticks as f32 * 0.1).clamp(0.0, 10.0);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    };
+    let _conn = match &chosen_port {
+        Some(p) => Some(midi_in.connect(p, "keysynth-in", midi_callback, ())?),
+        None => {
+            // Drop midi_in without connecting; the GUI's PC keyboard
+            // path uses egui input, not the MIDI callback, so silence
+            // here is intentional.
+            drop(midi_in);
+            drop(midi_callback);
+            None
+        }
+    };
 
     let voices_for_audio = voices.clone();
     let live_for_audio = live.clone();

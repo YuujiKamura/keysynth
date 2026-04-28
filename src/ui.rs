@@ -37,7 +37,11 @@ use crate::voice_lib::{Category, VoiceLibrary, VoiceSlot};
 /// MIDI handles so they aren't dropped while the GUI is open.
 pub struct AppContext {
     pub stream: Stream,
-    pub midi_conn: MidiInputConnection<()>,
+    /// MIDI input connection. `None` when no MIDI input was found (or
+    /// `--port`-less startup on a machine with no devices); the egui PC
+    /// keyboard path still works without it. Stored so the connection
+    /// (and its callback closures) live as long as the GUI window.
+    pub midi_conn: Option<MidiInputConnection<()>>,
     pub live: Arc<Mutex<LiveParams>>,
     pub dash: Arc<Mutex<DashState>>,
     pub voices: Arc<Mutex<Vec<Voice>>>,
