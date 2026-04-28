@@ -1,0 +1,26 @@
+[package]
+name = "keysynth_voice_piano_thick"
+version = "0.1.0"
+edition = "2021"
+description = "voices_live plugin: Engine::PianoThick (7-string + 12-mode lite body, dry-dominant mix)."
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+keysynth = { path = "../..", default-features = false }
+
+[profile.dev]
+opt-level = 1
+debug = 0
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = false
+incremental = true
+codegen-units = 16

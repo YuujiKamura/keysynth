@@ -1,0 +1,27 @@
+[package]
+name = "keysynth_voice_piano_modal"
+version = "0.1.0"
+edition = "2021"
+description = "voices_live plugin: Engine::PianoModal (32-partial LUT projection)."
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# See voices_live/piano/Cargo.toml for the dep rationale.
+keysynth = { path = "../..", default-features = false }
+
+[profile.dev]
+opt-level = 1
+debug = 0
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = false
+incremental = true
+codegen-units = 16
