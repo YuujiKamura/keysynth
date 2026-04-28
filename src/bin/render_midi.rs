@@ -11,12 +11,16 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use hound::{SampleFormat, WavSpec, WavWriter};
 use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 
+use keysynth::live_reload::{build_and_load, LiveFactory};
 use keysynth::sfz::SfzPlayer;
-use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
+use keysynth::synth::{
+    make_voice, midi_to_freq, set_live_voice_factory, Engine, ModalLut, VoiceImpl, MODAL_LUT,
+};
 
 pub const SR: u32 = 44100;
 pub const RELEASE_TAIL_SEC: f32 = 2.5;
@@ -36,6 +40,11 @@ struct Args {
     sfz_path: Option<PathBuf>,
     modal_lut_path: Option<PathBuf>,
     tempo_scale: f32,
+    /// `voices_live/<name>/` crate root to build + load when `engine ==
+    /// Engine::Live`. Set automatically by the `--engine guitar` and
+    /// `--engine guitar-stk` aliases; can be overridden explicitly via
+    /// `--live-crate-root`.
+    live_crate_root: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -45,6 +54,7 @@ fn parse_args() -> Result<Args, String> {
     let mut sfz_path: Option<PathBuf> = None;
     let mut modal_lut_path: Option<PathBuf> = None;
     let mut tempo_scale: f32 = 1.0;
+    let mut live_crate_root: Option<PathBuf> = None;
 
     let mut iter = env::args().skip(1);
     while let Some(a) = iter.next() {
@@ -65,6 +75,23 @@ fn parse_args() -> Result<Args, String> {
                     "piano-modal" => Engine::PianoModal,
                     "sfz-piano" => Engine::SfzPiano,
                     "koto" => Engine::Koto,
+                    // Live-loaded voice families. The string aliases pin the
+                    // crate root so the user does not have to repeat
+                    // `--live-crate-root voices_live/...` for the canonical
+                    // builds.
+                    "guitar" => {
+                        if live_crate_root.is_none() {
+                            live_crate_root = Some(PathBuf::from("voices_live/guitar"));
+                        }
+                        Engine::Live
+                    }
+                    "guitar-stk" => {
+                        if live_crate_root.is_none() {
+                            live_crate_root = Some(PathBuf::from("voices_live/guitar_stk"));
+                        }
+                        Engine::Live
+                    }
+                    "live" => Engine::Live, // requires --live-crate-root
                     other => return Err(format!("unknown engine: {other}")),
                 });
             }
@@ -82,6 +109,11 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--tempo-scale parse: {e}"))?;
             }
+            "--live-crate-root" => {
+                live_crate_root = Some(PathBuf::from(
+                    iter.next().ok_or("--live-crate-root needs a value")?,
+                ));
+            }
             other => return Err(format!("unknown arg: {other}")),
         }
     }
@@ -93,7 +125,24 @@ fn parse_args() -> Result<Args, String> {
         sfz_path,
         modal_lut_path,
         tempo_scale,
+        live_crate_root,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Live (voices_live/*) factory wiring.
+//
+// `Engine::Live` dispatches through `keysynth::synth::set_live_voice_factory`,
+// which expects a plain `fn(sr, freq, vel) -> Option<Box<dyn VoiceImpl + Send>>`
+// (no captures). We satisfy that by parking the loaded LiveFactory in a
+// static OnceLock and reading it from a trampoline that matches the
+// expected signature.
+// ---------------------------------------------------------------------------
+
+static LIVE_FACTORY_SLOT: OnceLock<Arc<LiveFactory>> = OnceLock::new();
+
+fn live_voice_trampoline(sr: f32, freq: f32, vel: u8) -> Option<Box<dyn VoiceImpl + Send>> {
+    LIVE_FACTORY_SLOT.get().map(|f| f.make_voice(sr, freq, vel))
 }
 
 /// Parse a Standard MIDI File and convert to a flat list of NoteEvent
@@ -374,6 +423,45 @@ fn main() {
             std::process::exit(2);
         }
     };
+
+    // For Engine::Live (guitar / guitar-stk / generic --live-crate-root),
+    // build the cdylib first and register the factory trampoline so
+    // `Engine::Live` dispatches through it instead of falling back to
+    // SilentVoice. Build is a `cargo build` invocation against the
+    // sibling crate; output is the cdylib path which `LiveFactory::load`
+    // opens via libloading.
+    if args.engine == Engine::Live {
+        let crate_root = match args.live_crate_root.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                eprintln!(
+                    "render_midi: --engine live requires --live-crate-root \
+                     (or use the `guitar` / `guitar-stk` aliases that pin it)"
+                );
+                std::process::exit(2);
+            }
+        };
+        eprintln!(
+            "render_midi: building live voice from {} (cargo build, may take a moment)",
+            crate_root.display(),
+        );
+        let factory = match build_and_load(&crate_root) {
+            Ok(f) => Arc::new(f),
+            Err(e) => {
+                eprintln!("render_midi: build_and_load({}): {e}", crate_root.display());
+                std::process::exit(2);
+            }
+        };
+        eprintln!(
+            "render_midi: live voice loaded from {}",
+            factory.dll_path.display(),
+        );
+        if LIVE_FACTORY_SLOT.set(factory).is_err() {
+            eprintln!("render_midi: LIVE_FACTORY_SLOT was already set");
+            std::process::exit(2);
+        }
+        set_live_voice_factory(live_voice_trampoline);
+    }
 
     let bytes = match std::fs::read(&args.input) {
         Ok(b) => b,
