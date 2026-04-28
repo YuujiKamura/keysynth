@@ -240,6 +240,13 @@ impl KeysynthApp {
         {
             let mut lp = self.ctx.live.lock().unwrap();
             lp.engine = slot.engine;
+            // Note-off semantics travel with the slot: piano variants
+            // keep `Damper` (default), guitar plugins write `Natural`.
+            // The MIDI callback's note-off arm reads this every key-up
+            // and skips `trigger_release()` for plucked voices so they
+            // ride out their natural loop-filter decay instead of
+            // getting cut short by an unconditional damper pull.
+            lp.decay_model = slot.decay_model;
             if let (Some(p), Some(b)) = (slot.sf_program, slot.sf_bank) {
                 lp.sf_program = p;
                 lp.sf_bank = b;

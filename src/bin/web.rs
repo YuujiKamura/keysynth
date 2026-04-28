@@ -709,6 +709,10 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     sf_bank: 0,
                     mix_mode: MixMode::ParallelComp,
                     pedal_sustain: 0.0,
+                    // Web build is piano-only (PianoModal default), so
+                    // Damper is correct and never overwritten — the
+                    // wasm bundle has no GUI catalog to swap voices in.
+                    decay_model: keysynth::voice_lib::DecayModel::default(),
                 })),
                 sample_rate: 0,
                 audio: Rc::new(RefCell::new(None)),

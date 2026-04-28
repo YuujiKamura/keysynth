@@ -37,6 +37,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::synth::{Engine, ModalParams, ModalPreset};
 
+/// How a voice reacts to MIDI / GUI note-off. Two physical models:
+///
+/// * `Damper` — note-off lowers the damper (or runs the release-stage
+///   envelope) and the voice fades quickly. This is the piano model:
+///   the action takes the felt off the string, the string is muted on
+///   purpose. Hosts call `VoiceImpl::trigger_release()`.
+///
+/// * `Natural` — note-off has no physical analogue. A plucked string
+///   (guitar, koto) has nothing the player can "release" — the hammer
+///   was never holding the string in the first place. The voice fades
+///   on its own loop-filter decay and is retired by the host once
+///   `is_done()` flips. Hosts MUST NOT call `trigger_release()`; doing
+///   so cuts the natural ring short and produces the "key-up kills the
+///   note" bug the chord-pad regression caught.
+///
+/// `Default` returns `Damper` so legacy plugins (and every entry in the
+/// static catalog) keep their pre-existing release semantics until they
+/// opt into `decay_model = "natural"` in their Cargo.toml metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DecayModel {
+    Damper,
+    Natural,
+}
+
+impl Default for DecayModel {
+    fn default() -> Self {
+        DecayModel::Damper
+    }
+}
+
 /// Top-level grouping in the side panel. Order in `ALL` is the
 /// rendering order: physically-modeled voices first (piano then
 /// guitar), the lightweight synth set, sample-based pianos, and
@@ -121,6 +151,13 @@ pub struct VoiceSlot {
     /// default to `Stable` via `default_recommend()`.
     #[serde(default = "default_recommend")]
     pub recommend: Recommend,
+    /// Whether MIDI / GUI note-off triggers an immediate damper release
+    /// (piano-style) or lets the string ring out on its own (plucked-
+    /// string voices like guitar / koto). Persisted with the slot so a
+    /// user-saved Custom built on top of a guitar plugin keeps its
+    /// "natural" behaviour even if the source manifest later flips.
+    #[serde(default)]
+    pub decay_model: DecayModel,
     /// Only meaningful for `Engine::PianoModal`. When `Some`, the
     /// global `ModalParams` cell is overwritten on selection.
     #[serde(default)]
@@ -175,6 +212,7 @@ impl VoiceSlot {
             engine,
             description: String::new(),
             recommend: Recommend::Stable,
+            decay_model: DecayModel::Damper,
             params: None,
             asset_path: None,
             sf_program: None,
@@ -497,6 +535,13 @@ struct PluginVoiceManifest {
     /// existing slot names.
     #[serde(default)]
     slot_name: Option<String>,
+    /// Note-off semantics: `"damper"` (piano-style trigger_release) or
+    /// `"natural"` (plucked-string voices, host must NOT call
+    /// trigger_release). Optional; missing or unknown values map to
+    /// `DecayModel::default() == Damper` so existing plugins keep
+    /// their pre-PR behaviour without manifest churn.
+    #[serde(default)]
+    decay_model: Option<String>,
 }
 
 /// Top-level shape of a `voices_live/<name>/Cargo.toml`. We don't care
@@ -613,10 +658,23 @@ pub fn discover_plugin_voices(voices_live_root: &Path) -> Vec<VoiceSlot> {
             }
         };
 
+        let decay_model = meta
+            .decay_model
+            .as_deref()
+            .map(|s| {
+                parse_decay_model(s).unwrap_or_else(|| {
+                    eprintln!(
+                        "voice_lib: plugin '{dir_name}' decay_model='{s}' unknown; defaulting to Damper"
+                    );
+                    DecayModel::default()
+                })
+            })
+            .unwrap_or_default();
         let slot_name = meta.slot_name.unwrap_or_else(|| dir_name.clone());
-        let slot = VoiceSlot::live_named(&meta.display_name, &slot_name, &dir_name)
+        let mut slot = VoiceSlot::live_named(&meta.display_name, &slot_name, &dir_name)
             .in_category(category)
             .with_meta(recommend, &meta.description);
+        slot.decay_model = decay_model;
         entries.push((dir_name, slot));
     }
 
@@ -642,6 +700,19 @@ fn parse_recommend(s: &str) -> Option<Recommend> {
         "Best" => Some(Recommend::Best),
         "Stable" => Some(Recommend::Stable),
         "Experimental" => Some(Recommend::Experimental),
+        _ => None,
+    }
+}
+
+/// Map a manifest `decay_model = "..."` string to the enum. Lower-case
+/// is the canonical form to match the rest of the manifest schema (which
+/// uses snake_case keys). Returns `None` for unknown values; callers
+/// fall back to `DecayModel::default()` (= `Damper`) and log a warning.
+#[cfg(feature = "native")]
+pub(crate) fn parse_decay_model(s: &str) -> Option<DecayModel> {
+    match s {
+        "damper" => Some(DecayModel::Damper),
+        "natural" => Some(DecayModel::Natural),
         _ => None,
     }
 }

@@ -583,6 +583,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sf_bank: args.sf2_bank,
         mix_mode: args.mix_mode,
         pedal_sustain: 0.0,
+        // Damper is the right startup default: the static catalog and
+        // every piano-family slot in voices_live/* uses it. The egui
+        // browser overwrites this on slot apply for plugins that
+        // declare `decay_model = "natural"` in their Cargo.toml.
+        decay_model: keysynth::voice_lib::DecayModel::default(),
     }));
     let dash: Arc<Mutex<DashState>> = Arc::new(Mutex::new(DashState::new(args.engine)));
 
@@ -739,7 +744,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let mut pool = voices_for_midi.lock().unwrap();
                 if let Some(slot) = pool.iter_mut().find(|x| x.key == (channel, note)) {
-                    slot.inner.trigger_release();
+                    let decay = live_for_midi.lock().unwrap().decay_model;
+                    match decay {
+                        keysynth::voice_lib::DecayModel::Damper => slot.inner.trigger_release(),
+                        // Plucked-string voice (guitar / koto / etc.):
+                        // the player's finger leaving the key has no
+                        // physical analogue — the hammer was never
+                        // touching the string after the pluck. Skip
+                        // trigger_release and let the loop-filter
+                        // decay carry the voice to silence; the audio
+                        // thread retires it via `is_done()`.
+                        keysynth::voice_lib::DecayModel::Natural => {}
+                    }
                 }
             }
             0xB0 => {

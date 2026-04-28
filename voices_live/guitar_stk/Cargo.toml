@@ -10,6 +10,11 @@ display_name = "Guitar (STK)"
 category = "Guitar"
 recommend = "Best"
 description = "Stanford Synthesis Toolkit port, well-balanced output"
+# Plucked-string voice: note-off has no physical analogue (the hammer
+# is already off the string the moment it's plucked). The host MUST
+# NOT call trigger_release(); the voice fades naturally via its loop
+# filter and is retired when is_done() flips.
+decay_model = "natural"
 
 # Self-contained workspace root, same reasoning as the other
 # `voices_live/<name>/` plugins: keysynth's top-level `[workspace]`

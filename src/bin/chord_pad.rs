@@ -23,7 +23,7 @@
 //! in-tree `Engine` variants).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +34,7 @@ use midir::{Ignore, MidiInput, MidiInputConnection};
 
 use keysynth::live_reload::{build_and_load, LiveFactory};
 use keysynth::synth::{midi_to_freq, VoiceImpl};
+use keysynth::voice_lib::DecayModel;
 
 // ---------------------------------------------------------------------------
 // Note dispatch
@@ -116,6 +117,14 @@ struct AudioState {
     /// Master gain. Defaults to 0.6 to leave headroom for ~6 stacked
     /// voices before clipping.
     master: f32,
+    /// Note-off semantics for the loaded voice. Read once at boot from
+    /// `voices_live/<crate>/Cargo.toml`'s `[package.metadata.keysynth-
+    /// voice].decay_model`. The audio thread branches on this in the
+    /// `NoteCmd::Off` arm: damper voices get `trigger_release()`, plucked
+    /// voices ride out their natural decay until `is_done()` retires
+    /// them. Fixed for the chord_pad lifetime because the binary loads
+    /// exactly one cdylib per run.
+    decay_model: DecayModel,
 }
 
 impl AudioState {
@@ -142,13 +151,22 @@ impl AudioState {
                         });
                     }
                 }
-                NoteCmd::Off { group } => {
-                    for v in self.voices.iter_mut() {
-                        if v.group == group {
-                            v.voice.trigger_release();
+                NoteCmd::Off { group } => match self.decay_model {
+                    DecayModel::Damper => {
+                        for v in self.voices.iter_mut() {
+                            if v.group == group {
+                                v.voice.trigger_release();
+                            }
                         }
                     }
-                }
+                    DecayModel::Natural => {
+                        // Plucked-string voice: note-off has no
+                        // physical analogue. Don't call trigger_release —
+                        // let the loop filter do its work and let
+                        // `render_mono`'s `retain(|v| !is_done())` cull
+                        // the voice once its envelope hits silence.
+                    }
+                },
             }
         }
     }
@@ -564,8 +582,65 @@ fn parse_args() -> CliArgs {
     CliArgs { live_crate_root }
 }
 
+/// Read `<crate_root>/Cargo.toml` and pull the
+/// `[package.metadata.keysynth-voice].decay_model` field. Falls back to
+/// `DecayModel::default()` (= `Damper`) on any error or missing key —
+/// same forgiving policy as `voice_lib::discover_plugin_voices`, and
+/// the right behaviour for the legacy `voices_live/piano` plugin which
+/// doesn't ship the field. We deliberately keep this lookup minimal
+/// (no full manifest parse, no shared schema) so chord_pad stays a
+/// single-binary tool that doesn't depend on the GUI catalog code.
+fn load_decay_model(crate_root: &Path) -> DecayModel {
+    let manifest = crate_root.join("Cargo.toml");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        eprintln!(
+            "chord_pad: cannot read {} — defaulting to decay_model=Damper",
+            manifest.display(),
+        );
+        return DecayModel::default();
+    };
+    let parsed: toml::Value = match toml::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "chord_pad: {} parse error ({e}) — defaulting to decay_model=Damper",
+                manifest.display(),
+            );
+            return DecayModel::default();
+        }
+    };
+    let raw = parsed
+        .get("package")
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("keysynth-voice"))
+        .and_then(|kv| kv.get("decay_model"))
+        .and_then(|v| v.as_str());
+    match raw {
+        Some("damper") => DecayModel::Damper,
+        Some("natural") => DecayModel::Natural,
+        Some(other) => {
+            eprintln!(
+                "chord_pad: {} decay_model='{other}' unknown — defaulting to Damper",
+                manifest.display(),
+            );
+            DecayModel::default()
+        }
+        None => DecayModel::default(),
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
+
+    // Read note-off semantics from the crate manifest BEFORE the cargo
+    // build so the user sees `decay_model=natural` in the boot log even
+    // if the build itself fails.
+    let decay_model = load_decay_model(&args.live_crate_root);
+    eprintln!(
+        "chord_pad: voice decay_model = {:?} (from {}/Cargo.toml)",
+        decay_model,
+        args.live_crate_root.display(),
+    );
 
     // Build + load the live voice cdylib.
     eprintln!(
@@ -604,6 +679,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         voices: Vec::with_capacity(VOICE_CAP),
         rx,
         master: 0.6,
+        decay_model,
     }));
 
     // Build the cpal stream. We support f32 and i16 output formats —
