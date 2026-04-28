@@ -44,6 +44,14 @@ Thumbs.db
 bench-out/*
 !bench-out/REF/
 !bench-out/REF/**
+# bench-out/songs/ — public-domain MIDI catalog for guitar/piano voice
+# testing. Only .mid + manifest.json + README.md are committed; rendered
+# WAVs land under bench-out/songs/<engine>/ at user request and stay
+# gitignored (the global **/*.wav rule below catches them).
+!bench-out/songs/
+!bench-out/songs/*.mid
+!bench-out/songs/manifest.json
+!bench-out/songs/README.md
 recordings/
 samples/
 ir/
@@ -107,6 +115,15 @@ bench-out/voice-unify/reload_latency.tsv
 **/*.midi
 !bench-out/REF/**/*.mid
 !bench-out/REF/**/*.midi
+# Public-domain song catalog (Mutopia, Traditional). Verified provenance
+# in bench-out/songs/manifest.json. Only the curated set is committable;
+# kssong-generated chord-progression demos and other ephemeral renders
+# stay local-only via the deny rules below.
+!bench-out/songs/*.mid
+bench-out/songs/bright_*.mid
+bench-out/songs/modern_*.mid
+bench-out/songs/rhythm_*.mid
+bench-out/songs/duet_*.mid
 # JSON transcriptions emitted by listener-lab from copyrighted audio are
 # derivative works — keep them out of git the same as the source mp3s.
 bench-out/CHIPTUNE/

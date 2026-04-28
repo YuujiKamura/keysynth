@@ -1,0 +1,160 @@
+{
+  "schema_version": 1,
+  "directory": "bench-out/songs",
+  "description": "Public-domain MIDI catalog for guitar / piano voice testing. Each entry is a single Standard MIDI File downloaded from the Mutopia Project, redistributable under Public Domain. Rendered audio output (WAV) is gitignored — generate per-engine renders with `cargo run --release --bin render_midi --features native -- --in bench-out/songs/<name>.mid --engine <ENGINE> --out <OUT>.wav`.",
+  "license_summary": {
+    "all_entries": "Public Domain",
+    "verification": "All entries verified via Mutopia Project catalogue (https://www.mutopiaproject.org/) on 2026-04-28. Mutopia restricts contributions to Public Domain / CC0 / CC-BY / CC-BY-SA; per-piece license metadata is on each piece's catalogue page.",
+    "rejected_categories": [
+      "CC-BY-NC*",
+      "proprietary",
+      "unknown / typesetter-claimed restrictions"
+    ]
+  },
+  "acquisition_date": "2026-04-28",
+  "entries": [
+    {
+      "file": "aguado_op3_no1.mid",
+      "title": "D. Aguado — Op. 3 No. 1 (Estudio, 1820s)",
+      "composer": "Dionisio Aguado (1784-1849)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AguadoD/O3/aguado-op03n01/aguado-op03n01.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "19th-century pedagogy: open-string root chords plus step-wise melodic motion. Short, consistent — good A/B regression candidate when comparing guitar-voice changes."
+    },
+    {
+      "file": "bach_bwv999_prelude.mid",
+      "title": "J.S. Bach — BWV 999 Prelude in D minor (lute, c. 1720)",
+      "composer": "J.S. Bach (1685-1750)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BachJS/BWV999/Bach_Prelude_BWV999/Bach_Prelude_BWV999.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Every classical guitarist's first Bach: broken-chord arpeggios at moderate tempo with sustained pedal tones. Tests how cleanly overlapping plucks ring against each other."
+    },
+    {
+      "file": "carcassi_op1_no1.mid",
+      "title": "M. Carcassi — Op. 1 No. 1 (1820s)",
+      "composer": "Matteo Carcassi (1792-1853)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CarcassiM/O1/carcassi-op1n01/carcassi-op1n01.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Carcassi études are the standard intermediate repertoire — right-hand finger patterns drill arpeggio voicings at clean tempo."
+    },
+    {
+      "file": "giuliani_op50_no1_papillon.mid",
+      "title": "M. Giuliani — Op. 50 No. 1 'Le Papillon' (1822)",
+      "composer": "Mauro Giuliani (1781-1829)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/GiulianiM/O50/giuliani-op50n01/giuliani-op50n01.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Light melodic figuration over staccato bass. Tests crisp note-onset behaviour at low velocities — the regime where most physical models start to fall apart."
+    },
+    {
+      "file": "sor_op1_no1.mid",
+      "title": "F. Sor — Op. 1 No. 1 (Six Petites Pièces, 1810s)",
+      "composer": "Fernando Sor (1778-1839)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/SorF/O1/sor_op1_1/sor_op1_1.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Sor is to classical guitar what Czerny is to piano — these miniatures are the foundational étude literature."
+    },
+    {
+      "file": "tarrega_adelita.mid",
+      "title": "F. Tárrega — Adelita (Mazurka, 1899)",
+      "composer": "Francisco Tárrega (1852-1909)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/TarregaF/adelita/adelita.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Slow held melody notes over arpeggio accompaniment. Directly tests sustain envelope shape on quarter and half notes."
+    },
+    {
+      "file": "tarrega_capricho_arabe.mid",
+      "title": "F. Tárrega — Capricho Árabe (1892)",
+      "composer": "Francisco Tárrega (1852-1909)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/TarregaF/capricho-arabe/capricho-arabe.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Phrygian-flavoured solo with rubato passages. Tests pluck-attack consistency under rhythmic flexibility rather than steady tempo."
+    },
+    {
+      "file": "tarrega_recuerdos.mid",
+      "title": "F. Tárrega — Recuerdos de la Alhambra (1896)",
+      "composer": "Francisco Tárrega (1852-1909)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/TarregaF/recuerdos/recuerdos.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "The canonical tremolo study: repeated 16th notes on a single melodic pitch. Any micro-decay or amplitude-modulation artefact in a guitar voice surfaces immediately."
+    },
+    {
+      "file": "trad_redapplerag.mid",
+      "title": "Traditional — Red Apple Rag",
+      "composer": "Traditional (American)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/Traditional/RedAppleRag/RedAppleRag.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Early-20th-century American ragtime arranged for solo guitar. Bright major-key syncopation — escapes the medieval / classical-MIDI vibe of the rest of the catalogue."
+    },
+    {
+      "file": "trad_soldiersjoy.mid",
+      "title": "Traditional — Soldier's Joy",
+      "composer": "Traditional (American / British Isles)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/Traditional/soldiers-joy/soldiers-joy.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Canonical bluegrass / fiddle hoedown tune in D major. Fast eighth-note runs, tests note-onset at speed."
+    },
+    {
+      "file": "mozart_kv309_1.mid",
+      "title": "W.A. Mozart — Piano Sonata KV 309, 1st movement (1777)",
+      "composer": "Wolfgang Amadeus Mozart (1756-1791)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/MozartWA/KV309/KV309_1/KV309_1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Allegro con spirito with broad dynamic range and full keyboard coverage. Stresses register balance and onset transients across the piano voice."
+    },
+    {
+      "file": "satie_danse.mid",
+      "title": "E. Satie — Danse (from 6 Croquis et agaceries, 1913)",
+      "composer": "Erik Satie (1866-1925)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/SatieE/Croquis/Danse/Danse.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Satie's spare harmonic language and slow tempo expose any envelope or sustain artefact that a busier romantic piece would mask."
+    },
+    {
+      "file": "albeniz_op71_rumores.mid",
+      "title": "I. Albéniz — Op. 71 Rumores de la Caleta (1886)",
+      "composer": "Isaac Albéniz (1860-1909)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AlbenizIMF/O71/Rumores_de_la-caleta/Rumores_de_la-caleta.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Spanish-romantic Andalusian flavour with rolled chords and rubato. Tests the piano voice on a programmatic / coloristic piece rather than a strict-tempo classical line."
+    }
+  ]
+}
