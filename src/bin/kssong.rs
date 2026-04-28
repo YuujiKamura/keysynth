@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use midly::num::{u15, u24, u28, u4, u7};
 use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
 
-use keysynth::song::{parse_progression_with_key, Chord, Key};
+use keysynth::song::{parse_progression_with_key, Chord, Key, Voicing};
 use keysynth::synth::{midi_to_freq, Engine, VoiceImpl};
 use keysynth::voices::guitar::GuitarVoice;
 
@@ -50,6 +50,7 @@ impl VoiceChoice {
 struct PlayArgs {
     progression: String,
     voice: VoiceChoice,
+    voicing: Voicing,
     bpm: u32,
     bars: Option<usize>,
     key: Option<Key>,
@@ -65,6 +66,7 @@ fn print_help() {
          kssong play \"C - G - Am - F\" --voice piano --bpm 120 --out out.wav\n\n\
          play options:\n  \
          --voice NAME      piano|piano-modal|piano-thick|piano-lite|piano-5am|guitar|square|ks|ks-rich|fm|sub|koto|sf-piano|sfz-piano\n  \
+         --voicing MODE    close|piano|guitar|open (default close)\n  \
          --bpm N           tempo in beats per minute (default 120)\n  \
          --bars N          total bars to render; repeats/truncates progression to fit\n  \
          --key KEY         base key for roman numerals (example: C, F#, Bb)\n  \
@@ -94,6 +96,7 @@ fn parse_args() -> Result<PlayArgs, String> {
         .next()
         .ok_or_else(|| "play requires a chord progression string".to_string())?;
     let mut voice = VoiceChoice::Engine(Engine::Piano);
+    let mut voicing = Voicing::Close;
     let mut bpm = DEFAULT_BPM;
     let mut bars = None;
     let mut key = None;
@@ -106,6 +109,10 @@ fn parse_args() -> Result<PlayArgs, String> {
             "--voice" | "--engine" => {
                 let value = iter.next().ok_or("--voice needs a value")?;
                 voice = VoiceChoice::parse(&value)?;
+            }
+            "--voicing" => {
+                let value = iter.next().ok_or("--voicing needs a value")?;
+                voicing = Voicing::parse(&value).map_err(|e| format!("bad --voicing: {e}"))?;
             }
             "--bpm" => {
                 bpm = iter
@@ -154,6 +161,7 @@ fn parse_args() -> Result<PlayArgs, String> {
     Ok(PlayArgs {
         progression,
         voice,
+        voicing,
         bpm,
         bars,
         key,
@@ -169,7 +177,7 @@ fn expand_progression(chords: &[Chord], total_bars: usize) -> Vec<Chord> {
         .collect()
 }
 
-fn build_smf_bytes(chords: &[Chord], bpm: u32) -> Result<Vec<u8>, String> {
+fn build_smf_bytes(chords: &[Chord], bpm: u32, voicing: Voicing) -> Result<Vec<u8>, String> {
     #[derive(Clone, Copy)]
     enum MidiKind {
         NoteOff(u8),
@@ -181,7 +189,7 @@ fn build_smf_bytes(chords: &[Chord], bpm: u32) -> Result<Vec<u8>, String> {
     for (bar_idx, chord) in chords.iter().enumerate() {
         let start_tick = bar_idx as u32 * bar_ticks;
         let end_tick = start_tick + bar_ticks;
-        for note in chord.voice() {
+        for note in chord.voice(voicing) {
             timeline.push((end_tick, MidiKind::NoteOff(note)));
             timeline.push((start_tick, MidiKind::NoteOn(note)));
         }
@@ -339,13 +347,14 @@ fn run_play(args: PlayArgs) -> Result<(), String> {
         .map_err(|e| format!("progression parse: {e}"))?;
     let total_bars = args.bars.unwrap_or(chords.len());
     let expanded = expand_progression(&chords, total_bars);
-    let midi_bytes = build_smf_bytes(&expanded, args.bpm)?;
+    let midi_bytes = build_smf_bytes(&expanded, args.bpm, args.voicing)?;
     render_to_wav(&args, &midi_bytes)?;
     eprintln!(
-        "kssong: wrote {} (bars={} bpm={})",
+        "kssong: wrote {} (bars={} bpm={} voicing={})",
         args.out_path.display(),
         total_bars,
-        args.bpm
+        args.bpm,
+        args.voicing.as_str()
     );
     Ok(())
 }
