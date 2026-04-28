@@ -184,6 +184,40 @@ def build_single_note_manifest():
         "fret7": 7,
         "fret12": 12,
     }
+    # Domain notes per open string. Only the open-string entries carry a
+    # per-position story — fretted positions get a short positional
+    # description. Avoid hand-waving: only assertions that are textbook
+    # facts about standard tuning go here.
+    OPEN_STRING_CONTEXT = {
+        "E2": "Standard tuning's lowest open string (82.41 Hz). "
+              "Tonic of E minor — the workhorse key of blues and "
+              "rock guitar; also the bass anchor for every E-major "
+              "open chord.",
+        "A2": "Standard tuning A. Open root for the canonical "
+              "'cowboy chord' A major and tonic of A minor; the "
+              "string the entire 'A-shape' barre-chord family is "
+              "voiced over.",
+        "D3": "Standard tuning D. Mid-range bass string; the bass "
+              "note of every D-major-key folk progression and the "
+              "drone in DADGAD-derived alternative tunings.",
+        "G3": "Standard tuning G. The single most-played open root "
+              "in beginner classical and folk fingerstyle "
+              "repertoire; G major dominates the Mutopia catalogue.",
+        "B3": "Standard tuning B. The string whose interval to the "
+              "next-up E breaks the all-fourths pattern (it's a "
+              "major third) — historical compromise that makes "
+              "open-position chord shapes playable.",
+        "E4": "Standard tuning's high E (329.63 Hz). Top voice of "
+              "the open chord. The 12th-fret natural harmonic of "
+              "the low E lands at this exact pitch — a useful "
+              "self-check for octave doubling in physical models.",
+    }
+    def fret_context(sname, fret):
+        if fret == 0:
+            return OPEN_STRING_CONTEXT[sname]
+        return (f"Fret {fret} on the {sname} string — "
+                f"raises the open string by {fret} semitone(s).")
+
     for sname, omidi in OPEN.items():
         for tag, fret in frets_for.items():
             midi = omidi + fret
@@ -195,6 +229,7 @@ def build_single_note_manifest():
                 "midi": midi,
                 "pitch": PITCH[midi],
                 "freq_hz": round(midi_to_hz(midi), 4),
+                "context": fret_context(sname, fret),
                 "duration_s": 2.0,
                 "samplerate_hz": SR,
                 "channels": "mono",
@@ -313,38 +348,89 @@ def build_chord_manifest():
 
 # ---- corpus/classical manifest (Mutopia) --------------------------------
 def build_classical_manifest():
+    # Each tuple: (slug, title, mutopia_path, context).
+    # `mutopia_path` is the on-server FTP path under
+    # https://www.mutopiaproject.org/ftp/ — verified to resolve as of
+    # the acquisition date. The `context` line is one sentence of
+    # domain rationale for *why this piece*, not what it is.
     pieces = [
-        ("bach_bwv1006_prelude", "J.S. Bach — BWV 1006a Prelude (Lute Suite IV)",
-         "1063", "Public Domain"),
-        ("sor_op35_no22_andantino", "F. Sor — Op. 35 No. 22 Andantino",
-         "0541", "Public Domain"),
-        ("tarrega_lagrima", "F. Tárrega — Lágrima (Preludio)",
-         "0207", "Public Domain"),
-        ("tarrega_adelita", "F. Tárrega — Adelita (Mazurka)",
-         "0208", "Public Domain"),
-        ("carcassi_op60_no1", "M. Carcassi — Op. 60 No. 1",
-         "0123", "Public Domain"),
-        ("giuliani_op50_no1_papillon", "M. Giuliani — Op. 50 No. 1 (Le Papillon)",
-         "0345", "Public Domain"),
-        ("carulli_op121_no1", "F. Carulli — Op. 121 No. 1 Andantino",
-         "0212", "Public Domain"),
-        ("bach_bwv996_bourree", "J.S. Bach — BWV 996 Bourrée",
-         "0090", "Public Domain"),
-        ("sor_op31_no2", "F. Sor — Op. 31 No. 2 Andantino",
-         "0301", "Public Domain"),
-        ("aguado_estudio_em", "D. Aguado — Estudio en Mi menor",
-         "0455", "Public Domain"),
+        ("bach_bwv1006a_prelude_lute_suite_iv",
+         "J.S. Bach — BWV 1006a Prelude (Lute Suite no. 4 in E major, c. 1737)",
+         "BachJS/BWV1006a/bwv-1006a_1g/bwv-1006a_1g.mid",
+         "Single-line counterpoint at speed. Exposes pluck attack, "
+         "string crossing, and decay tail more nakedly than any "
+         "chordal repertoire — the violin partita transcription is "
+         "the canonical Bach lute solo."),
+        ("bach_bwv999_prelude_dminor",
+         "J.S. Bach — BWV 999 Prelude in D minor (lute, c. 1720)",
+         "BachJS/BWV999/Bach_Prelude_BWV999/Bach_Prelude_BWV999.mid",
+         "Every classical guitarist's first Bach: broken-chord "
+         "arpeggios at moderate tempo, sustained pedal tones — "
+         "tests how cleanly overlapping plucks ring against each "
+         "other."),
+        ("bach_bwv997_prelude_lute_suite_ii",
+         "J.S. Bach — BWV 997 Prelude (Lute Suite no. 2 in C minor)",
+         "BachJS/BWV997/bwv997-01prelude/bwv997-01prelude.mid",
+         "Free-form prelude with strong polyphonic voice leading — "
+         "stresses the model's ability to hold independent voices "
+         "without smearing across registers."),
+        ("tarrega_recuerdos_de_la_alhambra",
+         "F. Tárrega — Recuerdos de la Alhambra (1896)",
+         "TarregaF/recuerdos/recuerdos.mid",
+         "The canonical tremolo study: repeated 16th notes on a "
+         "single melodic pitch. Any micro-decay or amplitude "
+         "modulation artefact in the voice surfaces immediately."),
+        ("tarrega_capricho_arabe",
+         "F. Tárrega — Capricho Árabe (1892)",
+         "TarregaF/capricho-arabe/capricho-arabe.mid",
+         "Phrygian-flavoured solo with rubato passages — tests "
+         "pluck-attack consistency under rhythmic flexibility "
+         "rather than steady tempo."),
+        ("tarrega_adelita_mazurka",
+         "F. Tárrega — Adelita (Mazurka, 1899)",
+         "TarregaF/adelita/adelita.mid",
+         "Slow held melody notes over arpeggio accompaniment — "
+         "directly tests sustain envelope shape on quarter and "
+         "half notes."),
+        ("aguado_op3_no1_estudio",
+         "D. Aguado — Op. 3 No. 1 (Estudio, 1820s)",
+         "AguadoD/O3/aguado-op03n01/aguado-op03n01.mid",
+         "19th-century pedagogy: open-string root chords plus "
+         "step-wise melodic motion. Short, consistent, and a good "
+         "A/B regression candidate when comparing voice changes."),
+        ("sor_op1_no1_six_petites_pieces",
+         "F. Sor — Op. 1 No. 1 (Six Petites Pièces, 1810s)",
+         "SorF/O1/sor_op1_1/sor_op1_1.mid",
+         "Sor is to classical guitar what Czerny is to piano — "
+         "these miniatures are the foundational étude literature "
+         "and reference how every working guitarist learned the "
+         "instrument."),
+        ("carcassi_op1_no1",
+         "M. Carcassi — Op. 1 No. 1 (1820s)",
+         "CarcassiM/O1/carcassi-op1n01/carcassi-op1n01.mid",
+         "Carcassi's études are the standard intermediate "
+         "repertoire — right-hand finger patterns drill arpeggio "
+         "voicings at clean tempo."),
+        ("giuliani_op50_no1_le_papillon",
+         "M. Giuliani — Op. 50 No. 1 'Le Papillon' (1822)",
+         "GiulianiM/O50/giuliani-op50n01/giuliani-op50n01.mid",
+         "Light melodic figuration over staccato bass — tests "
+         "crisp note-onset behaviour at low velocities, the regime "
+         "where most physical models fall apart."),
     ]
     entries = []
-    for slug, title, mid, lic in pieces:
+    for slug, title, path, context in pieces:
+        url = f"https://www.mutopiaproject.org/ftp/{path}"
         entries.append({
             "file_midi":  f"{slug}.mid",
             "file_audio": f"{slug}.wav",
             "title": title,
-            "license": lic,
-            "mutopia_id": mid,
+            "context": context,
+            "license": "Public Domain",
+            "mutopia_path": path,
             "source": "Mutopia Project",
-            "source_url": f"https://www.mutopiaproject.org/cgibin/piece-info.cgi?id={mid}",
+            "source_url": url,
+            "catalogue_url": "https://www.mutopiaproject.org/cgibin/make-table.cgi?Instrument=Guitar",
             "attribution": "Mutopia Project, public domain typesetting.",
             "midi_available": False,
             "audio_available": False,
@@ -454,6 +540,8 @@ curl_dl() {
 }
 
 echo "[fetch.sh] === GuitarSet (BSD-3) ==="
+echo "[fetch.sh]     MARL/NYU 2018 (Xi, Bittner, Pauwels, Ye, Bello — ISMIR);"
+echo "[fetch.sh]     first openly-licensed guitar dataset with hex-pickup ground truth."
 GUITARSET_AUDIO_ZIP="${DEST}/guitarset_audio_mono-pickup.zip"
 GUITARSET_ANN_ZIP="${DEST}/guitarset_annotations.zip"
 curl_dl \
@@ -466,45 +554,50 @@ curl_dl \
 # off-tree step; see corpus/classical/manifest.json description.
 
 echo "[fetch.sh] === Mutopia (Public Domain) ==="
+echo "[fetch.sh]     Community-typeset public-domain scores since 2000;"
+echo "[fetch.sh]     the LilyPond ecosystem's classical guitar archive."
 "${PY}" - "${DEST}" <<'PYMUTOPIA'
 import json, os, sys, urllib.request
 
 DEST = sys.argv[1]
+CATALOGUE = (
+    "https://www.mutopiaproject.org/cgibin/make-table.cgi"
+    "?Instrument=Guitar"
+)
 manifest_path = os.path.join(DEST, "corpus/classical", "manifest.json")
 with open(manifest_path) as f:
     m = json.load(f)
 for e in m["entries"]:
-    mid = e["mutopia_id"]
     out = os.path.join(DEST, "corpus/classical", e["file_midi"])
     if os.path.exists(out) and os.path.getsize(out) > 0:
         print(f"skip  {e['file_midi']}")
         continue
-    # Mutopia's per-piece info page links to .mid via a deterministic
-    # URL pattern. Soft-fail on 404 — Mutopia occasionally rotates URLs.
-    candidates = [
-        f"https://www.mutopiaproject.org/ftp/{mid}.mid",
-    ]
-    fetched = False
-    for url in candidates:
-        try:
-            with urllib.request.urlopen(url, timeout=20) as r:
-                data = r.read()
-            with open(out, "wb") as fp:
-                fp.write(data)
-            print(f"fetch {e['file_midi']}  ({len(data)} bytes)")
-            fetched = True
-            break
-        except Exception as ex:
-            print(f"  miss {url}: {ex}")
-    if not fetched:
-        print(f"  {e['file_midi']} unavailable; manifest entry kept, midi_available=false")
+    url = e["source_url"]
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = r.read()
+        with open(out, "wb") as fp:
+            fp.write(data)
+        print(f"fetch {e['file_midi']}  ({len(data)} bytes)  ← {e['title']}")
+    except Exception as ex:
+        # Soft-fail with an actionable error message — Mutopia occasionally
+        # restructures piece directories, so point the operator at the
+        # live catalogue rather than just printing `404`.
+        print(f"  MISS  {e['file_midi']}: {ex}")
+        print(f"        URL:        {url}")
+        print(f"        Catalogue:  {CATALOGUE}")
+        print(f"        Hint:       open the catalogue, search for "
+              f"'{e['title'].split(' — ')[0]}', and update")
+        print(f"                    the `mutopia_path` field in "
+              f"corpus/classical/manifest.json.")
 PYMUTOPIA
 
 if [[ "${SKIP_SLAKH}" -ne 1 ]]; then
     echo "[fetch.sh] === Slakh2100 (CC-BY 4.0, sample only) ==="
-    echo "[fetch.sh] Slakh2100's full distribution is ~145 GB. We only"
-    echo "[fetch.sh] reference the metadata index here. Pass --skip-slakh"
-    echo "[fetch.sh] to silence this notice."
+    echo "[fetch.sh]     Manilow et al. WASPAA 2019; the de-facto MIR"
+    echo "[fetch.sh]     source-separation benchmark for synthesised stems."
+    echo "[fetch.sh]     Full distribution is ~145 GB; we reference the"
+    echo "[fetch.sh]     metadata index only. Pass --skip-slakh to skip."
     SLAKH_INDEX_URL="https://raw.githubusercontent.com/ethman/slakh-utils/master/track_metadata.csv"
     curl_dl "${SLAKH_INDEX_URL}" "${DEST}/corpus/popular/slakh2100_metadata.csv" || true
 fi

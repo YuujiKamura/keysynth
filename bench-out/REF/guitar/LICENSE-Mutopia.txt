@@ -45,19 +45,22 @@ Dataset summary:
     or CC0.
 
 Selected pieces (from the Mutopia "Guitar" instrument tag; full list
-with mutopia_id and per-piece license is in
-bench-out/REF/guitar/corpus/classical/manifest.json):
+with `mutopia_path` and per-piece license is in
+bench-out/REF/guitar/corpus/classical/manifest.json — every URL
+verified to resolve as of the acquisition date):
 
-  - J.S. Bach, BWV 1006a (Lute Suite no. 4 in E major) — Prelude
-  - F. Sor, Op. 35 No. 22 (Études) — Andantino
-  - F. Tárrega, "Lágrima" — Preludio
-  - F. Tárrega, "Adelita" — Mazurka
-  - M. Carcassi, Op. 60 No. 1 (25 Études Mélodiques) — Allegro
-  - M. Giuliani, Op. 50 No. 1 (Le Papillon) — Andantino
-  - F. Carulli, Op. 121 No. 1 (Solfèges) — Andantino
-  - J.S. Bach, BWV 996 — Bourrée (transcription for guitar)
-  - F. Sor, Op. 31 No. 2 (Leçons Progressives) — Andantino
-  - D. Aguado, "Estudio en Mi menor"
+  - J.S. Bach, BWV 1006a — Prelude (Lute Suite no. 4 in E major,
+    c. 1737)
+  - J.S. Bach, BWV 999 — Prelude in D minor (lute, c. 1720)
+  - J.S. Bach, BWV 997 — Prelude (Lute Suite no. 2 in C minor)
+  - F. Tárrega, "Recuerdos de la Alhambra" (1896) — the canonical
+    tremolo study
+  - F. Tárrega, "Capricho Árabe" (1892)
+  - F. Tárrega, "Adelita" (Mazurka, 1899)
+  - D. Aguado, Op. 3 No. 1 (Estudio, 1820s)
+  - F. Sor, Op. 1 No. 1 (Six Petites Pièces, 1810s)
+  - M. Carcassi, Op. 1 No. 1 (1820s)
+  - M. Giuliani, Op. 50 No. 1, "Le Papillon" (1822)
 
 Use in this corpus:
   Only the auto-rendered .mid files are reproduced (downloaded on

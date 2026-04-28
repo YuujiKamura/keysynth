@@ -1,5 +1,30 @@
 # Guitar reference corpus
 
+## What you can hear, and why these references
+
+The corpus deliberately spans three eras so a guitar voice has to
+survive all of them:
+
+- **Bach lute suites** (BWV 999, BWV 997, BWV 1006a) — single-line
+  counterpoint and broken-chord preludes from the 1720s. Exposes
+  pluck attack and decay tail more nakedly than any chordal piece.
+- **19th-century salon literature** (Sor Op. 1, Aguado Op. 3,
+  Carcassi Op. 1, Giuliani Op. 50, Tárrega's *Adelita* and
+  *Recuerdos de la Alhambra*) — the foundational études every
+  classical guitarist learns. Tárrega's *Recuerdos* in particular
+  is the canonical tremolo study; any micro-decay artefact in the
+  voice surfaces immediately on its repeated 16ths.
+- **Modern strummed comping** (Slakh2100 guitar stems) — full-band
+  context, attack-heavy chord work.
+
+The single-note set covers all six open strings of standard tuning
+(E2 / A2 / D3 / G3 / B3 / E4) plus canonical fretted positions
+(open / 1 / 3 / 5 / 7 / 12). If a guitar voice can convincingly
+render Bach's solo single-note lines and a four-on-the-floor chord
+strum, it has covered the two ends of guitar timbre that matter.
+
+## Layout
+
 Two parallel layers, both restricted to permissive licences (CC0 / CC-BY /
 CC-BY-SA / BSD / MIT / Public Domain — anything more restrictive is
 rejected by `fetch.sh`'s manifest builder):
