@@ -14,6 +14,7 @@ pub mod gm;
 pub mod live_abi;
 pub mod resample;
 pub mod reverb;
+pub mod song;
 pub mod soundboard;
 pub mod sympathetic;
 pub mod synth;

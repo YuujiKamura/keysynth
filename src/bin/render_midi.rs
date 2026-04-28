@@ -18,15 +18,15 @@ use midly::{MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
 use keysynth::sfz::SfzPlayer;
 use keysynth::synth::{make_voice, midi_to_freq, Engine, ModalLut, MODAL_LUT};
 
-const SR: u32 = 44100;
-const RELEASE_TAIL_SEC: f32 = 2.5;
+pub const SR: u32 = 44100;
+pub const RELEASE_TAIL_SEC: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug)]
-struct NoteEvent {
-    start_sec: f32,
-    midi_note: u8,
-    duration_sec: f32,
-    velocity: u8,
+pub struct NoteEvent {
+    pub start_sec: f32,
+    pub midi_note: u8,
+    pub duration_sec: f32,
+    pub velocity: u8,
 }
 
 struct Args {
@@ -100,7 +100,7 @@ fn parse_args() -> Result<Args, String> {
 /// (note_on/note_off pairs collapsed into start_sec + duration_sec).
 /// Handles format-0 (single track) and format-1 (multi-track merged by
 /// absolute tick); tempo changes mid-piece are honoured.
-fn parse_smf(bytes: &[u8], tempo_scale: f32) -> Result<Vec<NoteEvent>, String> {
+pub fn parse_smf(bytes: &[u8], tempo_scale: f32) -> Result<Vec<NoteEvent>, String> {
     let smf = Smf::parse(bytes).map_err(|e| format!("midly parse: {e}"))?;
     let ppq: u32 = match smf.header.timing {
         Timing::Metrical(t) => t.as_int() as u32,
@@ -212,7 +212,7 @@ fn pan_for_note(midi_note: u8) -> f32 {
     ((midi_note as f32 - CENTRE) / SPAN).clamp(-1.0, 1.0)
 }
 
-fn render_keysynth(
+pub fn render_keysynth(
     engine: Engine,
     events: &[NoteEvent],
     modal_lut_path: Option<&std::path::Path>,
@@ -277,7 +277,7 @@ fn render_keysynth(
     (left, right)
 }
 
-fn render_sfz(
+pub fn render_sfz(
     sfz_path: &std::path::Path,
     events: &[NoteEvent],
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
@@ -322,7 +322,7 @@ fn render_sfz(
     Ok((left, right))
 }
 
-fn write_wav_stereo(path: &std::path::Path, left: &[f32], right: &[f32]) -> Result<(), String> {
+pub fn write_wav_stereo(path: &std::path::Path, left: &[f32], right: &[f32]) -> Result<(), String> {
     if let Some(p) = path.parent() {
         std::fs::create_dir_all(p).map_err(|e| format!("create_dir_all: {e}"))?;
     }
