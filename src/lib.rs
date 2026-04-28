@@ -11,6 +11,7 @@
 //! pull in midir / hound / rustfft / image / rustysynth / etc.
 
 pub mod gm;
+pub mod live_abi;
 pub mod resample;
 pub mod reverb;
 pub mod soundboard;

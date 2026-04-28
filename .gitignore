@@ -1,6 +1,11 @@
 /target
 /dist
 target-local/
+# voices_live/<name>/ plugins each carry their own target/ when
+# `live_reload::build_and_load` invokes cargo with --target-dir
+# crate_root/target. Keep those out of the repo too.
+voices_live/*/target/
+voices_live/target/
 
 # CARGO_TARGET_DIR may point elsewhere; keep the default rule too.
 # /dist is trunk's default output for the web demo.
@@ -50,6 +55,14 @@ reference/*.wav
 !bench-out/cp-e2e/run.log
 bench-out/cp-e2e/*.wav
 bench-out/cp-e2e/keysynth.stderr.log
+# Voice-unify E2E demo log: tests/voice_unify_e2e.sh writes the
+# captured PR evidence here. Same policy as cp-e2e: whitelist the log,
+# keep WAVs / latency tsv / stderr local-only.
+!bench-out/voice-unify/
+!bench-out/voice-unify/run.log
+bench-out/voice-unify/*.wav
+bench-out/voice-unify/keysynth.stderr.log
+bench-out/voice-unify/reload_latency.tsv
 **/*.flac
 **/*.aif
 **/*.aiff
