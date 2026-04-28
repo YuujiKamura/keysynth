@@ -44,6 +44,11 @@ Thumbs.db
 bench-out/*
 !bench-out/REF/
 !bench-out/REF/**
+# GUI visual-verify screenshots referenced from PR descriptions.
+# Small (~200 KB), one-off, useful for review without separate image
+# hosting. Renders themselves stay gitignored.
+!bench-out/gui-verify/
+!bench-out/gui-verify/*.png
 # bench-out/songs/ — public-domain MIDI catalog for guitar/piano voice
 # testing. Only .mid + manifest.json + README.md are committed; rendered
 # WAVs land under bench-out/songs/<engine>/ at user request and stay
