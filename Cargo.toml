@@ -54,6 +54,12 @@ native = [
     # Native-only because the cache renders to disk via subprocess
     # invocation of render_midi.
     "dep:sha2",
+    # rusqlite: bundled SQLite for the materialized songs/voices catalog
+    # (issue #66, src/library_db). `bundled` links the SQLite C amalgamation
+    # into the binary — no system libsqlite3 dependency, no cross-platform
+    # version skew at ship time. Native-only because the catalog is
+    # filesystem-scoped and the wasm bundle has no `bench-out/library.db`.
+    "dep:rusqlite",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -122,6 +128,12 @@ toml = { version = "0.8", optional = true }
 # preview_cache module itself is gated to `native` (depends on hound +
 # subprocess invocation of render_midi).
 sha2 = { version = "0.10", optional = true }
+# rusqlite: bundled SQLite for the materialized library catalog
+# (`src/library_db`, issue #66). `bundled` links the amalgamation
+# directly so we don't depend on a system libsqlite3 — keysynth ships
+# without per-OS install steps. Native-only: the wasm bundle has no
+# `bench-out/library.db` to read.
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -288,6 +300,15 @@ required-features = ["native"]
 [[bin]]
 name = "ksctl"
 path = "src/bin/ksctl.rs"
+required-features = ["native"]
+
+# keysynth_db: maintenance CLI for the materialized library catalog
+# (issue #66). Wraps `LibraryDb::rebuild` / `migrate` / typed queries
+# so an operator can inspect or refresh `bench-out/library.db` without
+# launching the GUI.
+[[bin]]
+name = "keysynth_db"
+path = "src/bin/keysynth_db.rs"
 required-features = ["native"]
 
 # chord_pad binary: real-time chord-trigger surface for the STK guitar

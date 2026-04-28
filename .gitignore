@@ -57,6 +57,19 @@ bench-out/*
 !bench-out/songs/*.mid
 !bench-out/songs/manifest.json
 !bench-out/songs/README.md
+# Library catalog (issue #66) — `library.db.sql` is the schema (always
+# committed) and `library.db` is the materialized SQLite index. The DB
+# is rebuildable from manifest.json + voices_live/* via `keysynth_db
+# rebuild`, but committing the rendered file lets a fresh checkout
+# query without having to run the rebuild first. `play_log.db` is
+# machine-local user state (record_play history) and stays untracked.
+!bench-out/library.db
+!bench-out/library.db.sql
+bench-out/library.db-wal
+bench-out/library.db-shm
+bench-out/play_log.db
+bench-out/play_log.db-wal
+bench-out/play_log.db-shm
 recordings/
 samples/
 ir/

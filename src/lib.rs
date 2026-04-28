@@ -37,6 +37,8 @@ pub mod dsp;
 #[cfg(feature = "native")]
 pub mod extract;
 #[cfg(feature = "native")]
+pub mod library_db;
+#[cfg(feature = "native")]
 pub mod live_reload;
 #[cfg(feature = "native")]
 pub mod preview_cache;
