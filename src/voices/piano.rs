@@ -271,6 +271,15 @@ pub struct PianoVoice {
     /// is well below any audible LFO step. Saves ~3 % CPU on the hot path
     /// and keeps the existing `step()` cost unchanged for non-piano voices.
     detune_update_period: u32,
+    /// Tier 2.3 (issue #32) MIDI CC 64 sustain-pedal value. `0.0` keeps
+    /// the per-sample release decay bit-identical to the pre-T2.3
+    /// envelope; `1.0` slows the decay by ~95 % so released notes ring
+    /// on for several seconds while the pedal is held.
+    ///
+    /// The audio thread snapshots `LiveParams::pedal_sustain` once per
+    /// buffer and writes it via `set_pedal_sustain`; `render_add` then
+    /// passes it into `ReleaseEnvelope::step_with_pedal` every sample.
+    pedal_sustain: f32,
 }
 
 impl PianoVoice {
@@ -402,6 +411,7 @@ impl PianoVoice {
             // 32-sample update — see field doc. Single-string presets skip
             // the update entirely (no inter-string beating to drive).
             detune_update_period: if preset.string_count <= 1 { 0 } else { 32 },
+            pedal_sustain: 0.0,
         }
     }
 
@@ -517,10 +527,19 @@ impl VoiceImpl for PianoVoice {
             let s_avg_filtered = self.bridge_fir_drive.process(s_avg);
             let board_out = self.soundboard.process(s_avg_filtered);
             // 4. Mix dry strings + wet soundboard + longitudinal into the audio bus.
-            let env = self.release.step();
+            // Tier 2.3: when the sustain pedal (MIDI CC 64) is held the
+            // release-stage decay slows by up to ~95 %; pedal=0 falls
+            // through to the legacy `step()` codepath bit-identically.
+            let env = self.release.step_with_pedal(self.pedal_sustain);
             *sample += (s_avg * dry_gain + board_out * wet_gain + s_long_total * long_gain) * env;
             self.samples_since_attack = self.samples_since_attack.saturating_add(1);
         }
+    }
+    fn set_pedal_sustain(&mut self, pedal: f32) {
+        // Clamp at the boundary so a stale or out-of-range CC value can't
+        // push the release decay past unity (which would make `rel_mul`
+        // grow back toward 1 instead of decaying).
+        self.pedal_sustain = pedal.clamp(0.0, 1.0);
     }
     fn release_env(&self) -> Option<&ReleaseEnvelope> {
         Some(&self.release)
