@@ -231,6 +231,11 @@ name = "render_midi"
 path = "src/bin/render_midi.rs"
 required-features = ["native"]
 
+[[bin]]
+name = "kssong"
+path = "src/bin/kssong.rs"
+required-features = ["native"]
+
 # render_chiptune binary: parse a chiptune-lab song JSON and render it.
 [[bin]]
 name = "render_chiptune"
