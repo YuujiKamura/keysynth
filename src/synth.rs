@@ -803,6 +803,34 @@ impl KsString {
         self.pending_feedback += x;
     }
 
+    /// Update the fractional-delay tuning allpass coefficient from a target
+    /// fractional sample count `frac` in `[0, 1)`. The coefficient is
+    /// `c = (1 - frac) / (1 + frac)` (Smith, PASP §3.7), which gives a
+    /// group delay of approximately `frac` samples at low frequency on top
+    /// of the integer delay-line length.
+    ///
+    /// Used by `PianoVoice` to drive the per-string time-varying mistuning
+    /// (Tier 2.1). Modulating the fractional component lets the loop period
+    /// shift sub-sample without resizing the buffer or introducing zipper
+    /// noise — the AP coefficient updates are smooth in `frac`.
+    ///
+    /// `frac` is clamped to `[0.0, 0.999]` so the coefficient never reaches
+    /// `-1` (which would put a pole on the unit circle and destabilise the
+    /// loop).
+    #[inline]
+    pub fn set_tune_frac(&mut self, frac: f32) {
+        let f = frac.clamp(0.0, 0.999);
+        self.tune_coef = (1.0 - f) / (1.0 + f);
+    }
+
+    /// Read-only access to the integer delay-line length. PianoVoice uses
+    /// this to compute the target fractional delay for cent-drift modulation
+    /// without having to remember `delay_length_compensated` separately.
+    #[inline]
+    pub fn delay_buf_len(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Fix B: configure a per-voice attack envelope on the in-loop LPF
     /// strength. Over the first `attack_ms` ms after the voice starts,
     /// the `cur`-tap weight interpolates linearly from `w0_attack` (high
