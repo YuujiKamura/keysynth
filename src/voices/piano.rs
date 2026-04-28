@@ -14,6 +14,7 @@ use super::super::synth::{
 };
 use super::hammer_stulov::{self, HammerParams};
 use super::longitudinal::LongitudinalString;
+use super::mistuning_table::{curve_for_midi, MistuneCurve, MIN_HALF_SPREAD_CENTS};
 use super::string_inharmonicity::dispersion_allpass_coeff;
 
 // ---------------------------------------------------------------------------
@@ -188,11 +189,43 @@ pub(crate) fn piano_detunes(count: usize, half_cents: f32) -> Vec<f32> {
     v
 }
 
+/// Per-string state needed to drive the Tier 2.1 time-varying mistuning.
+///
+/// At construction time each string gets a fixed integer delay-line length
+/// `n_int`, plus a known `compensation` amount (the LPF + dispersion AP
+/// phase delay reserved inside `delay_length_compensated`). The total
+/// loop period is therefore `n_int + frac + compensation`, where only
+/// `frac` is dynamically modulatable (`KsString::set_tune_frac`).
+///
+/// To shift the string by `cents` from its base frequency we compute the
+/// new total period `sr / (base_freq * 2^(cents/1200))` and back out the
+/// fractional component as `target_total - n_int - compensation`. Sub-
+/// sample modulations stay inside `[0, 1)` and avoid buffer resizing;
+/// for cent magnitudes large enough to push out of that range we clamp
+/// (in practice the per-note half-spread stays under 5 c, which
+/// corresponds to ~0.5 sample at C2).
+struct StringTuningState {
+    /// Static cent offset used at construction (sign defines the symmetric
+    /// fan-out: `-half_spread .. +half_spread` across the unison).
+    sign_cents: f32,
+    /// Base period in samples (`sr / freq_string_at_attack`).
+    base_total_delay: f32,
+    /// Integer delay-line length picked at construction.
+    n_int: usize,
+    /// LPF + dispersion-AP phase delay reserved at construction.
+    compensation: f32,
+    /// Current (most-recent) fractional delay command — kept for diagnostics
+    /// and to allow callers to read back the current effective tuning.
+    current_frac: f32,
+}
+
 pub struct PianoVoice {
     /// Detuned KS strings (count comes from `PianoPreset::string_count`).
     /// `Vec` rather than a fixed array so a single struct serves all
     /// presets — this is the issue #2 transition fix.
     strings: Vec<KsString>,
+    /// Per-string time-varying tuning state, parallel to `strings`.
+    string_tuning: Vec<StringTuningState>,
     /// Optional longitudinal mode per transverse string.
     longitudinal: Vec<LongitudinalString>,
     release: ReleaseEnvelope,
@@ -207,6 +240,20 @@ pub struct PianoVoice {
     /// 1.0 / string_count — applied to the string sum so the in-phase
     /// attack peak stays bounded regardless of preset.
     string_norm: f32,
+    /// Sample rate cached for the time-varying detune calculation.
+    sr: f32,
+    /// Sample counter since note-on. `t_since_attack = samples_since_attack / sr`.
+    /// Drives `MistuneCurve::evaluate` for the half-spread amplitude envelope.
+    samples_since_attack: u32,
+    /// Pre-resolved curve for this voice's MIDI note. Cached so the per-
+    /// sample inner loop doesn't repeat the table interpolation.
+    curve: MistuneCurve,
+    /// `1` = update fractional-delay AP every sample, otherwise update
+    /// every Nth sample. The mistuning envelope changes on a tau ≥ 0.3 s
+    /// time scale, so a 32-sample update period (~0.7 ms at 44.1 kHz)
+    /// is well below any audible LFO step. Saves ~3 % CPU on the hot path
+    /// and keeps the existing `step()` cost unchanged for non-piano voices.
+    detune_update_period: u32,
 }
 
 impl PianoVoice {
@@ -235,7 +282,17 @@ impl PianoVoice {
             preset.decay_base - preset.decay_slope * high
         };
 
-        let mk = |freq_string: f32| -> KsString {
+        // We need to compute the LPF+dispersion compensation per-string so
+        // that the time-varying detune can solve `target_frac = total_delay
+        // - n_int - compensation`. The compensation matches the formula
+        // baked into `KsString::delay_length_compensated`.
+        let compensation_for = |ap_coef: f32| -> f32 {
+            let lpf_delay = 0.5_f32;
+            let disp_delay = (1.0 - ap_coef) / (1.0 + ap_coef);
+            lpf_delay + disp_delay + 0.5
+        };
+
+        let mk = |freq_string: f32| -> (KsString, f32, usize, f32) {
             let partial_count = ((sr * 0.5 / freq_string.max(1.0)).floor() as usize).max(1);
             let ap = dispersion_allpass_coeff(midi_note, partial_count);
             let (n, _frac) = KsString::delay_length_compensated(sr, freq_string, ap);
@@ -249,10 +306,45 @@ impl PianoVoice {
                 let hammer_w = piano_hammer_width(velocity);
                 piano_hammer_excitation(n, hammer_w, amp)
             };
-            KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
-                .with_attack_lpf(sr, 0.0, 0.97, 0.97)
+            let s = KsString::with_buf(sr, freq_string, buf, decay_for(freq_string), ap)
+                .with_attack_lpf(sr, 0.0, 0.97, 0.97);
+            let total = sr / freq_string.max(1.0);
+            (s, total, n, compensation_for(ap))
         };
-        let strings: Vec<KsString> = detunes.iter().map(|d| mk(freq * *d)).collect();
+        let mut strings: Vec<KsString> = Vec::with_capacity(detunes.len());
+        let mut string_tuning: Vec<StringTuningState> = Vec::with_capacity(detunes.len());
+        // Static cent fan-out the preset would have used pre-T2.1 — kept
+        // as the per-string `unit_sign` distribution. We do NOT bake the
+        // static detune into each string's construction-time delay-line
+        // length anymore; instead all strings start at the centre `freq`
+        // and the entire fan-out is applied dynamically via
+        // `update_dynamic_detune`. This matches the brief's physics:
+        // strings start beating in phase at the attack, then drift apart
+        // as the per-string AP coefficients separate over `tau`.
+        let static_cents: Vec<f32> = detunes.iter().map(|d| 1200.0 * d.log2()).collect();
+        let max_static_abs = static_cents
+            .iter()
+            .copied()
+            .map(f32::abs)
+            .fold(0.0_f32, f32::max)
+            .max(1e-6);
+        for sc in &static_cents {
+            // All strings at centre frequency at construction.
+            let (s, total, n_int, comp) = mk(freq);
+            strings.push(s);
+            // `unit_sign` in `[-1, +1]` defines where this string sits in
+            // the symmetric fan-out. Multiplied by
+            // `MistuneCurve::evaluate(t)` per-sample to give the actual
+            // cent offset.
+            let unit_sign = sc / max_static_abs;
+            string_tuning.push(StringTuningState {
+                sign_cents: unit_sign,
+                base_total_delay: total,
+                n_int,
+                compensation: comp,
+                current_frac: total - n_int as f32 - comp,
+            });
+        }
 
         // Longitudinal strings (same count and tuning as transverse)
         let mut longitudinal = Vec::with_capacity(strings.len());
@@ -273,8 +365,10 @@ impl PianoVoice {
         } else {
             1.0 / (preset.string_count as f32)
         };
+        let curve = curve_for_midi(midi_note);
         Self {
             strings,
+            string_tuning,
             longitudinal,
             release: ReleaseEnvelope::new(preset.release_sec, sr),
             soundboard,
@@ -283,6 +377,40 @@ impl PianoVoice {
             wet_gain: preset.wet_gain,
             long_gain: preset.long_gain,
             string_norm,
+            sr,
+            samples_since_attack: 0,
+            curve,
+            // 32-sample update — see field doc. Single-string presets skip
+            // the update entirely (no inter-string beating to drive).
+            detune_update_period: if preset.string_count <= 1 { 0 } else { 32 },
+        }
+    }
+
+    /// Compute and apply the per-string fractional-delay update for the
+    /// current sample-since-attack count. Cheap fast path when called
+    /// frequently — the trig is just `exp2`/`floor`/`max`.
+    #[inline]
+    fn update_dynamic_detune(&mut self) {
+        if self.detune_update_period == 0 || self.string_tuning.is_empty() {
+            return;
+        }
+        let t_sec = self.samples_since_attack as f32 / self.sr.max(1.0);
+        // Half-spread amplitude in cents at the current time. Floored to
+        // MIN_HALF_SPREAD_CENTS so the time-varying detune always produces
+        // a measurable inter-string offset across the full keyboard.
+        let half = self.curve.evaluate(t_sec).max(MIN_HALF_SPREAD_CENTS);
+        for (state, string) in self.string_tuning.iter_mut().zip(self.strings.iter_mut()) {
+            // Per-string cent offset = unit_sign * dynamic_half_spread.
+            // `unit_sign` is the construction-time fan-out scaled to ±1.
+            let cents = state.sign_cents * half;
+            let ratio = (cents / 1200.0).exp2();
+            let target_total = state.base_total_delay / ratio;
+            let target_frac = target_total - state.n_int as f32 - state.compensation;
+            // Sub-sample regime: target_frac stays in [0, 1) for cents in
+            // roughly ±10 c at any pitch; clamp anyway for safety.
+            let frac = target_frac.clamp(0.0, 0.999);
+            string.set_tune_frac(frac);
+            state.current_frac = frac;
         }
     }
 }
@@ -299,7 +427,26 @@ impl VoiceImpl for PianoVoice {
         let wet_gain = self.wet_gain;
         let long_gain = self.long_gain;
         let string_norm = self.string_norm;
+        let detune_period = self.detune_update_period;
+        // Apply once at the start of every render block so the very first
+        // sample after note-on already reflects `c0` rather than
+        // construction-time static detune.
+        if detune_period != 0 {
+            self.update_dynamic_detune();
+        }
         for sample in buf.iter_mut() {
+            // 0. Time-varying mistuning: every `detune_period` samples,
+            //    re-solve the per-string fractional-delay AP coefficient
+            //    from the current `MistuneCurve::evaluate(t)`. This is the
+            //    Tier 2.1 detune-beat hook — at construction time the
+            //    strings sit at the static fan-out, then the half-spread
+            //    decays from `c0` toward `c_inf` over `tau`.
+            if detune_period != 0
+                && (self.samples_since_attack % detune_period) == 0
+                && self.samples_since_attack != 0
+            {
+                self.update_dynamic_detune();
+            }
             // 1. Inject the previous-sample soundboard output back into
             //    every string via the bridge. One-sample delay keeps the
             //    feedback loop strictly causal (no algebraic loop).
@@ -325,6 +472,7 @@ impl VoiceImpl for PianoVoice {
             // 4. Mix dry strings + wet soundboard + longitudinal into the audio bus.
             let env = self.release.step();
             *sample += (s_avg * dry_gain + board_out * wet_gain + s_long_total * long_gain) * env;
+            self.samples_since_attack = self.samples_since_attack.saturating_add(1);
         }
     }
     fn release_env(&self) -> Option<&ReleaseEnvelope> {

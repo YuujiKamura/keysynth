@@ -195,6 +195,11 @@ path = "src/bin/extract_dump.rs"
 required-features = ["native"]
 
 [[bin]]
+name = "extract_mistuning"
+path = "src/bin/extract_mistuning.rs"
+required-features = ["native"]
+
+[[bin]]
 name = "render_modal"
 path = "src/bin/render_modal.rs"
 required-features = ["native"]
