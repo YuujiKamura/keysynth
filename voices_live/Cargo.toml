@@ -5,6 +5,14 @@ edition = "2021"
 description = "Hot-reloadable voice DSP for keysynth. Edit src/lib.rs, save, hear it."
 publish = false
 
+# Self-contained workspace root. PR #41's keysynth crate now declares
+# `[workspace]` at the top level (with `cp-core` as a member), and
+# without this table cargo would auto-absorb every scratch copy of
+# voices_live/ that the cp_smoke integration tests stamp out under
+# target/cp-tests/. Empty [workspace] makes this crate its own root
+# regardless of where the directory ends up on disk.
+[workspace]
+
 [lib]
 # cdylib gives us a .dll / .so / .dylib with C ABI for libloading. The host
 # binary loads us through `keysynth_live_*` extern "C" symbols defined in

@@ -1,3 +1,11 @@
+[workspace]
+# Workspace introduced for the `cp-core` substrate split (PR #41).
+# `voices_live/` stays out of the workspace so it can rebuild
+# independently as a hot-reloaded cdylib without dragging in the rest
+# of the build graph.
+members = ["cp-core"]
+exclude = ["voices_live"]
+
 [package]
 name = "keysynth"
 version = "0.1.0"
@@ -29,6 +37,12 @@ native = [
     "dep:libloading",
     "dep:notify",
     "dep:arc-swap",
+    # Voice Control Protocol (CP): keysynth is the first consumer of
+    # the workspace-local `cp-core` JSON-RPC 2.0 substrate. ksctl CLI
+    # client lives in this crate too. cp-core itself has zero
+    # third-party RPC dependencies (std + serde + serde_json only)
+    # — see `cp-core/README.md` for the substrate philosophy.
+    "dep:cp-core",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -82,6 +96,12 @@ notify = { version = "6", optional = true }
 # arc-swap: wait-free atomic Arc swap for handing the latest live
 # factory from the watcher thread to the MIDI callback. Native-only.
 arc-swap = { version = "1.7", optional = true }
+# cp-core: workspace-local JSON-RPC 2.0 substrate over TCP localhost.
+# Built deliberately vendor-neutral — no jsonrpsee / rmcp / tonic /
+# other third-party RPC SDKs — so it can be reused across the rest
+# of the studio (ghostty-win, photo-ai-lisp, etc.) without taking on
+# someone else's protocol opinions.
+cp-core = { path = "cp-core", optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -228,4 +248,14 @@ required-features = ["native"]
 [[bin]]
 name = "render_nsf"
 path = "src/bin/render_nsf.rs"
+required-features = ["native"]
+
+# ksctl: Control Protocol CLI client. Connects to the keysynth GUI's
+# CP server (started with `--cp`) over a named pipe (Windows) or
+# Unix-socket (Linux/macOS) and drives slot load/swap/render commands.
+# Native-only: wasm32 has no pipe/socket access, and ksctl is a separate
+# CLI process anyway.
+[[bin]]
+name = "ksctl"
+path = "src/bin/ksctl.rs"
 required-features = ["native"]

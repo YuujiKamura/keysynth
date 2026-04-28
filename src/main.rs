@@ -28,6 +28,7 @@ use cpal::{SampleFormat, StreamConfig};
 use midir::{Ignore, MidiInput};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
+use keysynth::cp::{self, Server as CpServer};
 use keysynth::live_reload::Reloader;
 use keysynth::reverb::{self, Reverb};
 use keysynth::sfz::SfzPlayer;
@@ -80,6 +81,15 @@ struct Args {
     /// `bench-out/REF/sfz_salamander_multi/modal_lut.json` and falls back
     /// to the hardcoded C4 entry if that path doesn't exist.
     modal_lut: Option<PathBuf>,
+    /// Voice Control Protocol (CP) opt-in. When true, keysynth binds a
+    /// local-only named pipe (Windows) / Unix-socket (Linux/macOS) that
+    /// `ksctl` can drive: load/swap voice DLLs, render to WAV
+    /// headlessly, etc. Default OFF so a bare `keysynth` invocation has
+    /// no IPC surface and the trust boundary is unchanged from PR #40.
+    cp_enabled: bool,
+    /// Optional override for the CP endpoint path. Takes precedence
+    /// over the platform default (which honours `KEYSYNTH_CP`).
+    cp_endpoint: Option<String>,
 }
 
 impl Default for Args {
@@ -119,6 +129,8 @@ impl Default for Args {
             // Issue #4 phase 1.
             mix_mode: MixMode::ParallelComp,
             modal_lut: None,
+            cp_enabled: false,
+            cp_endpoint: None,
         }
     }
 }
@@ -196,6 +208,16 @@ fn parse_args() -> Result<Args, String> {
                 let v = iter.next().ok_or("--mix-mode needs a label")?;
                 out.mix_mode = MixMode::from_label(&v)
                     .ok_or_else(|| format!("bad --mix-mode: {v} (plain|limiter|parallel-comp)"))?;
+            }
+            "--cp" => {
+                // Opt-in voice Control Protocol server. Default OFF for
+                // security; with it on, keysynth binds a local-only
+                // pipe/socket that ksctl can drive.
+                out.cp_enabled = true;
+            }
+            "--cp-endpoint" => {
+                out.cp_enabled = true;
+                out.cp_endpoint = Some(iter.next().ok_or("--cp-endpoint needs a path")?);
             }
             "--help" | "-h" => {
                 print_help();
@@ -933,6 +955,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Launch egui dashboard. The cpal Stream and midir InputConnection are
     // moved into the App struct so they live as long as the GUI window.
+    // -- Voice Control Protocol server (--cp opt-in) --
+    //
+    // Generalises live-reload's single-watch slot into N named slots
+    // an external CLI (`ksctl`) can drive. Local pipe/socket only,
+    // off by default. Requires a Reloader to host the slot pool, so
+    // it's silently skipped if --cp was passed but live-reload didn't
+    // initialise (no voices_live/ found). Spawned here, after sr_hz
+    // is known from the audio stream, so render ops use the same
+    // sample rate the audio device is running at.
+    let cp_server: Option<CpServer> = if args.cp_enabled {
+        match LIVE_RELOADER.get() {
+            Some(reloader) => {
+                let endpoint = cp::resolve_endpoint(args.cp_endpoint.as_deref());
+                match cp::start(reloader.clone(), sr_hz, &endpoint) {
+                    Ok(srv) => {
+                        eprintln!("keysynth: CP server on {}", srv.endpoint);
+                        Some(srv)
+                    }
+                    Err(e) => {
+                        eprintln!("keysynth: CP server failed to bind: {e}");
+                        None
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "keysynth: --cp passed but live-reload disabled; CP needs a Reloader. \
+                     Skipping."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     ui::run_app(ui::AppContext {
         stream,
         midi_conn: _conn,
@@ -948,6 +1006,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         startup_sf2_path: args.sf2.clone(),
         startup_engine: args.engine,
         live_reloader: LIVE_RELOADER.get().cloned(),
+        cp_server,
     })?;
 
     eprintln!("keysynth: stopping");

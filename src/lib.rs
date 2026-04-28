@@ -27,6 +27,8 @@ pub mod analysis;
 #[cfg(feature = "native")]
 pub mod chiptune_import;
 #[cfg(feature = "native")]
+pub mod cp;
+#[cfg(feature = "native")]
 pub mod drums;
 #[cfg(feature = "native")]
 pub mod dsp;
