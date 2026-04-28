@@ -969,6 +969,74 @@ impl KsString {
 }
 
 // ---------------------------------------------------------------------------
+// SmallFir<N>: fixed-size linear-phase FIR primitive used to shape the
+// bridge admittance feedback path inside `PianoVoice`. Generic on tap count
+// so the soundboard ↔ string filter can stay stack-allocated and the const
+// `BRIDGE_ADMITTANCE_FIR_COEFS` table baked in at compile time.
+//
+// The filter is a textbook direct-form FIR with an internal `[f32; N]`
+// delay line; `process(x)` performs one sample of `y[n] = sum_k coefs[k] *
+// x[n-k]`. We deliberately keep N small (≤ 8) so the unrolled inner loop
+// stays in L1 and a per-sample call from a piano voice's hot path stays
+// well under 1 % CPU on the harness benchmarks.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct SmallFir<const N: usize> {
+    coefs: [f32; N],
+    /// `state[0]` = most-recent sample, `state[N-1]` = oldest.
+    state: [f32; N],
+}
+
+impl<const N: usize> SmallFir<N> {
+    pub const fn new(coefs: [f32; N]) -> Self {
+        Self {
+            coefs,
+            state: [0.0; N],
+        }
+    }
+
+    /// Sum of coefficients = `H(e^j0)` = the FIR's DC gain. Useful for
+    /// callers that want to design a filter with a particular passband
+    /// gain and verify the coefficient table didn't drift.
+    pub fn dc_gain(&self) -> f32 {
+        let mut s = 0.0;
+        let mut i = 0;
+        while i < N {
+            s += self.coefs[i];
+            i += 1;
+        }
+        s
+    }
+
+    /// Per-sample step. Shifts the internal state right by one (oldest
+    /// drops off), inserts `x` at the head, then convolves against the
+    /// coefficient vector. For N ≤ 8 the shift is fully unrolled by LLVM
+    /// in release builds.
+    #[inline]
+    pub fn process(&mut self, x: f32) -> f32 {
+        let mut i = N - 1;
+        while i > 0 {
+            self.state[i] = self.state[i - 1];
+            i -= 1;
+        }
+        self.state[0] = x;
+        let mut y = 0.0_f32;
+        let mut k = 0;
+        while k < N {
+            y += self.coefs[k] * self.state[k];
+            k += 1;
+        }
+        y
+    }
+
+    /// Reset internal state to all zeros without changing coefficients.
+    pub fn reset(&mut self) {
+        self.state = [0.0; N];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hammer excitation (shared by ks / ks-rich)
 // ---------------------------------------------------------------------------
 //
