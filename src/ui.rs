@@ -23,6 +23,7 @@ use eframe::egui;
 use midir::MidiInputConnection;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 
+use crate::cp::Server as CpServer;
 use crate::gm::{GM_FAMILIES, GM_INSTRUMENTS};
 use crate::live_reload::{Reloader, Status as LiveStatus};
 use crate::sfz::SfzPlayer;
@@ -56,6 +57,11 @@ pub struct AppContext {
     /// running outside the repo, etc.). When None, the "Live (hot edit)"
     /// browser entry is hidden and `Engine::Live` falls back to silence.
     pub live_reloader: Option<Reloader>,
+    /// Voice Control Protocol server handle. `None` unless `--cp` was
+    /// passed. When `Some`, the side panel renders the CP status
+    /// (endpoint + connection count); when `None`, the panel hides the
+    /// CP block entirely so the unmodified GUI experience is preserved.
+    pub cp_server: Option<CpServer>,
 }
 
 pub fn run_app(ctx: AppContext) -> Result<(), Box<dyn std::error::Error>> {
@@ -678,6 +684,43 @@ impl eframe::App for KeysynthApp {
                     if ui.small_button("Rebuild now").clicked() {
                         reloader.request_rebuild("manual");
                     }
+                }
+
+                // ─── CP server status ─────────────────────────────────
+                //
+                // Only renders when --cp was passed at startup. Surfaces
+                // the bound endpoint + live connection count so the user
+                // can confirm ksctl invocations are reaching the right
+                // server (esp. when KEYSYNTH_CP overrides the path).
+                if let Some(cp) = self.ctx.cp_server.as_ref() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("CP server")
+                            .strong()
+                            .color(egui::Color32::from_rgb(220, 220, 255)),
+                    );
+                    let color = if cp.is_ready() {
+                        egui::Color32::from_rgb(120, 220, 120)
+                    } else {
+                        egui::Color32::from_rgb(220, 200, 100)
+                    };
+                    let text = if cp.is_ready() {
+                        format!(
+                            "running ({} connection{})",
+                            cp.connection_count(),
+                            if cp.connection_count() == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        "binding...".to_string()
+                    };
+                    ui.colored_label(color, &text);
+                    ui.label(
+                        egui::RichText::new(format!("endpoint: {}", cp.endpoint))
+                            .small()
+                            .monospace(),
+                    );
+                    ui.label(egui::RichText::new(format!("sr: {} Hz", cp.sr_hz)).small());
                 }
             });
 
