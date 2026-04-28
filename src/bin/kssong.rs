@@ -55,6 +55,7 @@ struct PlayArgs {
     bars: Option<usize>,
     key: Option<Key>,
     out_path: PathBuf,
+    midi_out_path: Option<PathBuf>,
     sfz_path: Option<PathBuf>,
     modal_lut_path: Option<PathBuf>,
 }
@@ -72,7 +73,10 @@ fn print_help() {
          --key KEY         base key for roman numerals (example: C, F#, Bb)\n  \
          --sfz PATH        required when --voice sfz-piano\n  \
          --modal-lut PATH  optional modal LUT override for piano-modal\n  \
-         --out PATH        output WAV path (required)"
+         --out PATH        output WAV path (required)\n  \
+         --midi-out PATH   also dump the generated SMF to PATH (so the same\n  \
+                           progression can be re-rendered through any\n  \
+                           render_midi engine, including --engine guitar-stk)"
     );
 }
 
@@ -101,6 +105,7 @@ fn parse_args() -> Result<PlayArgs, String> {
     let mut bars = None;
     let mut key = None;
     let mut out_path: Option<PathBuf> = None;
+    let mut midi_out_path: Option<PathBuf> = None;
     let mut sfz_path = None;
     let mut modal_lut_path = None;
 
@@ -142,6 +147,11 @@ fn parse_args() -> Result<PlayArgs, String> {
             "--out" => {
                 out_path = Some(PathBuf::from(iter.next().ok_or("--out needs a value")?));
             }
+            "--midi-out" => {
+                midi_out_path = Some(PathBuf::from(
+                    iter.next().ok_or("--midi-out needs a value")?,
+                ));
+            }
             "--sfz" => {
                 sfz_path = Some(PathBuf::from(iter.next().ok_or("--sfz needs a value")?));
             }
@@ -166,6 +176,7 @@ fn parse_args() -> Result<PlayArgs, String> {
         bars,
         key,
         out_path: out_path.ok_or("--out is required")?,
+        midi_out_path,
         sfz_path,
         modal_lut_path,
     })
@@ -348,6 +359,19 @@ fn run_play(args: PlayArgs) -> Result<(), String> {
     let total_bars = args.bars.unwrap_or(chords.len());
     let expanded = expand_progression(&chords, total_bars);
     let midi_bytes = build_smf_bytes(&expanded, args.bpm, args.voicing)?;
+    if let Some(path) = args.midi_out_path.as_ref() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        std::fs::write(path, &midi_bytes)
+            .map_err(|e| format!("write midi-out {}: {e}", path.display()))?;
+        eprintln!(
+            "kssong: wrote MIDI {} ({} bytes)",
+            path.display(),
+            midi_bytes.len()
+        );
+    }
     render_to_wav(&args, &midi_bytes)?;
     eprintln!(
         "kssong: wrote {} (bars={} bpm={} voicing={})",
