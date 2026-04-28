@@ -256,6 +256,49 @@ impl ReleaseEnvelope {
         self.rel_mul
     }
 
+    /// Pedal-aware variant of `step`. The optional `pedal_sustain` value
+    /// (0..=1) modulates the decay factor: `0.0` is bit-identical to
+    /// `step()`, `1.0` collapses the per-sample decay close to unity so
+    /// the release tail rings on for several seconds — what holding the
+    /// piano sustain pedal (MIDI CC 64) does on a real grand.
+    ///
+    /// # Tier 2.3 (issue #32)
+    ///
+    /// Conklin (1996, JASA 100, *Design and tone in the mechanoacoustic
+    /// piano III*) and Fletcher & Rossing (1991, *The Physics of Musical
+    /// Instruments*, ch. 12) both describe the damper-felt geometry: the
+    /// pedal lifts every damper off every string, and even after the key
+    /// goes up the string keeps ringing because no felt is engaged. The
+    /// continuous-value parameter here also models *half-pedalling*: a
+    /// partially-engaged damper still attenuates the string, just less.
+    ///
+    /// Math: the per-sample decay factor `rel_step ∈ [0, 1)` is moved
+    /// toward 1.0 by an amount proportional to `pedal_sustain`. We cap
+    /// the maximum lift at 0.95 so even a fully-pressed pedal still has
+    /// a slow finite decay — a real piano sustain pedal does NOT make
+    /// the string ring forever, it just stretches the tail to several
+    /// seconds.
+    ///
+    /// `effective_step = 1.0 - (1.0 - rel_step) * (1.0 - 0.95 * pedal)`
+    ///
+    /// At `pedal = 0`: `effective_step = rel_step` → identical to `step()`.
+    /// At `pedal = 1`: `effective_step ≈ 1.0 - 0.05 * (1.0 - rel_step)`
+    /// — only 5 % of the original decay rate per sample.
+    #[inline]
+    pub fn step_with_pedal(&mut self, pedal_sustain: f32) -> f32 {
+        if self.released {
+            let pedal = pedal_sustain.clamp(0.0, 1.0);
+            // pedal=0 → factor = rel_step (bit-identical with `step()`).
+            let effective_step = if pedal == 0.0 {
+                self.rel_step
+            } else {
+                1.0 - (1.0 - self.rel_step) * (1.0 - 0.95 * pedal)
+            };
+            self.rel_mul *= effective_step;
+        }
+        self.rel_mul
+    }
+
     /// Current multiplier without advancing. Useful for tests.
     #[inline]
     pub fn current(&self) -> f32 {
@@ -314,6 +357,16 @@ pub trait VoiceImpl: Send {
             .map(|e| e.is_releasing())
             .unwrap_or(false)
     }
+
+    /// Tier 2.3 (issue #32): update the voice's view of MIDI CC 64
+    /// sustain pedal. Called by the audio thread once per buffer with
+    /// the current `LiveParams::pedal_sustain` snapshot. The default
+    /// impl is a no-op so non-piano voices (square / ks / fm / koto /
+    /// modal — the engines that have no damper to lift in the first
+    /// place) keep their pre-T2.3 behaviour bit-identically. Piano
+    /// voices override this to track the value and feed it into their
+    /// `ReleaseEnvelope::step_with_pedal`.
+    fn set_pedal_sustain(&mut self, _pedal: f32) {}
 }
 
 pub struct Voice {
@@ -348,6 +401,16 @@ pub struct LiveParams {
     /// Final-stage bus mixing strategy. Live-switchable from GUI / CLI;
     /// see `MixMode` for the available modes (issue #4).
     pub mix_mode: MixMode,
+    /// MIDI CC 64 sustain pedal, continuous 0..=1. `0.0` = damper down
+    /// (every released voice fades on its preset's natural release time);
+    /// `1.0` = damper fully off (released voices ring on for several
+    /// seconds). Half-pedal positions interpolate linearly per
+    /// `ReleaseEnvelope::step_with_pedal`.
+    ///
+    /// Tier 2.3 (issue #32). The MIDI callback writes this on every CC
+    /// 64 message; the audio thread snapshots it once per buffer and
+    /// passes the value into each voice's `set_pedal_sustain`.
+    pub pedal_sustain: f32,
 }
 
 /// Live-tunable parameters for `Engine::PianoModal`. Shared via a
@@ -1331,6 +1394,83 @@ mod tests {
             );
             prev = v;
         }
+    }
+
+    // ---- T2.3 pedal-aware variants ------------------------------------------
+
+    #[test]
+    fn release_env_pedal_zero_bit_identical_to_step() {
+        // Hard rule for the T2.3 numerical gate: pedal=0.0 must produce
+        // the exact same multiplier sequence as the legacy `step()` API.
+        let mut a = ReleaseEnvelope::new(0.300, SR);
+        let mut b = ReleaseEnvelope::new(0.300, SR);
+        a.trigger();
+        b.trigger();
+        for _ in 0..10_000 {
+            let va = a.step();
+            let vb = b.step_with_pedal(0.0);
+            assert_eq!(va, vb, "pedal=0 must be bit-identical to step()");
+        }
+    }
+
+    #[test]
+    fn release_env_pedal_one_decays_far_slower() {
+        // At pedal=1.0 the per-sample decay rate is reduced to ~5 %
+        // of the original, so a 0.3 s release becomes a multi-second
+        // ring-out. After the same number of post-trigger samples the
+        // pedal=1 envelope must be substantially closer to unity than
+        // the pedal=0 envelope.
+        let mut a = ReleaseEnvelope::new(0.300, SR);
+        let mut b = ReleaseEnvelope::new(0.300, SR);
+        a.trigger();
+        b.trigger();
+        let n = (SR * 0.5) as usize; // 0.5 s post-release
+        let mut last_a = 1.0;
+        let mut last_b = 1.0;
+        for _ in 0..n {
+            last_a = a.step_with_pedal(0.0);
+            last_b = b.step_with_pedal(1.0);
+        }
+        // pedal=0 has decayed well below threshold (0.5 s ≫ 0.3 s release).
+        assert!(last_a < 0.01, "pedal=0 should be near-silent: {}", last_a);
+        // pedal=1 has barely decayed.
+        assert!(last_b > 0.5, "pedal=1 should still be ringing: {}", last_b);
+    }
+
+    #[test]
+    fn release_env_pedal_release_mid_pivots_decay() {
+        // Hold pedal=1 for the first chunk, then drop to pedal=0 for the
+        // second chunk. After the second chunk the multiplier must be
+        // distinctly lower than the always-pedal=1 reference and
+        // distinctly higher than the always-pedal=0 reference — proving
+        // the envelope tracks live changes to the pedal value.
+        let mut held = ReleaseEnvelope::new(0.300, SR);
+        let mut released = ReleaseEnvelope::new(0.300, SR);
+        let mut mixed = ReleaseEnvelope::new(0.300, SR);
+        held.trigger();
+        released.trigger();
+        mixed.trigger();
+        let chunk = (SR * 0.5) as usize;
+        // First 0.5 s: all three are released, mixed/held use pedal=1.
+        let mut h = 0.0;
+        let mut r = 0.0;
+        let mut m = 0.0;
+        for _ in 0..chunk {
+            h = held.step_with_pedal(1.0);
+            r = released.step_with_pedal(0.0);
+            m = mixed.step_with_pedal(1.0);
+        }
+        // Second 0.5 s: held stays at pedal=1, mixed drops to pedal=0,
+        // released stays at pedal=0.
+        for _ in 0..chunk {
+            h = held.step_with_pedal(1.0);
+            r = released.step_with_pedal(0.0);
+            m = mixed.step_with_pedal(0.0);
+        }
+        assert!(
+            r < m && m < h,
+            "expected released < mixed < held, got r={r:.4} m={m:.4} h={h:.4}"
+        );
     }
 
     #[test]

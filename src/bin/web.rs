@@ -708,6 +708,7 @@ registerProcessor('keysynth-processor', KeysynthProcessor);
                     sf_program: 0,
                     sf_bank: 0,
                     mix_mode: MixMode::ParallelComp,
+                    pedal_sustain: 0.0,
                 })),
                 sample_rate: 0,
                 audio: Rc::new(RefCell::new(None)),
