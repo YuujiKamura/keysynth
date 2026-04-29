@@ -260,6 +260,14 @@ struct ManifestEntry {
     context: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    // Optional editorial override for the era bucket. When the
+    // composer string lacks a parsable "(YYYY-YYYY)" range — Anonymous
+    // Renaissance pieces, modern CC0 game-music handles like
+    // "m-malandro" — derive_era() can't classify them, and
+    // genre-broadening (Stage E) needs a hand-curated label like
+    // "Renaissance" or "Game". If `era` is set in the manifest it
+    // wins; otherwise we fall back to derive_era(composer).
+    era: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,7 +303,11 @@ impl LibraryDb {
         for entry in root.entries {
             let id = stem_of(&entry.file);
             let composer_key = composer_lookup_key(&entry.composer);
-            let era = derive_era(&entry.composer);
+            let era = entry
+                .era
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| derive_era(&entry.composer));
             let midi_path = song_dir.join(&entry.file);
 
             tx.execute(
@@ -993,6 +1005,16 @@ fn fold_ascii_lowercase(s: &str) -> String {
 ///   Romantic  1821-1910  (covers late-Romantic guitar virtuosi —
 ///                         Tárrega 1909, Albéniz 1909, Sarasate 1908)
 ///   Modern    > 1910
+///
+/// Stage E (cross-genre broadening) introduces composer strings that
+/// derive_era genuinely can't classify — Anonymous Renaissance dances
+/// have no death year, modern CC0 game-music handles like
+/// "m-malandro" don't fit any of the four classical buckets. For those
+/// the manifest carries an explicit `era` field (`"Renaissance"`,
+/// `"Game"`, etc.) that import_songs() uses in preference to
+/// derive_era. derive_era itself stays narrow on purpose so existing
+/// `--era Modern` queries don't suddenly start sweeping in folk and
+/// game music.
 fn derive_era(composer: &str) -> Option<String> {
     if composer.to_lowercase().contains("traditional") {
         return Some("Traditional".to_string());
@@ -1090,6 +1112,100 @@ mod tests {
             derive_era("Traditional (American)").as_deref(),
             Some("Traditional")
         );
+        // Stage E: composers without a parsable year range fall
+        // through. import_songs() patches this with the manifest's
+        // explicit `era` field; derive_era itself reports None so
+        // we don't silently misclassify game-music handles as
+        // "Modern".
+        assert_eq!(derive_era("Anonymous").as_deref(), None);
+        assert_eq!(derive_era("m-malandro").as_deref(), None);
+        assert_eq!(derive_era("Anonymous (Renaissance)").as_deref(), None);
+    }
+
+    #[test]
+    fn import_uses_explicit_era_when_composer_has_no_years() {
+        // Stage E genre-broadening: an Anonymous Renaissance dance and
+        // a CC0 game-music handle both have composer strings that
+        // derive_era() can't classify. The manifest's optional `era`
+        // field must override and land in the songs.era column so
+        // jukebox filtering on `era=Renaissance` / `era=Game` works.
+        let tmp = std::env::temp_dir().join(format!(
+            "keysynth_libdb_era_override_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest_path = tmp.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+              "schema_version": 1,
+              "directory": ".",
+              "entries": [
+                {
+                  "file": "anon_pavan.mid",
+                  "title": "Pavan",
+                  "composer": "Anonymous",
+                  "instrument": "guitar",
+                  "license": "Public Domain",
+                  "era": "Renaissance"
+                },
+                {
+                  "file": "boss_battle.mid",
+                  "title": "Frantic Boss Battle",
+                  "composer": "m-malandro",
+                  "instrument": "synth",
+                  "license": "CC0",
+                  "era": "Game"
+                },
+                {
+                  "file": "joplin_entertainer.mid",
+                  "title": "The Entertainer",
+                  "composer": "Scott Joplin (1868-1917)",
+                  "instrument": "piano",
+                  "license": "Public Domain"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        // Bytes content doesn't matter for the import — the import
+        // path doesn't read MIDI, only records the path. Write empty
+        // sentinel files so any later code that stat()s them still
+        // sees something on disk.
+        for f in ["anon_pavan.mid", "boss_battle.mid", "joplin_entertainer.mid"] {
+            std::fs::write(tmp.join(f), b"").unwrap();
+        }
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let n = db.import_songs(&manifest_path).unwrap();
+        assert_eq!(n, 3);
+
+        let mut stmt = db
+            .conn()
+            .prepare("SELECT id, era FROM songs ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("anon_pavan".to_string(), Some("Renaissance".to_string())),
+                ("boss_battle".to_string(), Some("Game".to_string())),
+                // No explicit era → derive_era from "(1868-1917)"
+                // → death year 1917 → Modern bucket.
+                (
+                    "joplin_entertainer".to_string(),
+                    Some("Modern".to_string()),
+                ),
+            ]
+        );
+
+        // Cleanup; failure is non-fatal.
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
