@@ -36,6 +36,8 @@ pub mod cp;
 #[cfg(feature = "native")]
 pub mod drums;
 #[cfg(feature = "native")]
+pub mod gui_cp;
+#[cfg(feature = "native")]
 pub mod dsp;
 #[cfg(feature = "native")]
 pub mod extract;

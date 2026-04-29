@@ -32,9 +32,31 @@ use cpal::{SampleFormat, StreamConfig};
 use eframe::egui;
 use midir::{Ignore, MidiInput, MidiInputConnection};
 
+use keysynth::gui_cp;
 use keysynth::live_reload::{build_and_load, LiveFactory};
 use keysynth::synth::{midi_to_freq, VoiceImpl};
 use keysynth::voice_lib::DecayModel;
+use serde::Serialize;
+use serde_json::json;
+
+/// CP snapshot published by the chord_pad GUI. Mirrors the header bar
+/// state plus a count of currently-active voices so a verifier can
+/// confirm note-on / note-off plumbing without listening to audio.
+#[derive(Clone, Debug, Default, Serialize)]
+struct CpChordPadSnapshot {
+    frame_id: u64,
+    key_pc: u8,
+    octave: i32,
+    velocity: u8,
+    active_voices: usize,
+    midi_active_port: Option<String>,
+    midi_error: Option<String>,
+    midi_port_count: usize,
+    /// Group ids of every chord currently being held (PC keyboard or
+    /// mouse). Lets a verifier assert "the GUI saw this chord trigger"
+    /// without inspecting the audio stream.
+    held_groups: Vec<u32>,
+}
 
 // ---------------------------------------------------------------------------
 // Note dispatch
@@ -322,11 +344,26 @@ struct ChordPadApp {
     midi_conn: Option<MidiInputConnection<()>>,
     midi_error: Option<String>,
     _stream: cpal::Stream,
+    /// CP snapshot bus. Read-only from the verifier's side: chord_pad
+    /// doesn't accept commands yet (chord triggers are tied to PC
+    /// keyboard / MIDI input by design), but exposing state lets a
+    /// verifier confirm the GUI is responsive and observing input.
+    cp_state: gui_cp::State<CpChordPadSnapshot, ()>,
+    _cp_handle: Option<gui_cp::Handle>,
+    cp_frame_id: u64,
 }
 
 impl ChordPadApp {
     fn new(audio: Arc<Mutex<AudioState>>, tx: Sender<NoteCmd>, stream: cpal::Stream) -> Self {
         let midi_ports = list_midi_ports();
+        let cp_state: gui_cp::State<CpChordPadSnapshot, ()> = gui_cp::State::new();
+        let cp_handle = match spawn_chord_pad_cp(cp_state.clone()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("chord_pad: CP server failed to start: {e}");
+                None
+            }
+        };
         Self {
             audio,
             tx,
@@ -340,6 +377,28 @@ impl ChordPadApp {
             midi_conn: None,
             midi_error: None,
             _stream: stream,
+            cp_state,
+            _cp_handle: cp_handle,
+            cp_frame_id: 0,
+        }
+    }
+
+    fn build_cp_snapshot(&self) -> CpChordPadSnapshot {
+        let active_voices = self.audio.lock().map(|a| a.voices.len()).unwrap_or(0);
+        let mut held_groups: Vec<u32> = self.held.values().copied().collect();
+        held_groups.extend(self.mouse_held.iter().copied());
+        held_groups.sort_unstable();
+        held_groups.dedup();
+        CpChordPadSnapshot {
+            frame_id: self.cp_frame_id,
+            key_pc: self.key_pc,
+            octave: self.octave,
+            velocity: self.velocity,
+            active_voices,
+            midi_active_port: self.midi_active_port.clone(),
+            midi_error: self.midi_error.clone(),
+            midi_port_count: self.midi_ports.len(),
+            held_groups,
         }
     }
 
@@ -404,6 +463,10 @@ impl eframe::App for ChordPadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Repaint every frame so PC keyboard polling stays responsive.
         ctx.request_repaint();
+
+        self.cp_frame_id = self.cp_frame_id.wrapping_add(1);
+        let snap = self.build_cp_snapshot();
+        self.cp_state.publish(snap);
 
         self.handle_keyboard(ctx);
 
@@ -627,6 +690,24 @@ fn load_decay_model(crate_root: &Path) -> DecayModel {
         }
         None => DecayModel::default(),
     }
+}
+
+/// Spawn the chord_pad CP server. Read-only for now: exposes
+/// `get_state` (returns `CpChordPadSnapshot`) plus the auto-registered
+/// `ping`. Driving chord triggers over CP isn't part of this stage —
+/// the binary's whole point is humans playing chords through PC
+/// keyboard / MIDI in real time.
+fn spawn_chord_pad_cp(
+    state: gui_cp::State<CpChordPadSnapshot, ()>,
+) -> std::io::Result<gui_cp::Handle> {
+    let endpoint = gui_cp::resolve_endpoint("chord_pad", None);
+    let st_get = state;
+    gui_cp::Builder::new("chord_pad", &endpoint)
+        .register("get_state", move |_p| match st_get.read_snapshot() {
+            Some(s) => gui_cp::encode_result(s),
+            None => Ok(json!({"frame_id": 0, "warming_up": true})),
+        })
+        .serve()
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
