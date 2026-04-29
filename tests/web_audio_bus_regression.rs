@@ -9,11 +9,16 @@
 //! Strategy: render the C-E-G chord through `Engine::PianoModal` at the
 //! browser-typical 48 kHz with the same defaults `WebApp::default` uses
 //! today, then assert peak / RMS / crest-factor thresholds that catch
-//! the known bad regimes:
+//! the known bad regimes.
 //!
-//! - peak ≥ 0.95 → hard clipping (was `0.96` under master=3.0 + Plain)
-//! - rms_dB ≥ -16 → loudness war (was `-15.5 dB` under broken defaults)
-//! - crest_factor ≤ 7 → dynamics squashed (was `5.7` under broken defaults)
+//! Note: issue #13 (`crate::calibration`) wraps `make_voice` in a
+//! per-engine output-level coefficient that brings every voice to
+//! −12 dBFS peak at C4 vel 100. PianoModal's coefficient is ≈0.535,
+//! which shifts the post-bus levels recorded here ≈5 dB lower than
+//! the pre-calibration measurements that motivated the original
+//! thresholds. The bands below were retightened against post-
+//! calibration numbers measured 2026-04-29 so the sandwich still
+//! catches the master=3.0+Plain regime.
 //!
 //! The bin/web.rs module itself is wasm32-only so we can't re-use its
 //! `render_mono_chunk` symbol directly; the math is duplicated here from
@@ -186,10 +191,11 @@ fn web_bus_pianomodal_default_chord_within_thresholds() {
     );
 
     // Threshold strategy: pass on what the *current* master=1.0 +
-    // ParallelComp + reverb=0.3 chain produces (peak ≈ 0.88, rms ≈
-    // -12.3 dB, crest ≈ 3.6 measured) and trip on the OLD broken
-    // master=3.0 + Plain regime (peak ≈ 0.997, rms ≈ -7.4 dB, crest
-    // ≈ 2.33 measured by the sibling sanity test below).
+    // ParallelComp + reverb=0.3 + issue-#13 calibration chain
+    // produces (peak ≈ 0.65, rms ≈ -16.96 dB, crest ≈ 4.59 measured
+    // 2026-04-29) and trip on the OLD broken master=3.0 + Plain
+    // regime (peak ≈ 0.946, rms ≈ -10.85 dB, crest ≈ 3.30 measured
+    // by the sibling sanity test below).
     //
     // The sibling `web_bus_old_master_3_plain_actually_does_clip`
     // test asserts the OLD numbers do trip these thresholds, so the
@@ -200,21 +206,21 @@ fn web_bus_pianomodal_default_chord_within_thresholds() {
     // (output_gain swing, residual_amp tweaks) don't false-alarm but
     // re-broken master values get caught.
     assert!(
-        peak < 0.95,
-        "peak {peak:.3} ≥ 0.95 — hard clipping. Likely master gain \
+        peak < 0.85,
+        "peak {peak:.3} ≥ 0.85 — hard clipping. Likely master gain \
          regressed up or `MixMode` flipped to `Plain` on a hot bus. \
-         (master=3.0 + Plain hit 0.997.)"
+         (master=3.0 + Plain hits 0.946.)"
     );
     assert!(
-        rms_db < -10.0,
-        "rms {rms_db:.2} dB ≥ -10 — bus too loud. Likely a master / \
-         output_gain regression. (master=3.0 + Plain hit -7.4 dB.)"
+        rms_db < -14.0,
+        "rms {rms_db:.2} dB ≥ -14 — bus too loud. Likely a master / \
+         output_gain regression. (master=3.0 + Plain hits -10.85 dB.)"
     );
     assert!(
-        crest > 3.0,
-        "crest factor {crest:.2} ≤ 3 — dynamics squashed nearly to a \
-         square wave. Likely saturating into the tanh wall. \
-         (master=3.0 + Plain hit 2.33.)"
+        crest > 3.5,
+        "crest factor {crest:.2} ≤ 3.5 — dynamics squashed nearly to \
+         a square wave. Likely saturating into the tanh wall. \
+         (master=3.0 + Plain hits 3.30.)"
     );
 }
 
@@ -276,13 +282,13 @@ fn web_bus_old_master_3_plain_actually_does_clip() {
          rms={rms:.4} ({rms_db:.2} dB)  crest={crest:.2}"
     );
 
-    let trips_peak = peak >= 0.95;
-    let trips_rms = rms_db >= -10.0;
-    let trips_crest = crest <= 3.0;
+    let trips_peak = peak >= 0.85;
+    let trips_rms = rms_db >= -14.0;
+    let trips_crest = crest <= 3.5;
     assert!(
         trips_peak || trips_rms || trips_crest,
         "Sanity check failed: the OLD master=3.0+Plain regime did NOT \
-         trip any of peak<0.95 / rms<-16 dB / crest>7. The thresholds \
+         trip any of peak≥0.85 / rms≥-14 dB / crest≤3.5. The thresholds \
          in `web_bus_pianomodal_default_chord_within_thresholds` are \
          too loose to catch the regression they exist for."
     );
