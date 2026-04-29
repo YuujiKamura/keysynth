@@ -87,7 +87,10 @@ pub fn run_app(ctx: AppContext) -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "keysynth",
         native_options,
-        Box::new(|_cc| Ok(Box::new(KeysynthApp::new(ctx)))),
+        Box::new(|cc| {
+            setup_japanese_fonts(&cc.egui_ctx);
+            Ok(Box::new(KeysynthApp::new(ctx)))
+        }),
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe error: {e}").into() })?;
 
@@ -398,6 +401,39 @@ impl KeysynthApp {
         self.pending_rename = Some(self.library.slots.len() - 1);
         self.rename_buf = label;
     }
+}
+
+/// Configure egui to use a Japanese font if available.
+///
+/// On Windows, this attempts to load "YuGothM.ttc" from the system font
+/// directory. This is the standard "Yu Gothic Medium" font found on
+/// Windows 10/11. When loaded, it's added to both Proportional and
+/// Monospace families as the fallback after default fonts.
+pub fn setup_japanese_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    #[cfg(target_os = "windows")]
+    {
+        let font_path = "C:\\Windows\\Fonts\\YuGothM.ttc";
+        if std::path::Path::new(font_path).exists() {
+            if let Ok(font_data) = std::fs::read(font_path) {
+                fonts.font_data.insert(
+                    "japanese".to_owned(),
+                    egui::FontData::from_owned(font_data),
+                );
+
+                if let Some(v) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    v.push("japanese".to_owned());
+                }
+
+                if let Some(v) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+                    v.push("japanese".to_owned());
+                }
+            }
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 /// QWERTY → MIDI mapping (FL-Studio-style two-octave layout).

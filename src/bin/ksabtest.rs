@@ -1114,11 +1114,14 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "ksabtest — blind A/B harness",
         options,
-        Box::new(|_cc| match App::new() {
-            Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
-            Err(e) => {
-                eprintln!("ksabtest: init failed: {e}");
-                std::process::exit(2);
+        Box::new(|cc| {
+            keysynth::ui::setup_japanese_fonts(&cc.egui_ctx);
+            match App::new() {
+                Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+                Err(e) => {
+                    eprintln!("ksabtest: init failed: {e}");
+                    std::process::exit(2);
+                }
             }
         }),
     )

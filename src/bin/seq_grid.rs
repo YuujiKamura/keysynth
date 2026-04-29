@@ -421,7 +421,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_title("seq_grid"),
         ..Default::default()
     };
-    eframe::run_native("seq_grid", opts, Box::new(|_cc| Ok(Box::new(app))))
+    eframe::run_native(
+        "seq_grid",
+        opts,
+        Box::new(|cc| {
+            keysynth::ui::setup_japanese_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
+    )
         .map_err(|e| format!("eframe: {e}").into())
 }
 

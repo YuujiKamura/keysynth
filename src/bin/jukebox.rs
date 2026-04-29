@@ -4507,7 +4507,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eframe::run_native(
         "keysynth jukebox",
         options,
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(|cc| {
+            keysynth::ui::setup_japanese_fonts(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe: {e}").into() })?;
     Ok(())
