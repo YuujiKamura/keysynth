@@ -302,6 +302,15 @@ name = "jukebox_lite"
 path = "src/bin/jukebox_lite.rs"
 required-features = ["native"]
 
+# jukebox_lite_c binary: Codex list-view browser.
+# Reuses the same backend modules as `jukebox_lite` but switches to a
+# dense Finder / foobar / Spotify-Songs-style list with an inspector
+# pane instead of a card grid.
+[[bin]]
+name = "jukebox_lite_c"
+path = "src/bin/jukebox_lite_c.rs"
+required-features = ["native"]
+
 # seq_grid binary: standalone egui step-sequencer pattern grid.
 [[bin]]
 name = "seq_grid"
