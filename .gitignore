@@ -107,6 +107,11 @@ reference/*.wav
 # README, even though the global **/*.wav rule above would otherwise hide
 # them. This is the only audio file we redistribute in the repo.
 !bench-out/REF/square_c4_4s.wav
+# Layer 1 Game-era chiptune corpus: 18 AI-composed pulse-wave tracks
+# from github.com/YuujiKamura/ai-chiptune-lab (MIT, owned). Pre-rendered
+# WAVs are committed because there's no source MIDI — the SSOT is a
+# custom JSON schema rendered offline by ai-chiptune-lab/render.py.
+!bench-out/songs/bgm_v*.wav
 !bench-out/REF/sfz_salamander_grand_v3_C4.wav
 !bench-out/REF/README.md
 !bench-out/REF/sfz_salamander_multi/

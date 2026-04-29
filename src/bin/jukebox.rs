@@ -49,6 +49,9 @@ enum Format {
     /// through the user's currently selected voice, which produces a
     /// WAV that the standard decoder path can play.
     Mid,
+    /// Nintendo Sound Format. Rendered via `render_nsf` (GME emulator)
+    /// into a WAV for playback.
+    Nsf,
 }
 
 impl Format {
@@ -57,6 +60,7 @@ impl Format {
             "wav" => Some(Format::Wav),
             "mp3" => Some(Format::Mp3),
             "mid" | "midi" => Some(Format::Mid),
+            "nsf" => Some(Format::Nsf),
             _ => None,
         }
     }
@@ -239,12 +243,14 @@ const AVAILABLE_VOICES: &[&str] = &[
     "ks",
     "fm",
     "sub",
+    "synth-nsf",
 ];
 
 /// Pick a default voice for a MIDI track based on filename heuristic.
 /// Piano-leaning composer prefixes (mozart, satie, albeniz, bach, ...)
 /// route through `piano-modal`; everything else through the STK guitar
-/// voice. Used as the fallback when the user has not yet picked a
+/// voice. NSF files always route through `synth-nsf`.
+/// Used as the fallback when the user has not yet picked a
 /// voice for this track via the GUI dropdown (`play_log.track_voices`).
 fn default_voice_for_midi(path: &Path) -> &'static str {
     let stem = path
@@ -252,6 +258,12 @@ fn default_voice_for_midi(path: &Path) -> &'static str {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if path.extension().and_then(|s| s.to_str()) == Some("nsf") || stem.starts_with("nsf_") {
+        return "synth-nsf";
+    }
+    if stem.starts_with("cc0_") || stem.starts_with("parodius") || stem.starts_with("bgm_v") {
+        return "square";
+    }
     const PIANO_PREFIXES: &[&str] = &[
         "mozart_",
         "satie_",
@@ -286,15 +298,45 @@ fn render_midi_binary_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Build the `CacheKey` for a MIDI file under an explicit voice id.
+/// Where to find the `render_nsf` binary for the NSF preview cache.
+fn render_nsf_binary_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let candidates = if cfg!(windows) {
+        vec!["render_nsf.exe"]
+    } else {
+        vec!["render_nsf"]
+    };
+    candidates
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// Synchronous render-and-store for NSF tracks.
+fn render_nsf_blocking(nsf_path: &Path, voice_id: &str) -> Result<PathBuf, String> {
+    let cache = open_preview_cache()?;
+    let key = build_preview_cache_key(nsf_path, voice_id);
+    let bin = render_nsf_binary_path()
+        .ok_or_else(|| "render_nsf binary not found alongside jukebox".to_string())?;
+
+    // For now we just render track 0. In the future we could parse
+    // voice_id for track number if it's encoded there.
+    let track = 0;
+
+    keysynth::preview_cache::render_nsf_to_cache(&cache, &key, track, &bin)
+        .map_err(|e| format!("render_nsf_to_cache: {e}"))
+}
+
+/// Build the `CacheKey` for a MIDI or NSF file under an explicit voice id.
 /// Pulled out of the resolve flow so the synchronous cache hit check
 /// and the background render-and-store path share the same key
 /// construction. The voice id is whatever the user has currently
 /// picked for this track (or the heuristic default if they have not
 /// touched the picker yet).
-fn build_midi_cache_key(midi_path: &Path, voice_id: &str) -> keysynth::preview_cache::CacheKey {
+fn build_preview_cache_key(track_path: &Path, voice_id: &str) -> keysynth::preview_cache::CacheKey {
     keysynth::preview_cache::CacheKey {
-        song_path: midi_path.to_path_buf(),
+        song_path: track_path.to_path_buf(),
         voice_id: voice_id.to_string(),
         // Voice .dll mtime tracking is wired in `preview_cache::CacheKey`
         // itself (and exercised by the unit tests); the GUI side just
@@ -317,12 +359,12 @@ fn open_preview_cache() -> Result<keysynth::preview_cache::Cache, String> {
 /// if there's already a rendered WAV for the (song, voice) pair.
 /// Used by the GUI thread for the synchronous fast path before
 /// deciding whether to spawn a background render.
-fn lookup_midi_in_preview_cache(
-    midi_path: &Path,
+fn lookup_in_preview_cache(
+    track_path: &Path,
     voice_id: &str,
 ) -> Result<Option<PathBuf>, String> {
     let cache = open_preview_cache()?;
-    let key = build_midi_cache_key(midi_path, voice_id);
+    let key = build_preview_cache_key(track_path, voice_id);
     cache.lookup(&key).map_err(|e| format!("lookup: {e}"))
 }
 
@@ -334,7 +376,7 @@ fn lookup_midi_in_preview_cache(
 /// and after a successful render (foreground or prewarm).
 ///
 /// The sweep stats only the (track, selected-voice) pair so cost stays
-/// O(N midi tracks) rather than O(N × |AVAILABLE_VOICES|). When the
+/// O(N midi/nsf tracks) rather than O(N × |AVAILABLE_VOICES|). When the
 /// user changes their pick we re-stat just that one entry from the
 /// click handler, not the whole catalogue.
 fn snapshot_cached_midi_voices(
@@ -350,14 +392,14 @@ fn snapshot_cached_midi_voices(
     };
     let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for t in tracks {
-        if t.format != Format::Mid {
+        if t.format != Format::Mid && t.format != Format::Nsf {
             continue;
         }
         let voice = selected_voices
             .get(&t.label)
             .cloned()
             .unwrap_or_else(|| default_voice_for_midi(&t.path).to_string());
-        let key = build_midi_cache_key(&t.path, &voice);
+        let key = build_preview_cache_key(&t.path, &voice);
         if matches!(cache.lookup(&key), Ok(Some(_))) {
             out.entry(t.label.clone()).or_default().insert(voice);
         }
@@ -378,7 +420,7 @@ fn refresh_cached_voice_entry(
         Ok(c) => c,
         Err(_) => return,
     };
-    let key = build_midi_cache_key(midi_path, voice_id);
+    let key = build_preview_cache_key(midi_path, voice_id);
     let entry = cached.entry(label.to_string()).or_default();
     if matches!(cache.lookup(&key), Ok(Some(_))) {
         entry.insert(voice_id.to_string());
@@ -399,7 +441,7 @@ fn refresh_cached_voice_entry(
 /// immediately.
 fn render_midi_blocking(midi_path: &Path, voice_id: &str) -> Result<PathBuf, String> {
     let cache = open_preview_cache()?;
-    let key = build_midi_cache_key(midi_path, voice_id);
+    let key = build_preview_cache_key(midi_path, voice_id);
     let bin = render_midi_binary_path()
         .ok_or_else(|| "render_midi binary not found alongside jukebox".to_string())?;
     keysynth::preview_cache::render_to_cache(&cache, &key, voice_id, &bin)
@@ -2008,7 +2050,7 @@ fn spawn_startup_prewarm(
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
-                let key = build_midi_cache_key(&path, &voice_id);
+                let key = build_preview_cache_key(&path, &voice_id);
                 // Cache may have been populated by a peer process
                 // (another jukebox window, a manual ksprerender run)
                 // since `pick_prewarm_targets` last looked. Cheap stat
@@ -2142,10 +2184,26 @@ impl Jukebox {
         //                  starts playback once the WAV is ready.
         let playable_path: PathBuf = if track.format == Format::Mid {
             let voice = self.voice_for(&track.label, &track.path);
-            match lookup_midi_in_preview_cache(&track.path, &voice) {
+            match lookup_in_preview_cache(&track.path, &voice) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
                     self.spawn_midi_render(idx, label, voice);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "jukebox: preview_cache lookup {} ({voice}): {e}",
+                        track.path.display(),
+                    );
+                    return;
+                }
+            }
+        } else if track.format == Format::Nsf {
+            let voice = self.voice_for(&track.label, &track.path);
+            match lookup_in_preview_cache(&track.path, &voice) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    self.spawn_nsf_render(idx, label, voice);
                     return;
                 }
                 Err(e) => {
@@ -2188,6 +2246,37 @@ impl Jukebox {
             .expect("spawn preview-render thread");
         eprintln!(
             "jukebox: render queued ({}) — voice={} (background thread)",
+            path.display(),
+            voice_id,
+        );
+        self.pending_render = Some(PendingRender {
+            track_idx: idx,
+            label,
+            voice_id,
+            started: std::time::Instant::now(),
+            rx,
+            _handle: handle,
+        });
+    }
+
+    /// Spawn a background thread that renders an NSF track.
+    fn spawn_nsf_render(&mut self, idx: usize, label: String, voice_id: String) {
+        let path = match self.tracks.get(idx) {
+            Some(t) => t.path.clone(),
+            None => return,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_for_thread = path.clone();
+        let voice_for_thread = voice_id.clone();
+        let handle = std::thread::Builder::new()
+            .name("preview-render-nsf".into())
+            .spawn(move || {
+                let result = render_nsf_blocking(&path_for_thread, &voice_for_thread);
+                let _ = tx.send(result);
+            })
+            .expect("spawn preview-render-nsf thread");
+        eprintln!(
+            "jukebox: NSF render queued ({}) — voice={} (background thread)",
             path.display(),
             voice_id,
         );
@@ -2369,9 +2458,9 @@ impl Jukebox {
                 // spam errors against an empty cache.
                 let want_path = want.and_then(|idx| self.tracks.get(idx)).and_then(|t| {
                     let label = format!("[{}] {}_{}", t.source, t.piece, t.engine);
-                    if t.format == Format::Mid {
+                    if t.format == Format::Mid || t.format == Format::Nsf {
                         let voice_id = self.voice_for(&label, &t.path);
-                        match lookup_midi_in_preview_cache(&t.path, &voice_id) {
+                        match lookup_in_preview_cache(&t.path, &voice_id) {
                             Ok(Some(p)) => Some((p, label)),
                             _ => None,
                         }

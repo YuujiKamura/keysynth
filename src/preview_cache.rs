@@ -351,6 +351,45 @@ pub fn render_to_cache(
     cache.store(key, &wav_bytes)
 }
 
+/// Look up `key` in `cache`; on miss, run `render_nsf` as a subprocess
+/// and store the produced WAV bytes under `key`. Returns the final
+/// on-disk WAV path.
+///
+/// `track` is the 0-indexed NSF track number. `render_nsf_bin` is
+/// typically `target/release/render_nsf.exe`.
+pub fn render_nsf_to_cache(
+    cache: &Cache,
+    key: &CacheKey,
+    track: u32,
+    render_nsf_bin: &Path,
+) -> io::Result<PathBuf> {
+    if let Some(p) = cache.lookup(key)? {
+        return Ok(p);
+    }
+    let tmp = std::env::temp_dir().join(format!(
+        "keysynth-preview-nsf-{}.wav",
+        key.hash().unwrap_or_else(|_| "unknown".to_string())
+    ));
+    let _ = fs::remove_file(&tmp);
+
+    let status = std::process::Command::new(render_nsf_bin)
+        .arg("--in")
+        .arg(&key.song_path)
+        .arg("--track")
+        .arg(track.to_string())
+        .arg("--out")
+        .arg(&tmp)
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "render_nsf exited with status {status}"
+        )));
+    }
+    let wav_bytes = fs::read(&tmp)?;
+    let _ = fs::remove_file(&tmp);
+    cache.store(key, &wav_bytes)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
