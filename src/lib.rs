@@ -30,6 +30,8 @@ pub mod ab_test;
 #[cfg(feature = "native")]
 pub mod analysis;
 #[cfg(feature = "native")]
+pub mod audio_audit;
+#[cfg(feature = "native")]
 pub mod chiptune_import;
 #[cfg(feature = "native")]
 pub mod cp;
