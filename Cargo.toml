@@ -343,3 +343,14 @@ required-features = ["native"]
 name = "ksrepl"
 path = "src/bin/ksrepl.rs"
 required-features = ["native"]
+
+# ksabtest: Stage F blind A/B harness — pick two voices, render the
+# same MIDI through both, randomize slot assignment, let the listener
+# pick which slot sounds more like a real piano, log every trial to
+# `bench-out/ab_test.db`, show cumulative stats per voice pair.
+# Independent egui binary so the existing jukebox stays focused on its
+# multi-track mixer role. See `src/ab_test/mod.rs` for the data layer.
+[[bin]]
+name = "ksabtest"
+path = "src/bin/ksabtest.rs"
+required-features = ["native"]
