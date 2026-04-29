@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -705,6 +705,15 @@ pub fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
     // crate name (CP `build` ops can target arbitrary crates whose
     // package name we don't know in advance), unlike the old
     // hard-coded `keysynth_voices_live.dll` heuristic.
+    //
+    // stderr is inherited so the user sees `Compiling ...` progress in
+    // real time. The first inner build of voices_live/guitar_stk on a
+    // cold target takes 60-90s; previously we used `.output()` which
+    // buffered everything until exit, making chord_pad look hung
+    // between "building live voice" and "live voice loaded". With
+    // inherit, cargo's own progress meter reaches the terminal directly.
+    // On failure the user has already seen the rustc message; we just
+    // surface the non-zero exit so callers can react.
     let output = Command::new("cargo")
         .arg("build")
         .arg("--manifest-path")
@@ -712,16 +721,16 @@ pub fn build_and_load(crate_root: &Path) -> Result<LiveFactory, String> {
         .arg("--target-dir")
         .arg(&target_dir)
         .arg("--message-format=json")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .output()
         .map_err(|e| format!("cargo invocation failed: {e}"))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        // Trim to last ~800 chars so a runaway error doesn't blow up the
-        // GUI label, but keep enough to see the actual rustc message.
-        let trimmed: String = stderr.chars().rev().take(800).collect::<String>();
-        let trimmed: String = trimmed.chars().rev().collect();
-        return Err(format!("cargo build failed:\n{trimmed}"));
+        return Err(format!(
+            "cargo build failed (exit {:?}); see cargo output above",
+            output.status.code()
+        ));
     }
 
     let dll_path = parse_cdylib_path_from_cargo_json(&output.stdout)
