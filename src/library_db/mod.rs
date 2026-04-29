@@ -209,6 +209,32 @@ impl LibraryDb {
         Ok((songs, voices))
     }
 
+    /// Like [`rebuild`](Self::rebuild) but also imports the SFZ sample
+    /// catalog from `samples_manifest_path` (Stage D / voice_collector).
+    /// Returns (songs, voices_total) where voices_total includes both
+    /// `voices_live/*` plugins, `static:*` built-ins, and `sample:*`
+    /// rows from the samples manifest. Pass `None` for the samples
+    /// manifest to skip Stage D import (legacy callers).
+    pub fn rebuild_with_samples(
+        &mut self,
+        manifest_path: &Path,
+        voices_live_root: &Path,
+        samples_manifest_path: Option<&Path>,
+    ) -> Result<(usize, usize)> {
+        self.migrate()?;
+        let songs = self.import_songs(manifest_path)?;
+        let mut voices = self.import_voices(voices_live_root)?;
+        if let Some(sp) = samples_manifest_path {
+            // Sample manifest is optional — if it doesn't exist, treat
+            // as a no-op rather than an error so a partial checkout
+            // (e.g. CI that hasn't run voice_collector) still rebuilds.
+            if sp.exists() {
+                voices += self.import_samples(sp)?;
+            }
+        }
+        Ok((songs, voices))
+    }
+
     /// Direct accessor for callers that need to run their own query —
     /// kept small on purpose; prefer the typed `query_*` helpers.
     pub fn conn(&self) -> &Connection {
@@ -456,6 +482,127 @@ impl LibraryDb {
             count += 1;
         }
 
+        tx.commit()?;
+        Ok(count)
+    }
+}
+
+// ─── Sample (SFZ) import (Stage D / voice_collector) ────────────────
+
+/// Mirror of one entry in `samples/manifest.json`. Kept structurally
+/// distinct from `crate::voice_collector::SampleEntry` on purpose: the
+/// DB layer treats this manifest as "another source manifest like
+/// songs/manifest.json" and does not depend on the voice_collector
+/// module — so a future caller could swap in a different curation
+/// pipeline without touching library_db.
+#[derive(Debug, Deserialize)]
+struct SampleManifestEntry {
+    id: String,
+    /// Filename of the .sfz under the manifest's `directory`. Not used
+    /// at the DB layer — `voice_collector` is the source of truth for
+    /// path resolution — but kept here so a strict `forbid(dead_code)`
+    /// in the future doesn't silently drop a manifest field.
+    #[allow(dead_code)]
+    file: String,
+    display_name: String,
+    instrument: String,
+    category: String,
+    recommend: String,
+    license: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    description: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SampleManifestRoot {
+    #[serde(default)]
+    directory: Option<String>,
+    entries: Vec<SampleManifestEntry>,
+}
+
+impl LibraryDb {
+    /// Import SFZ entries from `samples/manifest.json` as voice rows
+    /// with id prefix `sample:` (so `sample:karoryfer-shinyguitar-acoustic`
+    /// can never collide with a `voices_live/karoryfer-shinyguitar-acoustic`
+    /// directory of the same name should one ever appear). The cdylib
+    /// fields stay NULL since these are sample-based, not plugin-based.
+    /// `slot_name` is set to `sfz:<id>` so the engine layer can
+    /// recognize a sample-catalog selection from a voice row alone.
+    pub fn import_samples(&mut self, manifest_path: &Path) -> Result<usize> {
+        let raw = std::fs::read_to_string(manifest_path)?;
+        let root: SampleManifestRoot =
+            serde_json::from_str(&raw).map_err(|source| LibraryDbError::Manifest {
+                path: manifest_path.to_path_buf(),
+                source,
+            })?;
+        let _ = root.directory; // currently unused at DB layer; voice_collector resolves paths
+
+        let now = unix_now();
+        let tx = self.conn.transaction()?;
+        let mut count = 0usize;
+        for entry in root.entries {
+            // Voice id in the catalog. `sample:` prefix is hard-coded
+            // here (vs deriving from manifest) so a manifest editor
+            // can't accidentally produce a row that masquerades as a
+            // plugin or built-in. The SampleManifestEntry.id is the
+            // bare id (no prefix) per Stage D / Issue #67 convention.
+            let voice_id = format!("sample:{}", entry.id);
+
+            // Build a description that surfaces source + license at a
+            // glance — operators reading `keysynth_db query --voices`
+            // shouldn't have to cross-reference the manifest to know
+            // where a row came from.
+            let mut full_desc = entry.description.clone();
+            if let Some(src) = &entry.source {
+                full_desc.push_str(&format!(" [{} / {}]", src, entry.license));
+            } else {
+                full_desc.push_str(&format!(" [{}]", entry.license));
+            }
+
+            let slot_name = format!("sfz:{}", entry.id);
+
+            tx.execute(
+                "INSERT OR REPLACE INTO voices (
+                    id, display_name, category, recommend, description,
+                    slot_name, decay_model, cdylib_path, cdylib_mtime, imported_at
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    voice_id,
+                    entry.display_name,
+                    entry.category,
+                    entry.recommend,
+                    full_desc,
+                    slot_name,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    Option::<i64>::None,
+                    now,
+                ],
+            )?;
+            tx.execute("DELETE FROM voice_tags WHERE voice_id = ?1", params![voice_id])?;
+            // Always tag with instrument + license so query paths can
+            // filter by either without re-parsing the manifest.
+            let mut tag_set: Vec<String> = entry.tags.clone();
+            if !tag_set.iter().any(|t| t == &entry.instrument) {
+                tag_set.push(entry.instrument.clone());
+            }
+            tag_set.push(format!("license:{}", entry.license));
+            if let Some(url) = entry.source_url {
+                tag_set.push(format!("source_url:{url}"));
+            }
+            for tag in &tag_set {
+                tx.execute(
+                    "INSERT OR IGNORE INTO voice_tags (voice_id, tag) VALUES (?1, ?2)",
+                    params![voice_id, tag],
+                )?;
+            }
+            count += 1;
+        }
         tx.commit()?;
         Ok(count)
     }
@@ -963,6 +1110,78 @@ mod tests {
                 "missing table {required} in {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn import_samples_roundtrip() {
+        // Manifest crafted in a tempdir so the test doesn't depend on
+        // samples/manifest.json being present and parsed identically
+        // to the production catalog.
+        let tmp = std::env::temp_dir().join(format!(
+            "keysynth_libdb_samples_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let manifest_path = tmp.join("manifest.json");
+        std::fs::write(
+            &manifest_path,
+            r#"{
+              "schema_version": 1,
+              "directory": "samples/sfz",
+              "acquisition_date": "2026-04-29",
+              "entries": [
+                {
+                  "id": "demo-piano",
+                  "file": "demo-piano.sfz",
+                  "display_name": "Demo Piano",
+                  "instrument": "piano",
+                  "category": "Piano",
+                  "recommend": "Stable",
+                  "license": "CC0-1.0",
+                  "source": "Test fixture",
+                  "source_url": "https://example.com/demo",
+                  "fetch_url": "https://example.com/demo.sfz",
+                  "description": "fixture",
+                  "tags": ["sfz", "fixture"]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let n = db.import_samples(&manifest_path).unwrap();
+        assert_eq!(n, 1);
+
+        // Voice row must have `sample:` prefix and required tags.
+        let v = db
+            .query_voices(&VoiceFilter {
+                category: Some("Piano".to_string()),
+                recommend: None,
+            })
+            .unwrap();
+        let demo = v
+            .iter()
+            .find(|r| r.id == "sample:demo-piano")
+            .expect("sample:demo-piano row should exist");
+        assert_eq!(demo.slot_name.as_deref(), Some("sfz:demo-piano"));
+        assert!(demo.description.contains("CC0-1.0"));
+        assert!(demo.tags.iter().any(|t| t == "piano"));
+        assert!(demo.tags.iter().any(|t| t == "license:CC0-1.0"));
+
+        // Idempotent re-import (INSERT OR REPLACE).
+        let n2 = db.import_samples(&manifest_path).unwrap();
+        assert_eq!(n2, 1);
+        let count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM voices WHERE id = 'sample:demo-piano'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]
