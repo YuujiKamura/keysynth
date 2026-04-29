@@ -48,6 +48,8 @@ pub mod library_db;
 #[cfg(feature = "native")]
 pub mod live_reload;
 #[cfg(feature = "native")]
+pub mod midi_sched;
+#[cfg(feature = "native")]
 pub mod play_log;
 #[cfg(feature = "native")]
 pub mod preview_cache;
@@ -63,6 +65,8 @@ pub mod sfz;
 pub mod ui;
 #[cfg(feature = "native")]
 pub mod voice_collector;
+#[cfg(feature = "native")]
+pub mod voice_pool;
 
 // Re-export the dashboard-facing types at the crate root so older callers
 // that imported them via `crate::{LiveParams, DashState, Engine}` keep
