@@ -3216,36 +3216,114 @@ impl eframe::App for Jukebox {
         };
         let any_playing = snapshot.iter().any(|s| s.is_playing);
 
+        // Resolve Now Playing display fields before drawing the header
+        // so the title bar can prominently show what's audible right
+        // now. VLM critique (issue #67 operability redesign) flagged
+        // the lack of a "Now Playing" surface as the top usability
+        // blocker; this is the load-bearing fix for that.
+        let now_playing: Option<(String, String, String)> = if any_playing {
+            self.selected.and_then(|i| self.tracks.get(i)).map(|t| {
+                let title = self
+                    .song_index
+                    .get(&t.label)
+                    .map(|s| s.title.clone())
+                    .unwrap_or_else(|| t.piece.clone());
+                let composer = self
+                    .song_index
+                    .get(&t.label)
+                    .map(|s| compact_composer(&s.composer))
+                    .unwrap_or_else(|| t.source.clone());
+                let voice = if t.format == Format::Mid || t.format == Format::Nsf {
+                    self.voice_for(&t.label, &t.path)
+                } else {
+                    t.engine.clone()
+                };
+                (title, composer, voice)
+            })
+        } else {
+            None
+        };
+
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
+            // ---- Row 1: title + Now Playing + transport ------------
             ui.horizontal(|ui| {
                 ui.heading("keysynth jukebox");
                 ui.separator();
+                match &now_playing {
+                    Some((title, composer, voice)) => {
+                        ui.label(
+                            egui::RichText::new("\u{25B6} Now Playing")
+                                .color(egui::Color32::from_rgb(255, 200, 80))
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(title)
+                                .color(egui::Color32::from_rgb(255, 230, 180))
+                                .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("\u{00B7} {composer}"))
+                                .color(egui::Color32::from_rgb(200, 200, 200)),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("\u{00B7} voice: {voice}"))
+                                .color(egui::Color32::from_rgb(170, 200, 240))
+                                .monospace()
+                                .small(),
+                        );
+                        if ui
+                            .button(
+                                egui::RichText::new("\u{25A0} Stop")
+                                    .strong(),
+                            )
+                            .on_hover_text("Stop playback (all slots).")
+                            .clicked()
+                        {
+                            self.stop_all();
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new("idle \u{2014} click any \u{25B6} to play")
+                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                .italics(),
+                        );
+                    }
+                }
+            });
+            // ---- Row 2: filter + library actions -------------------
+            ui.horizontal(|ui| {
+                ui.label("filter:");
+                ui.add_sized(
+                    [220.0, 22.0],
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("type to filter songs"),
+                );
+                let fav_label = format!("\u{2605} only ({})", self.favorites.len());
+                ui.checkbox(&mut self.favorites_only, fav_label).on_hover_text(
+                    "Restrict the catalogue to starred songs. Use the \u{2605}/\u{2606} \
+                     button on each row to toggle. Persists across sessions in \
+                     bench-out/play_log.db (gitignored, machine-local).",
+                );
+                ui.separator();
                 if ui
-                    .button(if any_playing { "■ stop" } else { "—" })
+                    .button("\u{21BB} rescan library")
+                    .on_hover_text(
+                        "Re-scan track sources (bench-out/songs, voices_live, etc.) \
+                         for newly added or removed files.",
+                    )
                     .clicked()
                 {
-                    self.stop_all();
-                }
-                ui.separator();
-                if ui.button("rescan files").clicked() {
                     self.rescan();
                 }
                 ui.separator();
-                let db_label = format!(
-                    "{} tracks · DB: {} songs / {} voices",
-                    self.tracks.len(),
-                    self.song_index.len(),
-                    self.db_voice_count,
+                // Compact tracks count + stats menu (technical metadata
+                // moved off the always-visible header per VLM critique:
+                // sr/ch/DB counts overwhelm beginners).
+                ui.label(
+                    egui::RichText::new(format!("{} tracks", self.tracks.len()))
+                        .small(),
                 );
-                ui.label(db_label).on_hover_text(
-                    "DB counts come from bench-out/library.db (issue #66 — \
-                     materialized index over voices_live/* + bench-out/songs/manifest.json). \
-                     Hover any song row for full composer / era / license metadata.",
-                );
-                ui.separator();
-                ui.label("filter:");
-                ui.text_edit_singleline(&mut self.filter);
-                ui.separator();
                 let total_midi = self
                     .tracks
                     .iter()
@@ -3299,17 +3377,28 @@ impl eframe::App for Jukebox {
                         .small(),
                 )
                 .on_hover_text(
-                    "MIDI preview cache coverage. While startup prewarm is active, this \
-                     reads as background render progress instead of an alert. Run \
-                     `ksprerender` to fill bench-out/cache/ for every (song, voice) pair \
-                     offline.",
+                    "MIDI preview cache coverage. While startup prewarm is active, \
+                     this reads as background render progress instead of an alert. \
+                     Run `ksprerender` to fill bench-out/cache/ for every \
+                     (song, voice) pair offline.",
                 );
-                ui.separator();
-                let fav_label = format!("\u{2605} only ({})", self.favorites.len());
-                ui.checkbox(&mut self.favorites_only, fav_label).on_hover_text(
-                    "Restrict the catalogue to starred songs. Use the \u{2605}/\u{2606} \
-                     button on each row to toggle. Persists across sessions in \
-                     bench-out/play_log.db (gitignored, machine-local).",
+                // Stats popover keeps the deep numbers (DB song count,
+                // voice count) reachable without crowding the header.
+                ui.menu_button("\u{2139} stats", |ui| {
+                    ui.label(format!("Tracks: {}", self.tracks.len()));
+                    ui.label(format!("DB songs: {}", self.song_index.len()));
+                    ui.label(format!("DB voices: {}", self.db_voice_count));
+                    ui.separator();
+                    ui.label(format!(
+                        "Mixer: sr={} ch={}",
+                        self.mixer.sample_rate, self.mixer.output_channels
+                    ));
+                    ui.label(format!("MIDI cache: {cached}/{total_midi} ready"));
+                })
+                .response
+                .on_hover_text(
+                    "Library statistics & audio device parameters. Hidden by default \
+                     so the header stays focused on what you're playing.",
                 );
             });
             // ---- DB-driven catalogue filters ----
@@ -3463,11 +3552,15 @@ impl eframe::App for Jukebox {
                         self.rebind_device(&name);
                     }
                 }
-                if ui.button("rescan dev").clicked() {
+                if ui
+                    .button("\u{21BB} rescan devices")
+                    .on_hover_text("Re-poll the OS for newly plugged audio devices.")
+                    .clicked()
+                {
                     self.rescan_devices();
                 }
                 if ui
-                    .button("→ default")
+                    .button("\u{2192} default")
                     .on_hover_text(
                         "Re-bind to current OS default device. Use this when you've \
                          changed the default in Windows Sound (e.g. unplugged headphones).",
@@ -3476,11 +3569,6 @@ impl eframe::App for Jukebox {
                 {
                     self.rebind_device("(default)");
                 }
-                ui.separator();
-                ui.monospace(format!(
-                    "sr={} ch={}",
-                    self.mixer.sample_rate, self.mixer.output_channels
-                ));
             });
         });
 
@@ -4012,6 +4100,24 @@ impl eframe::App for Jukebox {
                          to_set_fav: &mut Vec<(String, bool)>,
                          to_set_voice: &mut Vec<(usize, String)>,
                          to_select: &mut Option<String>| {
+                            // Active row gets a tinted background frame
+                            // so the eye snaps to the playing track at
+                            // any scroll position. VLM critique #67:
+                            // bold text alone isn't strong enough — the
+                            // whole row needs to read as "this one".
+                            let row_active = indices
+                                .iter()
+                                .any(|i| self.selected == Some(*i) && any_playing);
+                            let row_frame = if row_active {
+                                egui::Frame::none()
+                                    .fill(egui::Color32::from_rgb(58, 44, 18))
+                                    .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                                    .rounding(egui::Rounding::same(3.0))
+                            } else {
+                                egui::Frame::none()
+                                    .inner_margin(egui::Margin::symmetric(4.0, 2.0))
+                            };
+                            row_frame.show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 let active_in_group = indices
                                     .iter()
@@ -4347,33 +4453,6 @@ impl eframe::App for Jukebox {
                                             .unwrap_or(false),
                                         None => false,
                                     };
-                                    if cache_hit {
-                                        ui.add_sized(
-                                            [16.0, 22.0],
-                                            egui::Label::new(
-                                                egui::RichText::new("\u{2713}")
-                                                    .color(egui::Color32::from_rgb(120, 220, 140))
-                                                    .strong(),
-                                            ),
-                                        )
-                                        .on_hover_text(
-                                            "Preview already rendered to bench-out/cache/ \
-                                             for the selected voice — click is instant.",
-                                        );
-                                    } else if t.format == Format::Mid {
-                                        ui.add_sized(
-                                            [16.0, 22.0],
-                                            egui::Label::new(
-                                                egui::RichText::new("\u{2218}")
-                                                    .color(egui::Color32::from_rgb(140, 140, 140))
-                                                    .small(),
-                                            ),
-                                        )
-                                        .on_hover_text(
-                                            "No cached preview for the selected voice — \
-                                             first click triggers a background render (1–10 s).",
-                                        );
-                                    }
                                     // Per-row voice picker. Only shown
                                     // for MIDI tracks because non-MIDI
                                     // rows have a fixed engine baked
@@ -4385,6 +4464,12 @@ impl eframe::App for Jukebox {
                                     // an auto-preview so the user
                                     // hears the new pick without a
                                     // second click.
+                                    //
+                                    // The "voice:" label up front makes
+                                    // the dropdown's role explicit per
+                                    // VLM critique — it's "current
+                                    // voice, click to change", not "the
+                                    // play action".
                                     if let Some(cur_voice) = &selected_voice {
                                         let mut picked: Option<String> = None;
                                         let cur_text = cur_voice.clone();
@@ -4393,6 +4478,11 @@ impl eframe::App for Jukebox {
                                             .get(&t.label)
                                             .cloned()
                                             .unwrap_or_default();
+                                        ui.label(
+                                            egui::RichText::new("voice:")
+                                                .color(egui::Color32::from_rgb(150, 150, 150))
+                                                .small(),
+                                        );
                                         egui::ComboBox::from_id_salt(format!("voice-{i}"))
                                             .selected_text(
                                                 egui::RichText::new(&cur_text).monospace().small(),
@@ -4431,33 +4521,60 @@ impl eframe::App for Jukebox {
                                             }
                                         }
                                     }
-                                    let engine_text = match &selected_voice {
-                                        Some(v) => v.as_str(),
-                                        None => t.engine.as_str(),
-                                    };
-                                    let label = if active {
-                                        format!("\u{25B6} {}", engine_text)
+                                    // Single, distinct Play button.
+                                    // Color encodes cache / render state
+                                    // so the user knows at a glance
+                                    // whether a click is instant
+                                    // (green), will trigger a render
+                                    // (yellow), is currently rendering
+                                    // (blue), or is the active track
+                                    // (orange). Replaces the previous
+                                    // ✓/○ glyph + redundant "▶ engine"
+                                    // pair (VLM critique #67: those
+                                    // looked like a checkbox + a
+                                    // separate control with the same
+                                    // role as the voice picker).
+                                    let (play_text, play_color, play_action_hint) = if active {
+                                        (
+                                            "\u{25B6} Playing".to_string(),
+                                            egui::Color32::from_rgb(255, 200, 80),
+                                            "Currently playing — click to restart from start.",
+                                        )
                                     } else if is_rendering {
-                                        // Live elapsed-time counter so
-                                        // the user knows the click
-                                        // landed and roughly how long
-                                        // the render has been in
-                                        // flight. Updated by the
-                                        // standard 50 ms repaint
-                                        // schedule.
                                         let secs = self
                                             .pending_render
                                             .as_ref()
                                             .map(|p| p.started.elapsed().as_secs_f32())
                                             .unwrap_or(0.0);
-                                        format!("\u{231B} {} ({:.1}s)", engine_text, secs)
+                                        (
+                                            format!("\u{231B} rendering {secs:.1}s"),
+                                            egui::Color32::from_rgb(120, 185, 255),
+                                            "Background render in progress; playback will start when ready.",
+                                        )
                                     } else if t.format == Format::Mid {
-                                        format!("\u{25B6} {}", engine_text)
+                                        if cache_hit {
+                                            (
+                                                "\u{25B6} Play".to_string(),
+                                                egui::Color32::from_rgb(120, 220, 140),
+                                                "Cached for the selected voice — click is instant.",
+                                            )
+                                        } else {
+                                            (
+                                                "\u{25B6} Render & Play".to_string(),
+                                                egui::Color32::from_rgb(220, 195, 120),
+                                                "Click triggers a background render (1–10 s) then plays.",
+                                            )
+                                        }
                                     } else {
-                                        t.engine.clone()
+                                        (
+                                            format!("\u{25B6} {}", t.engine),
+                                            egui::Color32::from_rgb(220, 220, 220),
+                                            "Click to play this engine variant.",
+                                        )
                                     };
                                     let mut hover = format!(
-                                        "{} ({} KB)",
+                                        "{}\n\n{} ({} KB)",
+                                        play_action_hint,
                                         t.path.display(),
                                         t.size_kb
                                     );
@@ -4493,14 +4610,20 @@ impl eframe::App for Jukebox {
                                             hover.push_str(ctx);
                                         }
                                     }
+                                    let play_btn = egui::Button::new(
+                                        egui::RichText::new(play_text)
+                                            .color(play_color)
+                                            .strong(),
+                                    );
                                     if ui
-                                        .selectable_label(active, label)
+                                        .add_sized([130.0, 24.0], play_btn)
                                         .on_hover_text(hover)
                                         .clicked()
                                     {
                                         *to_play = Some(i);
                                     }
                                 }
+                            });
                             });
                         };
 
