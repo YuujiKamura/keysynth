@@ -47,6 +47,27 @@ CREATE TABLE IF NOT EXISTS track_voices (
     voice_id   TEXT NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+-- Multi-axis user marking (study / perform / revisit / compare / custom).
+-- Composite key (song_id, tag) so the same song can carry several
+-- intents at once. The UI seeds a small known palette but ad-hoc
+-- strings are allowed so the user can grow their own taxonomy.
+CREATE TABLE IF NOT EXISTS user_tags (
+    song_id  TEXT NOT NULL,
+    tag      TEXT NOT NULL,
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (song_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_user_tags_tag ON user_tags(tag);
+
+-- Per-song free-form note. Single row per song (upsert on edit). Empty
+-- string deletes the row so notes(song_id) only ever holds songs the
+-- user has actually written something about.
+CREATE TABLE IF NOT EXISTS notes (
+    song_id    TEXT PRIMARY KEY,
+    note       TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug)]
@@ -308,6 +329,165 @@ impl PlayLogDb {
         Ok(out)
     }
 
+    /// Insert or remove `(song_id, tag)`. `tag` is trimmed; empty
+    /// strings are rejected so the UI can hand off raw text-input
+    /// without pre-validating. Idempotent in both directions.
+    pub fn set_user_tag(&mut self, song_id: &str, tag: &str, on: bool) -> Result<()> {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Ok(());
+        }
+        if on {
+            let now = unix_now();
+            self.conn.execute(
+                "INSERT OR IGNORE INTO user_tags (song_id, tag, added_at) VALUES (?1, ?2, ?3)",
+                params![song_id, tag, now],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM user_tags WHERE song_id = ?1 AND tag = ?2",
+                params![song_id, tag],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Toggle a single tag and return the new state. Mirrors
+    /// `toggle_favorite` for the per-piece tag chips.
+    pub fn toggle_user_tag(&mut self, song_id: &str, tag: &str) -> Result<bool> {
+        let tag_t = tag.trim();
+        if tag_t.is_empty() {
+            return Ok(false);
+        }
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM user_tags WHERE song_id = ?1 AND tag = ?2",
+                params![song_id, tag_t],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let new_state = exists.is_none();
+        self.set_user_tag(song_id, tag_t, new_state)?;
+        Ok(new_state)
+    }
+
+    /// Tags assigned to a single song, alphabetised for stable display.
+    pub fn user_tags(&self, song_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag FROM user_tags WHERE song_id = ?1 ORDER BY tag ASC",
+        )?;
+        let rows = stmt.query_map(params![song_id], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Snapshot of every (song_id -> tags) assignment so the GUI can
+    /// render row-level chips without a per-row SELECT. Tags inside
+    /// each Vec come back alphabetised.
+    pub fn all_user_tags(&self) -> Result<HashMap<String, Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT song_id, tag FROM user_tags ORDER BY song_id, tag")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for r in rows {
+            let (sid, tag) = r?;
+            out.entry(sid).or_default().push(tag);
+        }
+        Ok(out)
+    }
+
+    /// Distinct tag vocabulary across the whole table, ordered by use
+    /// frequency desc then alphabetically. Drives the "your tags" UI
+    /// suggestion list.
+    pub fn distinct_user_tags(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tag, COUNT(*) AS n FROM user_tags
+             GROUP BY tag ORDER BY n DESC, tag ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Read the user's free-form note for a song. `None` = no row yet.
+    pub fn get_note(&self, song_id: &str) -> Result<Option<String>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT note FROM notes WHERE song_id = ?1",
+                params![song_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Persist a note. Empty/whitespace-only payload deletes the row
+    /// so `get_note` returns `None` again — keeps the table clean and
+    /// matches the user mental model of "I cleared it".
+    pub fn set_note(&mut self, song_id: &str, note: &str) -> Result<()> {
+        let trimmed = note.trim();
+        if trimmed.is_empty() {
+            self.conn
+                .execute("DELETE FROM notes WHERE song_id = ?1", params![song_id])?;
+        } else {
+            let now = unix_now();
+            self.conn.execute(
+                "INSERT INTO notes (song_id, note, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(song_id) DO UPDATE SET note = excluded.note,
+                                                    updated_at = excluded.updated_at",
+                params![song_id, trimmed, now],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Snapshot every (song_id -> note) row for in-memory mirror.
+    pub fn all_notes(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT song_id, note FROM notes")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
+    /// Latest play timestamp per song, used to surface "last played
+    /// 3d ago" in the detail pane without scanning `recent_plays`.
+    pub fn last_played_at(&self, song_id: &str) -> Result<Option<i64>> {
+        // Two-step: COUNT first so we don't fight rusqlite's NULL→i64
+        // type coercion when the song has no rows. (`MAX(...)` over an
+        // empty filtered set returns SQL NULL, which `row.get::<_,i64>`
+        // reports as InvalidColumnType.)
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM plays WHERE song_id = ?1",
+            params![song_id],
+            |row| row.get(0),
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let v: i64 = self.conn.query_row(
+            "SELECT MAX(played_at) FROM plays WHERE song_id = ?1",
+            params![song_id],
+            |row| row.get(0),
+        )?;
+        Ok(Some(v))
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -343,7 +523,7 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        for required in ["favorites", "plays", "track_voices"] {
+        for required in ["favorites", "notes", "plays", "track_voices", "user_tags"] {
             assert!(
                 names.iter().any(|n| n == required),
                 "missing table {required} in {names:?}"
@@ -428,6 +608,105 @@ mod tests {
             all.get("scott_joplin_maple"),
             Some(&"guitar-stk".to_string())
         );
+    }
+
+    #[test]
+    fn user_tags_toggle_and_snapshot() {
+        let mut db = fresh();
+        assert!(db.user_tags("bach_bwv999").unwrap().is_empty());
+        // Toggle on.
+        let after_on = db.toggle_user_tag("bach_bwv999", "study").unwrap();
+        assert!(after_on);
+        assert_eq!(
+            db.user_tags("bach_bwv999").unwrap(),
+            vec!["study".to_string()]
+        );
+        // Stacks: a second tag joins the same song, alphabetised.
+        db.set_user_tag("bach_bwv999", "perform", true).unwrap();
+        assert_eq!(
+            db.user_tags("bach_bwv999").unwrap(),
+            vec!["perform".to_string(), "study".to_string()]
+        );
+        // Idempotent INSERT OR IGNORE: re-setting the same tag is a no-op.
+        db.set_user_tag("bach_bwv999", "study", true).unwrap();
+        assert_eq!(db.user_tags("bach_bwv999").unwrap().len(), 2);
+        // Empty / whitespace tag is silently ignored (UI passes raw input).
+        db.set_user_tag("bach_bwv999", "   ", true).unwrap();
+        assert_eq!(db.user_tags("bach_bwv999").unwrap().len(), 2);
+        // Toggle off.
+        let after_off = db.toggle_user_tag("bach_bwv999", "study").unwrap();
+        assert!(!after_off);
+        assert_eq!(
+            db.user_tags("bach_bwv999").unwrap(),
+            vec!["perform".to_string()]
+        );
+        // Cross-song snapshot.
+        db.set_user_tag("satie_danse", "revisit", true).unwrap();
+        let all = db.all_user_tags().unwrap();
+        assert_eq!(all.get("bach_bwv999"), Some(&vec!["perform".to_string()]));
+        assert_eq!(all.get("satie_danse"), Some(&vec!["revisit".to_string()]));
+        // Distinct vocabulary, frequency-sorted.
+        db.set_user_tag("twinkle", "perform", true).unwrap();
+        let vocab = db.distinct_user_tags().unwrap();
+        // "perform" appears twice (bach + twinkle) so it leads.
+        assert_eq!(vocab[0], ("perform".to_string(), 2));
+    }
+
+    #[test]
+    fn notes_upsert_and_clear() {
+        let mut db = fresh();
+        assert!(db.get_note("bach_bwv999").unwrap().is_none());
+        db.set_note("bach_bwv999", "  good warm-up etude\n").unwrap();
+        // Persisted with whitespace trimmed.
+        assert_eq!(
+            db.get_note("bach_bwv999").unwrap().as_deref(),
+            Some("good warm-up etude")
+        );
+        // Upsert: second write replaces the first.
+        db.set_note("bach_bwv999", "actually a prelude").unwrap();
+        assert_eq!(
+            db.get_note("bach_bwv999").unwrap().as_deref(),
+            Some("actually a prelude")
+        );
+        // Empty payload deletes the row.
+        db.set_note("bach_bwv999", "   ").unwrap();
+        assert!(db.get_note("bach_bwv999").unwrap().is_none());
+        // Snapshot covers multiple songs.
+        db.set_note("a", "note A").unwrap();
+        db.set_note("b", "note B").unwrap();
+        let all = db.all_notes().unwrap();
+        assert_eq!(all.get("a"), Some(&"note A".to_string()));
+        assert_eq!(all.get("b"), Some(&"note B".to_string()));
+    }
+
+    #[test]
+    fn last_played_at_tracks_most_recent_row() {
+        let db = fresh();
+        // Hand-roll timestamps for determinism.
+        db.conn
+            .execute(
+                "INSERT INTO plays (song_id, voice_id, played_at, duration_ms)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params!["fur_elise", "piano", 1_000i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO plays (song_id, voice_id, played_at, duration_ms)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params!["fur_elise", "piano", 5_000i64],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO plays (song_id, voice_id, played_at, duration_ms)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params!["other", "ks", 3_000i64],
+            )
+            .unwrap();
+        assert_eq!(db.last_played_at("fur_elise").unwrap(), Some(5_000));
+        assert_eq!(db.last_played_at("other").unwrap(), Some(3_000));
+        assert_eq!(db.last_played_at("never_played").unwrap(), None);
     }
 
     #[test]
