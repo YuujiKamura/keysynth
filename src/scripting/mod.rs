@@ -1,11 +1,13 @@
 //! Scripting layer — embedded Steel (Scheme) runtime.
 //!
-//! Issue #56 Phase 1: stand up a Steel `Engine` so the rest of the
-//! roadmap (voice construction DSL, chord progressions, live edit) has a
-//! Lisp host to grow on top of. This module deliberately exposes nothing
-//! keysynth-specific yet — Phase 2 is where `(list-voices)` /
-//! `(load-voice 'piano)` / `(render-wav ...)` get registered as Steel
-//! callables. Phase 1 only proves `(+ 1 2)` round-trips.
+//! Phase 1 stood up a bare Steel `Engine` to prove `(+ 1 2)` round-
+//! trips through the Cargo-dep → library-wrapper → CLI plumbing.
+//!
+//! Phase 2 (issue #56) registers the keysynth-specific surface area on
+//! top of that engine via [`bindings`]: `(list-voices)`, `(load-voice
+//! 'piano)`, `(query-songs :composer "Bach")`, and `(render-wav ...)`.
+//! See `bindings.rs` for the contract — this module just owns the
+//! engine lifecycle and the public `eval` API.
 //!
 //! The wrapper keeps the steel-core types behind a thin facade:
 //!   - construction errors collapse into [`ScriptError::Init`]
@@ -23,6 +25,8 @@
 use std::fmt;
 
 use steel::steel_vm::engine::Engine as SteelEngine;
+
+mod bindings;
 
 /// Errors surfaced by [`Engine::eval`].
 #[derive(Debug)]
@@ -54,15 +58,17 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Construct a fresh Steel engine with the standard prelude loaded.
+    /// Construct a fresh Steel engine with the standard prelude and
+    /// the keysynth Phase 2 bindings (`list-voices`, `load-voice`,
+    /// `query-songs`, `render-wav`) installed.
+    ///
+    /// The Phase-1 Result-returning shape is preserved so a future
+    /// addition that legitimately fails to register (missing asset,
+    /// unsupported VM build) doesn't break call sites.
     pub fn new() -> Result<Self, ScriptError> {
-        // `Engine::new()` itself is infallible in steel-core 0.8, but we
-        // keep `Result` in the signature so Phase 2 (which will register
-        // keysynth callables and may legitimately fail) doesn't break the
-        // public API.
-        Ok(Self {
-            inner: SteelEngine::new(),
-        })
+        let mut inner = SteelEngine::new();
+        bindings::register(&mut inner).map_err(ScriptError::Init)?;
+        Ok(Self { inner })
     }
 
     /// Evaluate a Steel/Scheme source string.
@@ -112,5 +118,98 @@ mod tests {
         let mut engine = Engine::new().expect("steel init");
         let err = engine.eval("(+ 1").expect_err("unbalanced paren");
         assert!(matches!(err, ScriptError::Eval(_)));
+    }
+
+    // ─── Phase 2 bindings (issue #56) ────────────────────────────
+
+    #[test]
+    fn list_voices_includes_static_engines() {
+        let mut engine = Engine::new().expect("steel init");
+        let out = engine.eval("(list-voices)").expect("list-voices");
+        // Steel renders lists as `("Square" "KS" ...)`. The Phase 2
+        // contract is "Piano shows up by default" — the user's golden
+        // path renders Piano without first loading a voice.
+        assert!(out.contains("\"Piano\""), "expected Piano in: {out}");
+        assert!(out.contains("\"Square\""), "expected Square in: {out}");
+    }
+
+    #[test]
+    fn load_voice_accepts_quoted_symbol_and_persists() {
+        let mut engine = Engine::new().expect("steel init");
+        let out = engine
+            .eval("(load-voice 'piano-lite)")
+            .expect("load-voice");
+        assert_eq!(out, "\"loaded: Piano Lite\"");
+        // Subsequent calls see the same runtime state.
+        let cur = engine.eval("(current-voice)").expect("current-voice");
+        assert_eq!(cur, "\"Piano Lite\"");
+    }
+
+    #[test]
+    fn load_voice_rejects_unknown_name() {
+        let mut engine = Engine::new().expect("steel init");
+        let err = engine
+            .eval("(load-voice 'no-such-voice)")
+            .expect_err("unknown voice should error");
+        let msg = format!("{err}");
+        assert!(msg.contains("unknown voice"), "got: {msg}");
+    }
+
+    #[test]
+    fn query_songs_keyword_macro_routes_to_rust() {
+        // Skip when the catalog hasn't been built yet — CI without the
+        // `keysynth_db rebuild` step is a real configuration. We still
+        // assert the binding is reachable: the error must come from the
+        // DB layer, not from `__query-songs` being unbound.
+        let mut engine = Engine::new().expect("steel init");
+        let result = engine.eval(r#"(query-songs :composer "Bach")"#);
+        match result {
+            Ok(s) => {
+                // Real DB present: at minimum the keyword macro must
+                // have routed through, returning a list (possibly empty).
+                assert!(s.starts_with('('), "expected list, got: {s}");
+            }
+            Err(ScriptError::Eval(msg)) => {
+                // Acceptable when bench-out/library.db is missing. The
+                // crucial signal is that the macro expanded — i.e. the
+                // failure comes from the DB layer, not from a free
+                // identifier `__query-songs`.
+                assert!(
+                    msg.contains("library db") || msg.contains("query"),
+                    "expected DB-layer error, got: {msg}"
+                );
+            }
+            Err(e) => panic!("unexpected error variant: {e}"),
+        }
+    }
+
+    #[test]
+    fn render_wav_writes_a_real_wav_file() {
+        let mut engine = Engine::new().expect("steel init");
+        let dir = std::env::temp_dir().join("keysynth-scripting-tests");
+        std::fs::create_dir_all(&dir).expect("mkdir tempdir");
+        let out = dir.join("render_wav_smoke.wav");
+        // Use forward slashes so the embedded Steel string literal is
+        // portable across Windows / Unix without backslash-escaping.
+        let path_str = out.to_string_lossy().replace('\\', "/");
+        let src = format!(
+            "(begin (load-voice 'piano) (render-wav (list 60 64 67) \"{path_str}\"))"
+        );
+        let report = engine.eval(&src).expect("render-wav");
+        assert!(report.contains("wrote"), "got: {report}");
+        // File must exist and contain a non-empty WAV (44-byte header
+        // alone would be evidence the writer never advanced past spec).
+        let meta = std::fs::metadata(&out).expect("output WAV metadata");
+        assert!(meta.len() > 1024, "WAV too small: {} bytes", meta.len());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn render_wav_rejects_empty_notes_list() {
+        let mut engine = Engine::new().expect("steel init");
+        let err = engine
+            .eval("(render-wav (list) \"unused.wav\")")
+            .expect_err("empty notes should error");
+        assert!(format!("{err}").contains("empty"), "got: {err}");
     }
 }

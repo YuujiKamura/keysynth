@@ -1,22 +1,27 @@
 //! `ksrepl` — Steel (embedded Scheme) REPL for keysynth.
 //!
-//! Issue #56 Phase 1 entry point. Hosts a bare Steel runtime so the
-//! Lisp scripting layer roadmap has a place to land:
+//! Issue #56 Phase 2 entry point. Hosts a Steel runtime preloaded with
+//! the keysynth API surface so AI agents (or any human at the prompt)
+//! can drive voice selection, library queries, and offline render from
+//! Lisp:
 //!
 //! ```text
 //! $ ksrepl
-//! ksrepl> (+ 1 2)
-//! 3
-//! ksrepl> (define greet (lambda (n) (* n 2)))
-//! ksrepl> (greet 21)
-//! 42
+//! ksrepl> (list-voices)
+//! ("Square" "KS" "KS Rich" ... "Piano Modal")
+//! ksrepl> (load-voice 'piano)
+//! "loaded: Piano"
+//! ksrepl> (query-songs :composer "Bach")
+//! ("bach_bwv999_prelude\tJ.S. Bach — BWV 999 ..." ...)
+//! ksrepl> (render-wav (list 60 64 67) "out.wav")
+//! "wrote out.wav (136800 frames)"
 //! ksrepl> :quit
 //! ```
 //!
-//! Phase 1 deliberately exposes nothing keysynth-specific — Phase 2
-//! is where `(list-voices)` / `(load-voice 'piano)` / `(render-wav ...)`
-//! get registered. This binary just proves the host-language plumbing
-//! is in place end-to-end (Cargo dep → library wrapper → CLI).
+//! See `keysynth::scripting::bindings` for the full contract. Phase 1
+//! kept this file deliberately bare; Phase 2 layers the four-function
+//! agent surface (`list-voices` / `load-voice` / `query-songs` /
+//! `render-wav`) on top of the same `scripting::Engine`.
 //!
 //! Modes:
 //!   * `ksrepl`                — interactive REPL on stdin/stdout
@@ -33,7 +38,7 @@ use std::process::ExitCode;
 use keysynth::scripting::{Engine, ScriptError};
 
 const PROMPT: &str = "ksrepl> ";
-const HELP: &str = r#"ksrepl — keysynth Steel (Scheme) REPL (issue #56 Phase 1)
+const HELP: &str = r#"ksrepl — keysynth Steel (Scheme) REPL (issue #56 Phase 2)
 
 USAGE:
   ksrepl                       interactive REPL
@@ -46,9 +51,17 @@ REPL COMMANDS:
   :quit, :q, :exit             exit the REPL
   :help                        print this help
 
-NOTES:
-  Phase 1 hosts only the Steel standard prelude. keysynth Rust API
-  (voice construction, render, live params) is registered in Phase 2."#;
+KEYSYNTH API (Phase 2):
+  (list-voices)                       list available voice labels
+  (load-voice 'piano)                 select voice for subsequent renders
+  (current-voice)                     report the currently-selected voice
+  (query-songs :composer "Bach")      search the library catalog
+  (query-songs :era "baroque" :instrument "guitar")
+  (render-wav '(60 64 67) "out.wav")  render notes to a 16-bit mono WAV
+
+ENVIRONMENT:
+  KEYSYNTH_DB                  override library.db path
+                               (default: bench-out/library.db)"#;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,7 +113,9 @@ fn interactive(mut engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     let mut line = String::new();
 
-    eprintln!("ksrepl (Steel — issue #56 Phase 1). Type :help for usage, :quit to exit.");
+    eprintln!(
+        "ksrepl (Steel — issue #56 Phase 2). Type :help for the keysynth API, :quit to exit."
+    );
 
     loop {
         write!(stdout, "{PROMPT}")?;
