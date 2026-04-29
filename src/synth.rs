@@ -1206,6 +1206,30 @@ pub fn midi_to_freq(note: u8) -> f32 {
 /// only exists so the voice-pool eviction logic can still track which
 /// (channel, note) pairs are sounding.
 pub fn make_voice(engine: Engine, sr: f32, freq: f32, velocity: u8) -> Box<dyn VoiceImpl + Send> {
+    // Per-engine output-level calibration (issue #13): wrap every
+    // constructed voice in `CalibratedVoice` so vel-100 C4 renders
+    // land within ±1.5 dB of `TARGET_PEAK_DBFS` regardless of which
+    // engine produced them. A/B comparison should measure colour, not
+    // loudness. Placeholder voices and live cdylibs pass through
+    // unwrapped (their gain coefficient is 1.0) — see
+    // `calibration::engine_calibration_gain`.
+    let inner = make_voice_raw_inner(engine, sr, freq, velocity);
+    crate::calibration::CalibratedVoice::wrap(inner, engine)
+}
+
+/// Construct an uncalibrated voice. This is the historical body of
+/// `make_voice`, factored out so [`crate::calibration::make_voice_raw`]
+/// can drive it directly when the diagnostic measurement test (or
+/// future analysis tooling) wants to reason about a voice's natural
+/// peak amplitude without the calibration coefficient confounding the
+/// measurement. Production code paths go through `make_voice` and get
+/// calibration applied automatically.
+pub fn make_voice_raw_inner(
+    engine: Engine,
+    sr: f32,
+    freq: f32,
+    velocity: u8,
+) -> Box<dyn VoiceImpl + Send> {
     // Per-engine velocity attenuation for chord headroom. The
     // `chord_headroom_audit` test renders a 3-note Cmaj chord through
     // every engine and reports raw bus peak; engines that exceed

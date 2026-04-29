@@ -10,6 +10,7 @@
 //! feature so the wasm32 build for the GitHub Pages demo doesn't try to
 //! pull in midir / hound / rustfft / image / rustysynth / etc.
 
+pub mod calibration;
 pub mod gm;
 pub mod live_abi;
 pub mod resample;
