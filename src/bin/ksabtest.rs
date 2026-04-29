@@ -30,7 +30,27 @@ use eframe::egui;
 use hound::{SampleFormat as WavSampleFormat, WavReader};
 
 use keysynth::ab_test::{aggregate, canonical_pair, AbTestDb, PairStats, Trial, Verdict};
+use keysynth::gui_cp;
 use keysynth::preview_cache::{Cache, CacheKey, RenderParams};
+use serde::Serialize;
+use serde_json::json;
+
+/// CP snapshot published by the ksabtest GUI. Captures the harness
+/// phase plus everything a verifier needs to assert "voice picker
+/// loaded N engines, MIDI scanner found M files, no error after init".
+#[derive(Clone, Debug, Default, Serialize)]
+struct CpAbSnapshot {
+    frame_id: u64,
+    phase: &'static str,
+    voice_a_input: String,
+    voice_b_input: String,
+    midi_count: usize,
+    selected_midi: Option<String>,
+    render_bin_present: bool,
+    last_error: Option<String>,
+    db_open: bool,
+    pair_trials: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Voices that `render_midi` can drive without extra CLI arguments.
@@ -400,6 +420,15 @@ struct App {
     /// a new trial is logged.
     pair_trials: Vec<Trial>,
     pair_stats: PairStats,
+
+    /// CP snapshot bus. Read-only: ksabtest's whole UX is the human
+    /// listener picking A vs B, so driving verdicts over CP would
+    /// defeat the blind-test premise. Verifiers can still observe the
+    /// phase and confirm bootstrap (engines loaded, MIDI list scanned,
+    /// render_midi binary located).
+    cp_state: gui_cp::State<CpAbSnapshot, ()>,
+    _cp_handle: Option<gui_cp::Handle>,
+    cp_frame_id: u64,
 }
 
 impl App {
@@ -434,6 +463,14 @@ impl App {
         } else {
             None
         };
+        let cp_state: gui_cp::State<CpAbSnapshot, ()> = gui_cp::State::new();
+        let cp_handle = match spawn_ksabtest_cp(cp_state.clone()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("ksabtest: CP server failed to start: {e}");
+                None
+            }
+        };
         let mut app = App {
             audio,
             db,
@@ -449,6 +486,9 @@ impl App {
             last_error: None,
             pair_trials: Vec::new(),
             pair_stats: PairStats::default(),
+            cp_state,
+            _cp_handle: cp_handle,
+            cp_frame_id: 0,
         };
         if !app.midi_files.is_empty() {
             app.selected_midi = Some(0);
@@ -707,6 +747,46 @@ impl App {
         self.stop_audio();
         self.phase = Phase::Idle;
     }
+
+    fn build_cp_snapshot(&self) -> CpAbSnapshot {
+        let phase_label = match &self.phase {
+            Phase::Idle => "idle",
+            Phase::Rendering { .. } => "rendering",
+            Phase::Listening { .. } => "listening",
+            Phase::Reveal { .. } => "reveal",
+        };
+        let selected_midi = self
+            .selected_midi
+            .and_then(|i| self.midi_files.get(i))
+            .and_then(|p| p.file_stem().and_then(|s| s.to_str()))
+            .map(|s| s.to_string());
+        CpAbSnapshot {
+            frame_id: self.cp_frame_id,
+            phase: phase_label,
+            voice_a_input: self.voice_a_input.clone(),
+            voice_b_input: self.voice_b_input.clone(),
+            midi_count: self.midi_files.len(),
+            selected_midi,
+            render_bin_present: self.render_bin.is_some(),
+            last_error: self.last_error.clone(),
+            db_open: self.db.is_some(),
+            pair_trials: self.pair_trials.len(),
+        }
+    }
+}
+
+/// Spawn the ksabtest CP server. Read-only (`get_state` + `ping`):
+/// the binary's UX is the human listener picking which slot is more
+/// realistic, so verdicts must come from a person.
+fn spawn_ksabtest_cp(state: gui_cp::State<CpAbSnapshot, ()>) -> std::io::Result<gui_cp::Handle> {
+    let endpoint = gui_cp::resolve_endpoint("ksabtest", None);
+    let st_get = state;
+    gui_cp::Builder::new("ksabtest", &endpoint)
+        .register("get_state", move |_p| match st_get.read_snapshot() {
+            Some(s) => gui_cp::encode_result(s),
+            None => Ok(json!({"frame_id": 0, "warming_up": true})),
+        })
+        .serve()
 }
 
 // ---------------------------------------------------------------------------
@@ -715,6 +795,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.cp_frame_id = self.cp_frame_id.wrapping_add(1);
+        let snap = self.build_cp_snapshot();
+        self.cp_state.publish(snap);
+
         // Drive the rendering poll every frame so the UI flips into
         // Listening as soon as the worker thread sends.
         self.poll_render();

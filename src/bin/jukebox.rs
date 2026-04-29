@@ -17,13 +17,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use keysynth::gui_cp;
 use keysynth::library_db::{LibraryDb, Song, SongFilter, SongSort, VoiceFilter};
 use keysynth::play_log::{PlayEntry, PlayLogDb};
 
+use cp_core::RpcError;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use eframe::egui;
 use hound::{SampleFormat as WavSampleFormat, WavReader};
+use serde::Serialize;
+use serde_json::json;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -1230,6 +1234,93 @@ fn fill_callback(out: &mut [f32], channels: u16, state: &Arc<Mutex<MixerState>>)
 
 // ---------- App -----------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Control-Protocol (CP) snapshot + command types — shared with the
+// embedded `gui_cp` server so external tooling can drive verification
+// without scripting the windowing layer. See `verify_jukebox.sh` and
+// the user-path verification skill for the consumer side.
+// ---------------------------------------------------------------------------
+
+/// Per-mix-slot summary published over CP. Only the fields a
+/// verification script actually needs to reason about playback state
+/// — full mixer detail (VU peaks, pan, etc.) stays internal.
+#[derive(Clone, Debug, Serialize)]
+struct CpSlotSnap {
+    slot: usize,
+    /// `Track::label` of the file currently in this slot, or `None`.
+    label: Option<String>,
+    is_playing: bool,
+    cursor_frames: u64,
+    total_frames: u64,
+    sample_rate: u32,
+}
+
+/// Wire-format snapshot of the jukebox state. Refreshed at the tail
+/// of every `update()` frame; CP `get_state` reads serve a clone.
+#[derive(Clone, Debug, Default, Serialize)]
+struct CpJukeboxSnapshot {
+    /// Increments every painted frame so a verification script can
+    /// confirm the GUI is alive (and wait for command effects to land
+    /// in the next frame).
+    frame_id: u64,
+    /// Cataloged tracks (jukebox-side, includes WAV/MP3/MIDI rows).
+    track_count: usize,
+    /// Voice rows materialized in `bench-out/library.db`. Mirrors the
+    /// header line that proves DB discovery succeeded.
+    db_voice_count: usize,
+    /// Songs in `bench-out/library.db` keyed by stem. Together with
+    /// `db_voice_count` this matches the stdout boot line
+    /// `library_db catalog → N songs / M voices`.
+    db_song_count: usize,
+    /// Currently-selected catalog row label, or `None`.
+    selected_label: Option<String>,
+    /// Aggregate transport state: any slot is_playing.
+    any_playing: bool,
+    /// Per-slot detail (length matches `slot_count`).
+    slots: Vec<CpSlotSnap>,
+    /// Number of (label, voice) pairs that already have a preview WAV
+    /// on disk. The verification script asserts this matches the
+    /// disk-scan in `bench-out/cache/`.
+    cache_hit_pairs: usize,
+    /// Distinct labels that have at least one cached voice. Lighter to
+    /// post-filter against on the consumer side than the full map.
+    cached_labels: Vec<String>,
+    /// Effective voice id per `Track::label` (empty when the user
+    /// hasn't picked one yet — caller can still fall back to the
+    /// jukebox's heuristic by querying `get_state` after a
+    /// `set_voice`).
+    selected_voices: HashMap<String, String>,
+    /// True while the background prewarm worker is still draining its
+    /// queue.
+    prewarm_active: bool,
+    /// Every catalog row's `Track::label`, in display order. Verifiers
+    /// use this to pick a real label for `load_track` without having
+    /// to glob `bench-out/songs/`. Kept on the snapshot so it stays
+    /// in sync with `track_count` automatically.
+    all_labels: Vec<String>,
+}
+
+/// Commands CP handlers can enqueue for the egui thread to apply on
+/// the next frame. Stays small on purpose — anything more ambitious
+/// belongs as a dedicated method that locks its own state.
+#[derive(Clone, Debug)]
+enum CpJukeboxCommand {
+    /// Find a catalog row whose `Track::label` matches and start it
+    /// in slot 0 (same code path as the per-row "▶" button).
+    LoadTrack { label: String },
+    /// Resume playback for whatever is already loaded.
+    Play,
+    /// Stop every slot. Equivalent to the header "■ stop" button.
+    Stop,
+    /// Persist a voice pick for `label`; if the row currently plays,
+    /// re-trigger so the user hears the new voice.
+    SetVoice { label: String, voice: String },
+    /// Re-scan source dirs + library.db (matches the "rescan files"
+    /// header button). Mostly here so a verification script can force
+    /// a refresh after staging a new bench-out file.
+    Rescan,
+}
+
 struct Jukebox {
     tracks: Vec<Track>,
     selected: Option<usize>,
@@ -1316,6 +1407,20 @@ struct Jukebox {
     era_filter: Option<String>,
     license_filter: Option<String>,
     instrument_filter: Option<String>,
+    /// Control-Protocol shared state: snapshot publish + command queue.
+    /// Cloned into the cp-core handler closures so verification
+    /// scripts can drive load/play/stop/set-voice without scripting
+    /// the windowing layer.
+    cp_state: gui_cp::State<CpJukeboxSnapshot, CpJukeboxCommand>,
+    /// Running CP server handle. Held by the app so `Drop` cleans up
+    /// the listener and removes the `bench-out/cp/jukebox-<pid>.endpoint`
+    /// announce file. `None` when CP startup failed (e.g. port in use)
+    /// — the GUI keeps running so a developer is not blocked on a
+    /// wire-protocol failure.
+    _cp_handle: Option<gui_cp::Handle>,
+    /// Monotonic frame counter mirrored into the snapshot so a
+    /// verification script can prove the egui loop is advancing.
+    cp_frame_id: u64,
 }
 
 const RECENT_PLAYS_LIMIT: usize = 12;
@@ -1535,6 +1640,14 @@ impl Jukebox {
         let cached_midi_labels = snapshot_cached_midi_voices(&tracks, &selected_voices);
         let prewarm =
             spawn_startup_prewarm(&tracks, &play_counts, &cached_midi_labels, &selected_voices);
+        let cp_state: gui_cp::State<CpJukeboxSnapshot, CpJukeboxCommand> = gui_cp::State::new();
+        let cp_handle = match spawn_cp_server(cp_state.clone()) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!("jukebox: CP server failed to start: {e} — verification disabled");
+                None
+            }
+        };
         Ok(Self {
             tracks,
             selected: None,
@@ -1559,6 +1672,9 @@ impl Jukebox {
             era_filter: None,
             license_filter: None,
             instrument_filter: None,
+            cp_state,
+            _cp_handle: cp_handle,
+            cp_frame_id: 0,
         })
     }
 
@@ -2181,6 +2297,208 @@ impl Jukebox {
             }
         }
     }
+
+    // ---------------------------------------------------------------
+    // CP integration
+    // ---------------------------------------------------------------
+
+    /// Apply one queued CP command. Called from `update()` head, on
+    /// the egui thread, so it can freely use the same `&mut self`
+    /// methods the UI buttons use (preview / stop_all / set_track_voice
+    /// / rescan).
+    fn apply_cp_command(&mut self, cmd: CpJukeboxCommand) {
+        match cmd {
+            CpJukeboxCommand::LoadTrack { label } => {
+                let idx = self.tracks.iter().position(|t| t.label == label);
+                match idx {
+                    Some(i) => self.preview(i),
+                    None => eprintln!("cp: load_track: no catalog row matches label '{label}'"),
+                }
+            }
+            CpJukeboxCommand::Play => {
+                self.play_all();
+            }
+            CpJukeboxCommand::Stop => {
+                self.stop_all();
+            }
+            CpJukeboxCommand::SetVoice { label, voice } => {
+                let path = match self.tracks.iter().find(|t| t.label == label) {
+                    Some(t) => t.path.clone(),
+                    None => {
+                        eprintln!("cp: set_voice: no catalog row matches label '{label}'");
+                        return;
+                    }
+                };
+                if self.set_track_voice(&label, &path, &voice) {
+                    // Mirror the UI's behaviour: a voice change re-fires
+                    // preview so the user (or verifier) hears the new
+                    // voice on the row that's currently selected.
+                    if let Some(idx) = self.tracks.iter().position(|t| t.label == label) {
+                        self.preview(idx);
+                    }
+                }
+            }
+            CpJukeboxCommand::Rescan => {
+                self.rescan();
+            }
+        }
+    }
+
+    /// Build the `CpJukeboxSnapshot` published over `get_state` for
+    /// this frame. Computed after all command application + UI mutation
+    /// so the result reflects what the user (or verification script)
+    /// will see in the *next* frame's GUI paint.
+    fn build_cp_snapshot(&self) -> CpJukeboxSnapshot {
+        let (slot_snaps, any_playing) = {
+            let st = self.mixer.state.lock().unwrap();
+            let snaps: Vec<CpSlotSnap> = st
+                .tracks
+                .iter()
+                .enumerate()
+                .map(|(i, t)| CpSlotSnap {
+                    slot: i,
+                    label: if t.decoded.is_some() {
+                        Some(t.file_label.clone())
+                    } else {
+                        None
+                    },
+                    is_playing: t.is_playing,
+                    cursor_frames: t.cursor_frames,
+                    total_frames: t
+                        .decoded
+                        .as_ref()
+                        .map(|d| d.total_samples / d.channels.max(1) as u64)
+                        .unwrap_or(0),
+                    sample_rate: t.decoded.as_ref().map(|d| d.sample_rate).unwrap_or(0),
+                })
+                .collect();
+            let any = snaps.iter().any(|s| s.is_playing);
+            (snaps, any)
+        };
+        let cache_hit_pairs: usize = self
+            .cached_midi_labels
+            .values()
+            .map(|s| s.len())
+            .sum();
+        let cached_labels: Vec<String> = self
+            .cached_midi_labels
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let selected_label = self
+            .selected
+            .and_then(|i| self.tracks.get(i))
+            .map(|t| t.label.clone());
+        let all_labels: Vec<String> = self.tracks.iter().map(|t| t.label.clone()).collect();
+        CpJukeboxSnapshot {
+            frame_id: self.cp_frame_id,
+            track_count: self.tracks.len(),
+            db_voice_count: self.db_voice_count,
+            db_song_count: self.song_index.len(),
+            selected_label,
+            any_playing,
+            slots: slot_snaps,
+            cache_hit_pairs,
+            cached_labels,
+            selected_voices: self.selected_voices.clone(),
+            prewarm_active: self.prewarm.is_some(),
+            all_labels,
+        }
+    }
+}
+
+/// Spawn the embedded jukebox CP server. Registers `get_state`,
+/// `load_track`, `play`, `stop`, `set_voice`, and `rescan` against a
+/// shared `gui_cp::State`. The egui thread drains the command queue
+/// each frame; CP handlers do nothing more than queue or read.
+fn spawn_cp_server(
+    state: gui_cp::State<CpJukeboxSnapshot, CpJukeboxCommand>,
+) -> std::io::Result<gui_cp::Handle> {
+    let endpoint = gui_cp::resolve_endpoint("jukebox", None);
+
+    let st_get = state.clone();
+    let st_load = state.clone();
+    let st_play = state.clone();
+    let st_stop = state.clone();
+    let st_voice = state.clone();
+    let st_rescan = state.clone();
+    let st_list = state.clone();
+
+    gui_cp::Builder::new("jukebox", &endpoint)
+        .register("get_state", move |_p| match st_get.read_snapshot() {
+            Some(snap) => gui_cp::encode_result(snap),
+            None => Ok(json!({"frame_id": 0, "warming_up": true})),
+        })
+        .register("load_track", move |p| {
+            #[derive(serde::Deserialize)]
+            struct Args {
+                label: String,
+            }
+            let a: Args = gui_cp::decode_params(p)?;
+            let label = a.label.clone();
+            st_load.push_command(CpJukeboxCommand::LoadTrack { label });
+            Ok(json!({"queued": "load_track", "label": a.label}))
+        })
+        .register("play", move |_p| {
+            st_play.push_command(CpJukeboxCommand::Play);
+            Ok(json!({"queued": "play"}))
+        })
+        .register("stop", move |_p| {
+            st_stop.push_command(CpJukeboxCommand::Stop);
+            Ok(json!({"queued": "stop"}))
+        })
+        .register("set_voice", move |p| {
+            #[derive(serde::Deserialize)]
+            struct Args {
+                label: String,
+                voice: String,
+            }
+            let a: Args = gui_cp::decode_params(p)?;
+            let pair = json!({"label": a.label, "voice": a.voice});
+            st_voice.push_command(CpJukeboxCommand::SetVoice {
+                label: a.label,
+                voice: a.voice,
+            });
+            Ok(json!({"queued": "set_voice", "args": pair}))
+        })
+        .register("rescan", move |_p| {
+            st_rescan.push_command(CpJukeboxCommand::Rescan);
+            Ok(json!({"queued": "rescan"}))
+        })
+        .register("list_tracks", move |p| {
+            #[derive(serde::Deserialize, Default)]
+            #[serde(default)]
+            struct Args {
+                limit: Option<usize>,
+                contains: Option<String>,
+            }
+            let a: Args = serde_json::from_value(p)
+                .map_err(|e| RpcError::invalid_params(format!("param parse: {e}")))?;
+            // Read the most-recent snapshot so list_tracks reflects
+            // the same set the GUI is rendering. Fall back to "warming
+            // up" if no frame has published yet.
+            let snap = match st_list.read_snapshot() {
+                Some(s) => s,
+                None => return Ok(json!({"warming_up": true, "tracks": []})),
+            };
+            let needle = a.contains.unwrap_or_default().to_ascii_lowercase();
+            let limit = a.limit.unwrap_or(usize::MAX);
+            let tracks: Vec<&str> = snap
+                .all_labels
+                .iter()
+                .filter(|label| {
+                    needle.is_empty() || label.to_ascii_lowercase().contains(&needle)
+                })
+                .take(limit)
+                .map(|s| s.as_str())
+                .collect();
+            Ok(json!({
+                "tracks": tracks,
+                "track_count": snap.track_count,
+            }))
+        })
+        .serve()
 }
 
 /// Render a single VU meter bar. peak / rms are 0..1+ (we clamp).
@@ -2222,6 +2540,14 @@ fn vu_meter_bar(ui: &mut egui::Ui, label: &str, peak: f32, rms: f32) {
 impl eframe::App for Jukebox {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
+
+        // Drain the CP command queue first so external verification
+        // commands (load_track / play / stop / set_voice) take effect
+        // *this* frame — by the time we publish the snapshot at the
+        // tail, the resulting state mutation is already visible.
+        for cmd in self.cp_state.drain_commands() {
+            self.apply_cp_command(cmd);
+        }
 
         // Lazy-MIDI render: drain the background-render channel before
         // anything else so a finished render becomes the active track
@@ -3561,6 +3887,13 @@ impl eframe::App for Jukebox {
                 }
             });
         });
+
+        // Publish the post-paint snapshot for any waiting CP reader.
+        // Done last so a verifier polling `get_state` after a queued
+        // command observes the resulting mutation in this same frame.
+        self.cp_frame_id = self.cp_frame_id.wrapping_add(1);
+        let snap = self.build_cp_snapshot();
+        self.cp_state.publish(snap);
     }
 }
 

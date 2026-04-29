@@ -34,8 +34,12 @@
 
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use keysynth::gui_cp;
 use keysynth::scripting::{Engine, ScriptError};
+use serde_json::json;
 
 const PROMPT: &str = "ksrepl> ";
 const HELP: &str = r#"ksrepl — keysynth Steel (Scheme) REPL (issue #56 Phase 2)
@@ -117,6 +121,20 @@ fn interactive(mut engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
         "ksrepl (Steel — issue #56 Phase 2). Type :help for the keysynth API, :quit to exit."
     );
 
+    // Embed a CP server so verification scripts can confirm the REPL
+    // is alive and observe how many expressions have been evaluated.
+    // Steel's `Engine` isn't `Send + Sync`, so we don't expose `eval`
+    // over CP — the REPL stdin loop stays the only mutator. The
+    // server is dropped automatically when this function returns.
+    let eval_count = Arc::new(AtomicU64::new(0));
+    let _cp = match spawn_ksrepl_cp(eval_count.clone()) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            eprintln!("ksrepl: CP server failed to start: {e}");
+            None
+        }
+    };
+
     loop {
         write!(stdout, "{PROMPT}")?;
         stdout.flush()?;
@@ -143,12 +161,33 @@ fn interactive(mut engine: Engine) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         match engine.eval(trimmed) {
-            Ok(out) if out.is_empty() => {}
-            Ok(out) => println!("{out}"),
+            Ok(out) if out.is_empty() => {
+                eval_count.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(out) => {
+                eval_count.fetch_add(1, Ordering::Relaxed);
+                println!("{out}");
+            }
             // Print eval errors but stay in the REPL — that's the whole
             // point of an interactive session.
             Err(ScriptError::Eval(msg)) => eprintln!("error: {msg}"),
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+/// Spawn the ksrepl CP server. Read-only: `get_state` returns the
+/// REPL's running flag and the number of successful evaluations so a
+/// verifier can confirm the process is alive without injecting input.
+fn spawn_ksrepl_cp(eval_count: Arc<AtomicU64>) -> std::io::Result<gui_cp::Handle> {
+    let endpoint = gui_cp::resolve_endpoint("ksrepl", None);
+    gui_cp::Builder::new("ksrepl", &endpoint)
+        .register("get_state", move |_p| {
+            Ok(json!({
+                "running": true,
+                "eval_count": eval_count.load(Ordering::Relaxed),
+                "phase": "interactive",
+            }))
+        })
+        .serve()
 }
