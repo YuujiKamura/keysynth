@@ -26,6 +26,8 @@ pub mod voices;
 // game-music-emu / midly / symphonia which are gated out of the
 // wasm32 build via the `web` Cargo feature.
 #[cfg(feature = "native")]
+pub mod ab_test;
+#[cfg(feature = "native")]
 pub mod analysis;
 #[cfg(feature = "native")]
 pub mod chiptune_import;
