@@ -119,7 +119,7 @@ impl VoicePool {
     /// at `default` initially. The UI can override individual channels
     /// later via `set_channel_factory`.
     pub fn new(sample_rate: f32, voice_cap: usize, default: Arc<dyn VoiceFactory>) -> Self {
-        // Array::map keeps the array on the stack and avoids needing
+        // `array::from_fn` keeps the array on the stack and avoids needing
         // `Clone` on the trait object itself.
         let factories: [Arc<dyn VoiceFactory>; NUM_CHANNELS] =
             std::array::from_fn(|_| Arc::clone(&default));
@@ -182,6 +182,13 @@ impl VoicePool {
 
     fn dispatch_note_on(&self, channel: u8, note: u8, velocity: u8) {
         if channel as usize >= NUM_CHANNELS {
+            return;
+        }
+        // A pool with zero capacity can never hold a voice; bail out
+        // before we touch the channel-factory map or the voices Mutex
+        // (the eviction branch below would otherwise call
+        // `voices.remove(0)` on an empty Vec and panic).
+        if self.voice_cap == 0 {
             return;
         }
         // Pull factory + decay model out under the read lock first so we
@@ -477,6 +484,22 @@ mod tests {
             "factory_b_probe should have produced the new voice and rendered at least once"
         );
         assert_eq!(pool.channel_factory_name(0), "factory_b_probe");
+    }
+
+    #[test]
+    fn voice_cap_zero_does_not_panic() {
+        // A degenerate pool with zero capacity should silently swallow
+        // NoteOn dispatches rather than panic on `voices.remove(0)`.
+        let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
+        let pool = VoicePool::new(44_100.0, 0, f);
+        assert_eq!(pool.active_count(), 0);
+        pool.dispatch(&note_on(0, 60, 100));
+        pool.dispatch(&note_on(0, 62, 100));
+        assert_eq!(pool.active_count(), 0);
+        // process_block on an empty pool must also be a no-op.
+        let mut buf = vec![0.0_f32; 16];
+        pool.process_block(&mut buf);
+        assert_eq!(pool.active_count(), 0);
     }
 
     #[test]
