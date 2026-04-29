@@ -292,6 +292,16 @@ name = "jukebox"
 path = "src/bin/jukebox.rs"
 required-features = ["native"]
 
+# jukebox_lite binary: YouTube-style minimal browser
+# (team/jukebox-lite-rebuild). Same backend modules as `jukebox`
+# (library_db / play_log / preview_cache / gui_cp) but a heavily
+# trimmed UI: header search, mood/genre sidebar, song-card grid,
+# Now Playing bar. Voice picking is mood-driven (no per-row UI).
+[[bin]]
+name = "jukebox_lite"
+path = "src/bin/jukebox_lite.rs"
+required-features = ["native"]
+
 # seq_grid binary: standalone egui step-sequencer pattern grid.
 [[bin]]
 name = "seq_grid"
