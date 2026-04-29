@@ -290,6 +290,15 @@ required-features = ["native"]
 # jukebox_lite_g の4変種は archive/jukebox-bins-2026-04-30 タグに退避。
 # 今後の jukebox 機能は jukebox_lite_seq (sequencer + list view 統合) に集約。
 
+# jukebox_lite_seq binary: jukebox_lite_c list view + a BMS-style live
+# sequencer view. The sequencer drives `voices_live/*` cdylibs in-process
+# (no `render_midi` subprocess, no preview_cache) so voice / mute / solo /
+# tempo changes take effect mid-playback.
+[[bin]]
+name = "jukebox_lite_seq"
+path = "src/bin/jukebox_lite_seq.rs"
+required-features = ["native"]
+
 # seq_grid binary: standalone egui step-sequencer pattern grid.
 [[bin]]
 name = "seq_grid"
