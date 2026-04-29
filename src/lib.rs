@@ -48,6 +48,8 @@ pub mod library_db;
 #[cfg(feature = "native")]
 pub mod live_reload;
 #[cfg(feature = "native")]
+pub mod midi_sched;
+#[cfg(feature = "native")]
 pub mod play_log;
 #[cfg(feature = "native")]
 pub mod preview_cache;
