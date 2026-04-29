@@ -19,40 +19,14 @@
 //!   - `set_channel_factory` is the only writer of the channel routing
 //!     table; everything else takes a read lock.
 //!
-//! TODO(integrate): unify `MidiEvent`/`MidiEventKind` with
-//! `crate::midi_sched` once the SCHED branch lands. The duplicated
-//! definitions below are a deliberate placeholder so this file builds
-//! and tests in isolation; the hub will replace them with a `pub use`
-//! re-export at integration time.
-
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::synth::VoiceImpl;
 use crate::voice_lib::DecayModel;
 
-// ---------------------------------------------------------------------------
-// MidiEvent (placeholder; see TODO(integrate) above)
-// ---------------------------------------------------------------------------
-
-/// One MIDI event tagged with its destination channel. The pool is the
-/// authority over how each channel maps to a `VoiceFactory`; the
-/// scheduler only emits these structs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MidiEvent {
-    pub channel: u8,
-    pub kind: MidiEventKind,
-}
-
-/// Subset of the MIDI 1.0 wire protocol that the pool understands.
-/// Velocity is 0..=127 (raw MIDI byte); the pool normalises it to
-/// 0.0..=1.0 before handing it to the factory.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MidiEventKind {
-    NoteOn { note: u8, velocity: u8 },
-    NoteOff { note: u8 },
-    /// Trigger release on every voice routed to this channel.
-    AllNotesOff,
-}
+// `MidiEvent` / `MidiEventKind` の単一定義は `crate::midi_sched` 側。
+// POOL は同じ型を再エクスポートして使う (Phase 1 hub 統合で Plan A 解消)。
+pub use crate::midi_sched::{MidiEvent, MidiEventKind};
 
 // ---------------------------------------------------------------------------
 // VoiceFactory
