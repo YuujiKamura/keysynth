@@ -35,6 +35,17 @@ Thumbs.db
 *.log
 *.tmp
 
+# Python bytecode (Stage C collector tooling is Python).
+__pycache__/
+*.pyc
+
+# Stage C collector-hardening artifacts (tools/collector_validate.py).
+# Regenerated on every `scripts/run-collector.sh` run and uploaded as
+# the song-collector.yml workflow artifact; never committed.
+tools/.collector-failures.json
+tools/.collector-validated.json
+bench-out/songs/manifest.json.bak
+
 # bench artifacts + acquired audio data
 # NEVER commit acquired sound data, sample libraries, or impulse responses.
 # Many free-licence packs are CC-BY / CC-NC and DO NOT permit redistribution
