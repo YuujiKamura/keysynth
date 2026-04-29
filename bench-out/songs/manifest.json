@@ -1493,7 +1493,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/frantic-boss-battle.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "CC0 indie-game-style boss battle theme — fast 16th-note runs across multiple instruments. Exercises voice polyphony at high event density.",
       "tags": [
         "game",
@@ -1512,7 +1512,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/lighthearted-battle-theme.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Upbeat JRPG-style battle theme. Major-key, melodic — counterpoint to the frantic boss track.",
       "tags": [
         "game",
@@ -1531,7 +1531,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/arena-rock.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "CC0 driving rock-arena instrumental. Power-chord harmonic vocabulary — extends genre coverage beyond keyboard literature.",
       "tags": [
         "game",
@@ -1550,7 +1550,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/game-over.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Short 'game over' sting (<1 KiB SMF). Useful as a UX-style cue and as a smoke-test for very short pieces.",
       "tags": [
         "game",
@@ -1569,7 +1569,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/gather-your-party.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Adventure-game tavern / party-formation cue. Mid-tempo, layered — a different timbral target than the battle tracks.",
       "tags": [
         "game",
@@ -1588,7 +1588,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/overture-2021.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Long-form (~44 KiB SMF) game overture. Tests sustained voice behavior over multi-minute playback.",
       "tags": [
         "game",
@@ -1607,7 +1607,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/sitar-jam.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "CC0 indie game cue with sitar-flavored melodic line. Modal, pentatonic-leaning — non-Western tonal stress test.",
       "tags": [
         "game",
@@ -1626,7 +1626,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/math-metal.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Odd-meter math-metal-style instrumental. Irregular phrase lengths exercise the voice's transient response under unsteady accent patterns.",
       "tags": [
         "game",
@@ -1645,7 +1645,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/movin-on.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Mid-tempo CC0 instrumental — overworld-traversal vibe. Typical SNES-RPG-adjacent style.",
       "tags": [
         "game",
@@ -1664,7 +1664,7 @@
       "license": "CC0",
       "source": "github.com/m-malandro/CC0-midis",
       "source_url": "https://raw.githubusercontent.com/m-malandro/CC0-midis/main/midis/android-observation-room.mid",
-      "suggested_voice": "synth-square",
+      "suggested_voice": "square",
       "context": "Sci-fi ambient cue. Sparse texture — exposes voice noise floor / sustain quality.",
       "tags": [
         "game",
@@ -1672,6 +1672,348 @@
         "scifi",
         "cc0",
         "license:cc0"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v0_original.wav",
+      "title": "AI Chiptune Lab — v0 · Original",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. Claude の最初の作曲. 音楽理論ベース, 耳なし.",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v10_legacy_reborn.wav",
+      "title": "AI Chiptune Lab — v10 · Legacy Reborn",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 初の『構成』を持つ楽曲。イントロ4小節 + メイン8小節。イントロは低域とリズムのみで静かに開始し、物理モデリングの弦楽器が徐々に熱量を高める。メインフレーズではFM音源の煌びやかなリードが加わり、SNESエコーによって壮大な空間が広がる。単なるループを超え、物語性を感じさせる『ゲームの幕開け』を表現した。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v11_claude_motif.wav",
+      "title": "AI Chiptune Lab — v11 · Motif Development",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. モチーフ変奏で勝負. 4音モチーフ M = [E4 D4 C4 A4] (step-step-skip3rd の下降形) を全8小節で変形. Bar1=原形+反転, Bar2=Fへ転調, Bar3=Gへ転調, Bar4=拡大(2倍長), Bar5=断片化+16分速攻, Bar6=call&response, Bar7=経過音付加+上行, Bar8=原形回帰+長音着地. モチーフの同一性を維持したまま8通りの顔を見せる古典的技法. 他トラックはモチーフを邪魔しない単純支持.",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v11_staccato_strike.wav",
+      "title": "AI Chiptune Lab — v11 · Staccato Strike",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. ゲートタイム(Gate)を駆使して、機械的な平坦さを排除。LeadのGateを0.2まで絞り、物理モデリングの鋭い弦の響きと16分音符の細かな連符を組み合わせることで、生身の奏者が弾いているような『タメ』と『キレ』を表現した。低域も極短のGateで歯切れよく刻み、ビートの隙間に潜むグルーヴを強調。AI特有ののっぺりとした質感を払拭した野心作。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v12_codex_compose2.wav",
+      "title": "AI Chiptune Lab — v12 · Clockwork Tofu Chase",
+      "composer": "Codex (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. Codex round-2 composition. I chose a quirky chase theme instead of title-rock, broken-beat, grand narrative, or motif-variation formalism: a clockwork sub-character sprint with a slightly mischievous arcade pulse. The lead uses sawtooth for sharper attack, the harmony uses sine t",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:codex",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v12_tears_of_the_tofu.wav",
+      "title": "AI Chiptune Lab — v12 · Tears of the Tofu",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 『主題(Theme)』の確立に全力を注いだ一曲。イントロで主題の予兆を見せ、メインでFM音源による『歌い上げるリード』が炸裂。16分音符の細かな震え(ビブラート)と、オクターブを超える大胆なメロディの跳躍により、これまでの無機質なループから『キャラの感情を代弁する音楽』へと昇華させた。アクセントの強弱とゲートタイムの制御でAI感を払拭。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v13_zenith.wav",
+      "title": "AI Chiptune Lab — v13 · Tofu Zenith",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. v10(構成)×v11(キレ)×v4(旋律)の集大成。物理モデリングによる極短Gateのスラップベースが地を這い、FM音源の高速アルペジオ主題が空を駆ける。イントロ4小節でリズムの緊張感を極限まで高め、5小節目から一桁台の王道メロディを現代的音色で爆発させる構成。エコーとスタッカートの共存により、リッチさとスピード感を両立させた。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v14_overdrive_tofu.wav",
+      "title": "AI Chiptune Lab — v14 · Overdrive Tofu",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 音源エンジンの限界に挑んだハードロック・チューン。物理モデリングの弦に激しいオーバードライブを掛け、唸るエレキギターの質感を再現。ドラムセットも一新し、ピッチスライドを伴う重厚なキックと芯のあるスネアを導入。チップチューンの枠を超え、生楽器のエネルギーとデジタル歪みが融合した、格闘ゲームのボルテージを最高潮に引き上げる一曲。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v1_gemini_fix.wav",
+      "title": "AI Chiptune Lab — v1 · Gemini Fix",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. Gemini 指摘3点を適用: (1) Bar3 Lead末尾 F4→B4 (2) Bar4 Bass をルート固定 (3) Triangle +2dB / Pulse1 -1dB",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v2_broken_beat.wav",
+      "title": "AI Chiptune Lab — v2 · Broken Beat",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 同じ進行(Am-F-G-Am)でリズムだけ全面改訂. ドラム: 変拍子風シンコペーション(kick clusters + 裏スネア). Lead: 長短混在のスタッカート. Harm: 裏拍ステイブ. Bass: 奇数ステップのルート. 正調ロックからブレイクビート感へ.",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v3_bass_fix.wav",
+      "title": "AI Chiptune Lab — v3 · Bass Locked",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. v2 から Bass のみ修正. Bar1/Bar3 で step 8 (beat 3) に必ずルートを置いて重心を固定. 他のトラック (Lead/Harm/Drum) と mix は v2 完全同一.",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v4_gemini_compose.wav",
+      "title": "AI Chiptune Lab — v4 · Iron Tofu Burst",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 格闘ゲームのタイトル画面に求められる『闘志の着火』をテーマに構成。v0の安定感とv2の躍動感を統合。Leadは16分音符の高速アルペジオで疾走感を出しつつ、Bassは8分音符主体のドライビング・ラインで重心を徹底的に固定。Harmは裏拍にアクセントを置き、Drumsはダブルキック気味の重厚なパターンを採用。全体として、プレイヤーを煽りつつも操作の邪魔をしない、推進力の高いアンサンブルを目指した。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v5_codex_compose.wav",
+      "title": "AI Chiptune Lab — v5 · Tofu Slipstream",
+      "composer": "Codex (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. Codex composition for the multi-AI contest. Instead of straight rock or dense arpeggio spam, this version uses a diagonal lead line that keeps slipping across the barline feel, with small gaps in harmony and bass to suggest unstable acceleration. The target image is a title scree",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:codex",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v6_claude_struct.wav",
+      "title": "AI Chiptune Lab — v6 · Claude Struct",
+      "composer": "Claude (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. 構造勝負. 8小節3部構成: (1) Bar1-2 イントロ = Lead単騎, ドラムは『デーン』キックのみ, 最後にスネアフィルでバンド呼び込み. (2) Bar3-6 メイン = 4ch合流, Am-F-G-Am. (3) Bar7-8 裏フレーズ = 降下メロ+コード変動(F-C-G-D)+フィル, 最終小節で A2 に着地してループ頭のイントロへ戻る. rockman_title.py (2025-03) で実装した『沈黙→デーン→合流→解決』の型を JSON で復活.",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:claude",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v6_proper_breakbeat.wav",
+      "title": "AI Chiptune Lab — v5 · Proper Breakbeat",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. v2の『壊れたビート』を『グルーヴするブレイクビート』へ昇華。Bassの各小節1拍目を固定し、ドラムのキックに追従した16分音符のシンコペーションを導入。低域がキックと共に跳ねることで、v2の不安定さが力強い推進力へと変わる。LeadのDuty 0.125の細さとBassの太いTriangleの対比を強調。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v7_ethereal_tofu.wav",
+      "title": "AI Chiptune Lab — v7 · Ethereal Tofu",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. render.pyを拡張し、エンベロープ(ADSR)制御を導入。Leadはアタックを遅くしたパッド音色、Bassはリリースを削り落としたパーカッシブなピチカート音色、Harmは極細Duty比による金属的なベル音色を採用。従来の『ピコピコ』から『幻想的・硬質』な空間演出へと音の質感を劇的に変化させた。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v8_cyber_tofu_overdrive.wav",
+      "title": "AI Chiptune Lab — v8 · Cyber Tofu Overdrive",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 195, A minor. テンポをBPM 195まで引き上げ、波形選択肢を拡張。Leadに攻撃的なSawtooth波形を、Bassに深く沈むSine波形を導入。もはや8-bitの枠を超えた現代的なサイバー・トランスの質感を追求。高速なアルペジオと重厚な低域により、これまでのバリエーションとは一線を画す圧倒的な疾走感を目指した。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
+      ],
+      "era": "Game"
+    },
+    {
+      "file": "bgm_v9_tofu_legacy.wav",
+      "title": "AI Chiptune Lab — v9 · Tofu Legacy",
+      "composer": "Gemini (AI-composed, 2025)",
+      "instrument": "synth",
+      "license": "MIT",
+      "source": "ai-chiptune-lab",
+      "source_url": "https://github.com/YuujiKamura/ai-chiptune-lab",
+      "suggested_voice": "square",
+      "context": "BPM 150, A minor. SNES/Konamiサウンドへのオマージュ。FM合成によるクリスタルなLead、物理モデリングによる生楽器に近い質感のHarm、そしてSNES最大の特徴である『温かいエコー』を実装。これまでのデジタルな質感から、奥行きと有機的な響きを持つ次世代の音響空間へと進化させた。",
+      "tags": [
+        "game",
+        "chiptune",
+        "ai-composed",
+        "author:gemini",
+        "license:mit"
       ],
       "era": "Game"
     }
