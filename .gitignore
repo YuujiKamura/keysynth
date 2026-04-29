@@ -174,3 +174,7 @@ sfz-libraries/
 pr_body.md
 target-codex/
 target-claude/
+
+# tools/mutopia_collector.py page cache. Re-fetchable from the live
+# catalogue; only the resulting `*.mid` + manifest.json are checked in.
+bench-out/.mutopia-cache/

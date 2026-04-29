@@ -1,10 +1,20 @@
-# Public-domain MIDI catalog (`bench-out/songs/`)
+# Permissive-license MIDI catalog (`bench-out/songs/`)
 
-Static collection of permissive-license MIDI files for hand-auditioning
-the keysynth voice families on real musical material. Curated rather
-than auto-generated: every entry is verified Public Domain via the
-Mutopia Project catalogue, with the canonical FTP URL recorded in
-`manifest.json`.
+Collection of permissive-license MIDI files (Public Domain or CC-BY 4.0)
+for hand-auditioning the keysynth voice families on real musical
+material. Two curation paths feed the same `manifest.json`:
+
+1. **Hand-curated seed** (the original 13 entries, PR #63) — picked for
+   pedagogical relevance to specific voice families (sustain stress,
+   tremolo, broken chords, etc.). Per-piece `context` field documents
+   the testing rationale.
+2. **Agent-collected** (Stage B, `tools/mutopia_collector.py`) — an
+   AI agent walks the Mutopia Project catalogue, filters by license
+   (allowlist: Public Domain, CC-BY 4.0; excludes CC-BY-SA / CC-BY-NC),
+   round-robins by composer surname for diversity, and downloads up to
+   N pieces per instrument. Idempotent (skips ids and source URLs that
+   already appear in the manifest). Layer 1 of the data-collection
+   plan: AI agent does the legwork that a human did before.
 
 This catalog is **independent** of the in-tree `render_song::piece_*()`
 hardcoded pieces (arpeggio / twinkle / bach_invention /
@@ -14,34 +24,24 @@ The two paths are complementary: render_song's pieces are
 deterministic Rust-defined fixtures; this catalog is real public-domain
 repertoire.
 
-## Contents (13 entries)
+## Contents
 
-### Guitar (10 pieces)
+`manifest.json` is the source of truth. Counts and per-piece metadata
+(`composer`, `license`, `source_url`, `suggested_voice`, `tags`,
+`context`) live there. Run `keysynth_db query --instrument <i>` for the
+current listing, e.g.:
 
-| File                                | Composer                  | Date        |
-|-------------------------------------|---------------------------|-------------|
-| `aguado_op3_no1.mid`                | D. Aguado                 | 1820s       |
-| `bach_bwv999_prelude.mid`           | J.S. Bach (BWV 999)       | c. 1720     |
-| `carcassi_op1_no1.mid`              | M. Carcassi               | 1820s       |
-| `giuliani_op50_no1_papillon.mid`    | M. Giuliani (Le Papillon) | 1822        |
-| `sor_op1_no1.mid`                   | F. Sor                    | 1810s       |
-| `tarrega_adelita.mid`               | F. Tárrega (Mazurka)      | 1899        |
-| `tarrega_capricho_arabe.mid`        | F. Tárrega                | 1892        |
-| `tarrega_recuerdos.mid`             | F. Tárrega (Recuerdos de la Alhambra) | 1896 |
-| `trad_redapplerag.mid`              | Traditional (American)    | early 20th C |
-| `trad_soldiersjoy.mid`              | Traditional (Anglo-American) | 18th C    |
+```bash
+F:/rust-targets/release/keysynth_db.exe query --instrument guitar
+F:/rust-targets/release/keysynth_db.exe query --composer Bach
+F:/rust-targets/release/keysynth_db.exe query --era Romantic --instrument piano
+```
 
-### Piano (3 pieces)
-
-| File                                | Composer                  | Date  |
-|-------------------------------------|---------------------------|-------|
-| `mozart_kv309_1.mid`                | W.A. Mozart (KV 309 mvt 1) | 1777 |
-| `satie_danse.mid`                   | E. Satie (6 Croquis)       | 1913 |
-| `albeniz_op71_rumores.mid`          | I. Albéniz (Rumores de la Caleta) | 1886 |
-
-Per-piece `composer`, `license`, `source_url`, `suggested_voice`, and
-`context` (one-line rationale for the choice) are in
-[`manifest.json`](./manifest.json).
+The hand-curated seed (PR #63) is identifiable by short, descriptive
+file names (`aguado_op3_no1.mid`, `tarrega_recuerdos.mid`,
+`mozart_kv309_1.mid`, ...). Agent-collected entries keep their
+upstream Mutopia file stems so the canonical URL ↔ on-disk filename
+mapping is one-to-one.
 
 ## License
 
@@ -51,20 +51,22 @@ restricts contributions to Public Domain / CC0 / CC-BY / CC-BY-SA;
 each file's per-piece license metadata sits on its catalogue page
 (linked from the `source_url` field).
 
-## Re-download
+## Re-download (existing entries)
 
 Every URL is HTTPS / direct-link / curl-able with no authentication.
-To re-fetch the whole catalog from scratch:
+To re-fetch the whole catalog from scratch using stdlib only:
 
 ```bash
-mkdir -p bench-out/songs
-while IFS= read -r line; do
-    file=$(echo "$line" | jq -r .file)
-    url=$(echo "$line"  | jq -r .source_url)
-    out="bench-out/songs/${file}"
-    [[ -s "$out" ]] && { echo "skip $file"; continue; }
-    curl -fsSL -o "$out" "$url" && echo "fetch $file"
-done < <(jq -c '.entries[]' bench-out/songs/manifest.json)
+python - <<'PY'
+import json, urllib.request, pathlib
+m = json.load(open('bench-out/songs/manifest.json', encoding='utf-8'))
+for e in m['entries']:
+    out = pathlib.Path('bench-out/songs') / e['file']
+    if out.exists() and out.stat().st_size > 0:
+        print('skip', e['file']); continue
+    out.write_bytes(urllib.request.urlopen(e['source_url']).read())
+    print('fetch', e['file'])
+PY
 ```
 
 If a Mutopia URL returns 404, the piece directory has been
@@ -72,6 +74,29 @@ restructured upstream. Open the catalogue page
 (`https://www.mutopiaproject.org/cgibin/make-table.cgi?Instrument=Guitar`
 or `?Instrument=Piano`), find the piece, copy the `.mid` URL into
 the entry's `source_url` in `manifest.json`, and re-run the loop.
+
+## Add new entries (Stage B Agent Collector)
+
+`tools/mutopia_collector.py` (stdlib only, no third-party deps) walks
+the Mutopia catalogue, filters by license, and appends N more entries
+per instrument. Idempotent — re-running with the same target counts is
+a no-op once the manifest is full enough.
+
+```bash
+python tools/mutopia_collector.py \
+    --target-guitar 25 --target-piano 25 \
+    [--dry-run]            # preview picks without downloading
+
+# Then refresh the materialized SQLite catalog so query / Steel REPL
+# pick up the new rows:
+F:/rust-targets/release/keysynth_db.exe rebuild
+F:/rust-targets/release/ksrepl.exe -e '(query-songs :composer "Bach")'
+```
+
+License allowlist: `Public Domain`, `CC-BY 4.0`. CC-BY-SA, CC-BY-NC,
+and unknown licenses are rejected. The script picks composer-diverse
+entries via round-robin so a target of 25 spreads across ~15+
+composers rather than dumping a single op-set.
 
 ## Rendering
 

@@ -11,7 +11,7 @@
       "unknown / typesetter-claimed restrictions"
     ]
   },
-  "acquisition_date": "2026-04-28",
+  "acquisition_date": "2026-04-29",
   "entries": [
     {
       "file": "aguado_op3_no1.mid",
@@ -155,6 +155,818 @@
       "source_url": "https://www.mutopiaproject.org/ftp/AlbenizIMF/O71/Rumores_de_la-caleta/Rumores_de_la-caleta.mid",
       "suggested_voice": "piano-modal",
       "context": "Spanish-romantic Andalusian flavour with rolled chords and rubato. Tests the piano voice on a programmatic / coloristic piece rather than a strict-tempo classical line."
+    },
+    {
+      "file": "wtk1-prelude1-guitar-duo.mid",
+      "title": "Das Wohltemperierte Klavier I, Praeludium I",
+      "composer": "J. S. Bach (1685-1750)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BachJS/BWV846/wtk1-prelude1-guitar-duo/wtk1-prelude1-guitar-duo.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Baroque-period Bach guitar piece (BWV 846) composed 1722 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "baroque",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "pathetique-2-guitar-duo.mid",
+      "title": "Sonata No. 8 “Pathétique” (2nd Movement: Adagio cantabile)",
+      "composer": "L. V. Beethoven (1770-1827)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BeethovenLv/O13/pathetique-2-guitar-duo/pathetique-2-guitar-duo.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Beethoven guitar piece (Op. 13) composed 1798 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "sonata",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "LullabyBrahms-C.mid",
+      "title": "Cancion de Cuna",
+      "composer": "J. Brahms (1833-1897)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BrahmsJ/LullabyBrahms-C/LullabyBrahms-C.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Brahms guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "lullaby.mid",
+      "title": "Lullaby to an Eastern Child",
+      "composer": "C. J. Brown (1947-2016)",
+      "instrument": "guitar",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BrownCJ/lullaby/lullaby.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Brown guitar piece composed December 2008 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "CarcassiMethodPreludes.mid",
+      "title": "Preludes in Progressive Keys from Méthode complète pour Guitare",
+      "composer": "M. Carcassi (1792-1853)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CarcassiM/O59/CarcassiMethodPreludes/CarcassiMethodPreludes.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Carcassi guitar piece (Op. 59) composed 1836 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "prelude",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "guitar-skole-no-01.mid",
+      "title": "Guitar-Skole no. 1 : Waltz, op. 241, no 1",
+      "composer": "F. Carulli (1770-1841)",
+      "instrument": "guitar",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CarulliF/guitar-skole-no-01/guitar-skole-no-01.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Carulli guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "waltz",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "guitar-skole-no-10.mid",
+      "title": "Guitar-Skole no. 10 : Menuett, fra det 17de Aarhundrede",
+      "composer": "N. Coste (1805-1883)",
+      "instrument": "guitar",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CosteN/guitar-skole-no-10/guitar-skole-no-10.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Coste guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "minuet",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "faure_dolly_berceuse.mid",
+      "title": "Berceuse",
+      "composer": "G. Fauré (1845-1924)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/FaureG/O56/faure_dolly_berceuse/faure_dolly_berceuse.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Fauré guitar piece (Op. 56) — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "saltarello.mid",
+      "title": "Saltarello",
+      "composer": "V. Galilei (1520-1591)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/GalileiV/saltarello/saltarello.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Renaissance-period Galilei guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "renaissance",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "giuliani-op50n02.mid",
+      "title": "Opus 50 No. 2",
+      "composer": "M. Giuliani (1781-1829)",
+      "instrument": "guitar",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/GiulianiM/O50/giuliani-op50n02/giuliani-op50n02.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Giuliani guitar piece (Op. 50) — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "stille-orig.mid",
+      "title": "Stille Nacht",
+      "composer": "F. X. Gruber (1787-1863)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/GruberFX/stille-orig/stille-orig.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Hymn-period Gruber guitar piece composed 1816 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "hymn",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "horetzky1.mid",
+      "title": "Nº. 1. March by Rossini.",
+      "composer": "F. Horetzky (1796-1870)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/HoretzkyF/horetzky1/horetzky1.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Horetzky guitar piece composed unk — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "march",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "SixStudiesA.mid",
+      "title": "Six Progressive Studies: No. I",
+      "composer": "F. Knjze (1784-1840)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/KnjzeF/SixStudiesA/SixStudiesA.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Knjze guitar piece composed unk — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Matiegka2.mid",
+      "title": "Nº. 2. Rondo",
+      "composer": "W. T. Matiegka (1773-1830)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/MatiegkaWT/Matiegka2/Matiegka2.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Matiegka guitar piece composed unk — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "guitar-skole-no-04.mid",
+      "title": "Guitar-Skole no. 4 : Andante",
+      "composer": "J. K. Mertz (1806-1856)",
+      "instrument": "guitar",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/MertzJK/guitar-skole-no-04/guitar-skole-no-04.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Mertz guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "milan-pavan2.mid",
+      "title": "Pavan 2",
+      "composer": "L. Milan (1536-1561)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/MilanL/milan-pavan2/milan-pavan2.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Renaissance-period Milan guitar piece composed 16th C. — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "renaissance",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "guitar-duo-complete.mid",
+      "title": "Ah Vous Dirai-Je Maman",
+      "composer": "W. A. Mozart (1756-1791)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/MozartWA/KV265/guitar-duo-complete/guitar-duo-complete.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Mozart guitar piece composed 1785 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "recuerdos-luna.mid",
+      "title": "Recuerdos de la Luna",
+      "composer": "Jeffrey Olson (1947-)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/OlsonJJ/recuerdos-luna/recuerdos-luna.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Olson guitar piece composed 1896 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "sanz-1.mid",
+      "title": "Preludio",
+      "composer": "G. Sanz (1640-1710)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/SanzG/sanz-1/sanz-1.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Sanz guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Sor_Etude_Opus35_14.mid",
+      "title": "No. 14: Etude",
+      "composer": "F. Sor (1778-1839)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/SorF/O35/Sor_Etude_Opus35_14/Sor_Etude_Opus35_14.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Sor guitar piece (Opus 35, No. 14) — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "etude",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "adelita-duo.mid",
+      "title": "Adelita",
+      "composer": "F. Tarrega (1852-1909)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/TarregaF/adelita-duo/adelita-duo.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Romantic-period Tarrega guitar piece composed n.d. — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Greensleaves.mid",
+      "title": "Greensleaves",
+      "composer": "Traditional",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/Traditional/Greensleaves/Greensleaves.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Renaissance-period Traditional guitar piece — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "renaissance",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "SpanishFandango1882.mid",
+      "title": "Spanish Fandango",
+      "composer": "H. Worrall (1825-1902)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/WorrallH/SpanishFandango1882/SpanishFandango1882.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Worrall guitar piece composed 1882 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Bach_Preludio_BWV997.mid",
+      "title": "Prelude to Suite in C Major",
+      "composer": "J. S. Bach (1685-1750)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BachJS/BWV997/Bach_Preludio_BWV997/Bach_Preludio_BWV997.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Baroque-period Bach guitar piece (BWV 997) — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "baroque",
+        "guitar",
+        "prelude",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "moonlight-guitar-duo.mid",
+      "title": "Sonata No. 14 “Moonlight” (1st Movement: Adagio sostenuto)",
+      "composer": "L. V. Beethoven (1770-1827)",
+      "instrument": "guitar",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BeethovenLv/O27/moonlight-guitar-duo/moonlight-guitar-duo.mid",
+      "suggested_voice": "guitar-stk",
+      "context": "Classical-period Beethoven guitar piece composed 1802 — exercises the guitar-stk voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "guitar",
+        "sonata",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Vocalise1.mid",
+      "title": "Vocalise № 1",
+      "composer": "F. Abt (1819-1885)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AbtF/Vocalise1/Vocalise1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Abt piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "giselle.mid",
+      "title": "Giselle - Pas de deux (1er Acte)",
+      "composer": "A. Adam (1803-1856)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AdamA/giselle/giselle.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Adam piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "bluemtns.mid",
+      "title": "The Blue Alsatian Mountains",
+      "composer": "S. Adams (1844-1913)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AdamsS/bluemtns/bluemtns.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Adams piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "andre-sonatine.mid",
+      "title": "Sonatine",
+      "composer": "J. André (1741-1799)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AndreJ/O34/andre-sonatine/andre-sonatine.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period André piano piece (Opus 34. I.) composed 18th Century — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "lanative.mid",
+      "title": "La Native",
+      "composer": "Anonymous",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/Anonymous/lanative/lanative.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Popular / Dance-period Anonymous piano piece composed c1860 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "popular / dance",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "alice.mid",
+      "title": "Alice, Where Art Thou?",
+      "composer": "J. Ascher (1829-1869)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/AscherJ/alice/alice.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Ascher piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "cpe-bach-rondo.mid",
+      "title": "Rondo in E-flat Major",
+      "composer": "C. P. E. Bach (1714-1788)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BachCPE/cpe-bach-rondo/cpe-bach-rondo.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Bach piano piece (H.288) composed 18th Century — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "rom_folk_dance_1_bartok.mid",
+      "title": "Romanian Folk Dance No.2 - Peasant Costume",
+      "composer": "B. Bartók (1881-1945)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BartokB/rom_folk_dance_1_bartok/rom_folk_dance_1_bartok.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Bartók piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "LVB_Sonate_02no1_1.mid",
+      "title": "Sonata No. 1 (1st Movement: Allegro)",
+      "composer": "L. V. Beethoven (1770-1827)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BeethovenLv/O2/LVB_Sonate_02no1_1/LVB_Sonate_02no1_1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Beethoven piano piece (Op. 2, No. 1) composed 1794/95 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "sonata",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "in_may_piano.mid",
+      "title": "In May",
+      "composer": "F. Behr (1837-1898)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BehrF/in_may_piano/in_may_piano.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Behr piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "Benda_SonateG3.mid",
+      "title": "3. Satz aus der Sonate in G-Dur",
+      "composer": "J. A. Benda (1722-1795)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BendaJA/Benda_SonateG3/Benda_SonateG3.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Benda piano piece composed 18th Century — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "sonata",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "homeshome.mid",
+      "title": "Home, Sweet Home",
+      "composer": "H. R. Bishop (1786-1855)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BishopHR/homeshome/homeshome.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Bishop piano piece composed 1852 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "mdeux.mid",
+      "title": "Les Deux Anges",
+      "composer": "J. Blumenthal (1829-1908)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BlumenthalJ/mdeux/mdeux.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Blumenthal piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "waltz-op39-10.mid",
+      "title": "Waltz No. 10",
+      "composer": "J. Brahms (1833-1897)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BrahmsJ/O39/waltz-op39-10/waltz-op39-10.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Brahms piano piece (Op. 39) composed 19th C — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "waltz",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "ebbflow.mid",
+      "title": "Ebb and Flow",
+      "composer": "C. J. Brown (1947-2016)",
+      "instrument": "piano",
+      "license": "CC-BY 4.0",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BrownCJ/ebbflow/ebbflow.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Brown piano piece composed 2006 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:cc-by"
+      ]
+    },
+    {
+      "file": "25EF-01.mid",
+      "title": "La Candeur",
+      "composer": "J. F. F. Burgmüller (1806-1874)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/BurgmullerJFF/O100/25EF-01/25EF-01.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Burgmüller piano piece (Opus 100.) composed 19th Century — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "sally.mid",
+      "title": "Sally in Our Alley",
+      "composer": "H. Carey (1687?-1743)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CareyH/sally/sally.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Carey piano piece — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "TroisNouvellesEtudes_Chopin_n1.mid",
+      "title": "Trois Nouvelles Etudes, No. 1 F Minor",
+      "composer": "F. F. Chopin (1810-1849)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/ChopinFF/B130/TroisNouvellesEtudes_Chopin_n1/TroisNouvellesEtudes_Chopin_n1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Classical-period Chopin piano piece (B.130) — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "classical",
+        "piano",
+        "etude",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "oldsong.mid",
+      "title": "I Cannot Sing the Old Songs",
+      "composer": "Claribel [C. A. Barnard (1830-1869)]",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/Claribel/oldsong/oldsong.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Barnard piano piece composed 1868 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "cornelius-ein-ton.mid",
+      "title": "Ein Ton",
+      "composer": "P. Cornelius (1824-1874)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CorneliusP/cornelius-ein-ton/cornelius-ein-ton.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Cornelius piano piece composed 19th Century — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "op840-1.mid",
+      "title": "50 Melodische Übungsstücke, No. 1",
+      "composer": "C. Czerny (1791-1857)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/CzernyC/O840/op840-1/op840-1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Czerny piano piece (Op. 840, No. 1) — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "debussy_Arabesque_1.mid",
+      "title": "Première Arabesque",
+      "composer": "C. Debussy (1862-1918)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/DebussyC/L66/debussy_Arabesque_1/debussy_Arabesque_1.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Modern-period Debussy piano piece (L66 No.1) — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "modern",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "NearTheCross.mid",
+      "title": "Near the Cross",
+      "composer": "W. H. Doane (1832-1915)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/DoaneWH/NearTheCross/NearTheCross.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Hymn-period Doane piano piece composed 1869 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "hymn",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "dvorak-als-die-alte-mutter.mid",
+      "title": "Als die alte Mutter",
+      "composer": "A. Dvořák (1841-1904)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/DvorakA/O55/dvorak-als-die-alte-mutter/dvorak-als-die-alte-mutter.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Romantic-period Dvořák piano piece (O 55) composed 1880 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "romantic",
+        "piano",
+        "license:public-domain"
+      ]
+    },
+    {
+      "file": "bmh.mid",
+      "title": "Oh! Boatman, Haste!",
+      "composer": "D. D. Emmett (1815-1904)",
+      "instrument": "piano",
+      "license": "Public Domain",
+      "source": "Mutopia Project",
+      "source_url": "https://www.mutopiaproject.org/ftp/EmmettDD/bmh/bmh.mid",
+      "suggested_voice": "piano-modal",
+      "context": "Song-period Emmett piano piece composed 1843 — exercises the piano-modal voice on real repertoire from the Mutopia catalog.",
+      "tags": [
+        "song",
+        "piano",
+        "license:public-domain"
+      ]
     }
   ]
 }
