@@ -40,8 +40,6 @@ pub mod drums;
 #[cfg(feature = "native")]
 pub mod gui_cp;
 #[cfg(feature = "native")]
-pub mod jukebox_core;
-#[cfg(feature = "native")]
 pub mod dsp;
 #[cfg(feature = "native")]
 pub mod extract;
