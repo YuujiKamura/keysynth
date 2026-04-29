@@ -106,6 +106,69 @@ const ENGINE_SUFFIXES: &[&str] = &[
     "pure",
 ];
 
+/// Strip the trailing "(YYYY-YYYY)" / "(b. YYYY)" / "(Spanish)" parens
+/// from a `composer` so the inline song-list cell stays readable. The
+/// dates already drive era classification; once the era badge is shown
+/// they're noise on the row itself. Trims trailing whitespace so the
+/// result is hover-tooltip-clean too.
+fn compact_composer(composer: &str) -> String {
+    let core = match composer.split_once('(') {
+        Some((before, _)) => before,
+        None => composer,
+    };
+    core.trim().to_string()
+}
+
+/// Background colour for an era badge. Picked to be distinguishable at
+/// a glance against the egui dark theme — same idea as `source_label`'s
+/// palette in `render_piece_row`. Unknown eras fall back to neutral
+/// grey so adding a new era doesn't crash the UI.
+fn era_color(era: &str) -> egui::Color32 {
+    match era {
+        "Baroque" => egui::Color32::from_rgb(200, 160, 100),
+        "Classical" => egui::Color32::from_rgb(140, 220, 160),
+        "Romantic" => egui::Color32::from_rgb(220, 160, 230),
+        "Modern" => egui::Color32::from_rgb(120, 200, 240),
+        "Traditional" => egui::Color32::from_rgb(240, 200, 120),
+        _ => egui::Color32::from_rgb(170, 170, 170),
+    }
+}
+
+/// Compact license label for the inline badge ("Public Domain" → "PD",
+/// "CC-BY-SA 4.0" → "CC-BY-SA"). Keeps the row narrow enough that
+/// composer + era + license still fit before the engine buttons wrap.
+/// The full string remains available via the row tooltip.
+fn license_short(license: &str) -> String {
+    let l = license.trim();
+    let lower = l.to_lowercase();
+    if lower.contains("public domain") || lower == "pd" {
+        "PD".to_string()
+    } else if lower.starts_with("cc0") {
+        "CC0".to_string()
+    } else if lower.starts_with("cc-by-sa") || lower.starts_with("cc by-sa") {
+        "CC-BY-SA".to_string()
+    } else if lower.starts_with("cc-by") || lower.starts_with("cc by") {
+        "CC-BY".to_string()
+    } else if lower.is_empty() {
+        "?".to_string()
+    } else {
+        l.to_string()
+    }
+}
+
+/// Colour-code license category. Public-domain / CC0 are "free to use,
+/// no strings"; CC-BY needs attribution; CC-BY-SA also locks downstream
+/// licensing — surface that distinction so a user picking material for
+/// downstream redistribution can spot share-alike at a glance.
+fn license_color(short: &str) -> egui::Color32 {
+    match short {
+        "PD" | "CC0" => egui::Color32::from_rgb(140, 220, 160),
+        "CC-BY" => egui::Color32::from_rgb(180, 200, 255),
+        "CC-BY-SA" => egui::Color32::from_rgb(255, 200, 120),
+        _ => egui::Color32::from_rgb(170, 170, 170),
+    }
+}
+
 fn classify_source(path: &Path, piece: &str) -> &'static str {
     // Path-driven first: which directory is this file in?
     let path_str = path.to_string_lossy().to_lowercase();
@@ -1180,6 +1243,14 @@ struct Jukebox {
     /// so the user's first click on a popular song is a cache hit.
     /// `None` once the worker has finished or never started.
     prewarm: Option<PrewarmState>,
+    /// DB-driven catalogue filters. Each is a value pulled from the
+    /// matching `Song` column ("Baroque", "Public Domain", "guitar"…)
+    /// and `None` means "show all". A track without DB metadata is
+    /// hidden whenever any of these is set, since by definition we
+    /// can't tell whether it matches.
+    era_filter: Option<String>,
+    license_filter: Option<String>,
+    instrument_filter: Option<String>,
 }
 
 const RECENT_PLAYS_LIMIT: usize = 12;
@@ -1403,6 +1474,9 @@ impl Jukebox {
             favorites_only: false,
             cached_midi_labels,
             prewarm,
+            era_filter: None,
+            license_filter: None,
+            instrument_filter: None,
         })
     }
 
@@ -2093,6 +2167,138 @@ impl eframe::App for Jukebox {
                      bench-out/play_log.db (gitignored, machine-local).",
                 );
             });
+            // ---- DB-driven catalogue filters ----
+            // Each combo is built once per frame from the song_index so a
+            // freshly imported manifest immediately surfaces new eras /
+            // licenses / instruments without needing a separate refresh
+            // path. Empty index → no DB metadata available, skip the row.
+            if !self.song_index.is_empty() {
+                let mut eras: Vec<String> = self
+                    .song_index
+                    .values()
+                    .filter_map(|s| s.era.clone())
+                    .collect();
+                eras.sort();
+                eras.dedup();
+                let mut licenses: Vec<String> = self
+                    .song_index
+                    .values()
+                    .map(|s| s.license.clone())
+                    .collect();
+                licenses.sort();
+                licenses.dedup();
+                let mut instruments: Vec<String> = self
+                    .song_index
+                    .values()
+                    .map(|s| s.instrument.clone())
+                    .collect();
+                instruments.sort();
+                instruments.dedup();
+
+                ui.horizontal(|ui| {
+                    ui.label("browse:");
+                    let era_cur = self
+                        .era_filter
+                        .clone()
+                        .unwrap_or_else(|| "(any era)".to_string());
+                    egui::ComboBox::from_id_salt("era-filter")
+                        .selected_text(era_cur.clone())
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.era_filter.is_none(), "(any era)")
+                                .clicked()
+                            {
+                                self.era_filter = None;
+                            }
+                            for e in &eras {
+                                if ui
+                                    .selectable_label(
+                                        self.era_filter.as_deref() == Some(e.as_str()),
+                                        e,
+                                    )
+                                    .clicked()
+                                {
+                                    self.era_filter = Some(e.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Era buckets are derived from each composer's death year \
+                             (Baroque ≤1750, Classical ≤1820, Romantic ≤1910, Modern \
+                             >1910, Traditional for unattributed folk pieces).",
+                        );
+                    let lic_cur = self
+                        .license_filter
+                        .clone()
+                        .unwrap_or_else(|| "(any license)".to_string());
+                    egui::ComboBox::from_id_salt("license-filter")
+                        .selected_text(lic_cur)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.license_filter.is_none(), "(any license)")
+                                .clicked()
+                            {
+                                self.license_filter = None;
+                            }
+                            for l in &licenses {
+                                if ui
+                                    .selectable_label(
+                                        self.license_filter.as_deref() == Some(l.as_str()),
+                                        l,
+                                    )
+                                    .clicked()
+                                {
+                                    self.license_filter = Some(l.clone());
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text(
+                            "Filter by source license. Use Public Domain / CC0 for \
+                             unrestricted downstream reuse; CC-BY-SA pieces propagate \
+                             share-alike to anything you publish that contains them.",
+                        );
+                    let ins_cur = self
+                        .instrument_filter
+                        .clone()
+                        .unwrap_or_else(|| "(any instrument)".to_string());
+                    egui::ComboBox::from_id_salt("instrument-filter")
+                        .selected_text(ins_cur)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(self.instrument_filter.is_none(), "(any instrument)")
+                                .clicked()
+                            {
+                                self.instrument_filter = None;
+                            }
+                            for i in &instruments {
+                                if ui
+                                    .selectable_label(
+                                        self.instrument_filter.as_deref() == Some(i.as_str()),
+                                        i,
+                                    )
+                                    .clicked()
+                                {
+                                    self.instrument_filter = Some(i.clone());
+                                }
+                            }
+                        });
+                    let any_filter_set = self.era_filter.is_some()
+                        || self.license_filter.is_some()
+                        || self.instrument_filter.is_some();
+                    if any_filter_set
+                        && ui
+                            .button("clear")
+                            .on_hover_text("Reset era / license / instrument filters.")
+                            .clicked()
+                    {
+                        self.era_filter = None;
+                        self.license_filter = None;
+                        self.instrument_filter = None;
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("output:");
                 let current = self.current_device.clone();
@@ -2589,6 +2795,36 @@ impl eframe::App for Jukebox {
                 if self.favorites_only && !self.favorites.contains(&t.label) {
                     continue;
                 }
+                // DB-driven filters: era / license / instrument. A track
+                // without a song_index entry can't be classified, so any
+                // active DB filter excludes it. Once all three are None
+                // this branch is a noop and non-DB tracks (chiptune /
+                // listener-lab / tofu / archive-ref) flow through as
+                // before.
+                if self.era_filter.is_some()
+                    || self.license_filter.is_some()
+                    || self.instrument_filter.is_some()
+                {
+                    let song = match self.song_index.get(&t.label) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    if let Some(want) = &self.era_filter {
+                        if song.era.as_deref() != Some(want.as_str()) {
+                            continue;
+                        }
+                    }
+                    if let Some(want) = &self.license_filter {
+                        if &song.license != want {
+                            continue;
+                        }
+                    }
+                    if let Some(want) = &self.instrument_filter {
+                        if &song.instrument != want {
+                            continue;
+                        }
+                    }
+                }
                 let root = fold_key(&t.piece);
                 folded
                     .entry(root)
@@ -2771,8 +3007,99 @@ impl eframe::App for Jukebox {
                                 } else {
                                     egui::RichText::new(piece).monospace()
                                 };
-                                let piece_w = (avail_w * 0.30).max(200.0);
+                                let piece_w = (avail_w * 0.22).max(180.0);
                                 ui.add_sized([piece_w, 22.0], egui::Label::new(piece_text));
+
+                                // ---- DB metadata badges --------------
+                                // Pull metadata off the first track that
+                                // resolves in song_index (typically all
+                                // renders in a piece share the same DB
+                                // row since the file stem is the same).
+                                // Tracks without a DB row (chiptune /
+                                // listener-lab / tofu) get neutral
+                                // placeholders so column widths stay
+                                // stable across rows.
+                                let song_meta: Option<&Song> = indices
+                                    .iter()
+                                    .filter_map(|i| self.tracks.get(*i))
+                                    .find_map(|t| self.song_index.get(&t.label));
+                                let composer_disp = song_meta
+                                    .map(|s| compact_composer(&s.composer))
+                                    .unwrap_or_else(|| "—".to_string());
+                                let composer_color = if song_meta.is_some() {
+                                    egui::Color32::from_rgb(220, 220, 220)
+                                } else {
+                                    egui::Color32::from_rgb(110, 110, 110)
+                                };
+                                ui.add_sized(
+                                    [160.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(composer_disp)
+                                            .color(composer_color)
+                                            .small(),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    song_meta
+                                        .map(|s| s.composer.clone())
+                                        .unwrap_or_else(|| {
+                                            "no library_db entry — non-MIDI source"
+                                                .to_string()
+                                        }),
+                                );
+                                let era_disp = song_meta
+                                    .and_then(|s| s.era.clone())
+                                    .unwrap_or_else(|| "—".to_string());
+                                ui.add_sized(
+                                    [80.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(era_disp.clone())
+                                            .color(era_color(&era_disp))
+                                            .strong()
+                                            .small(),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Musicological era bucket (derived from composer \
+                                     death year). Use the era filter at the top to \
+                                     pull just one period out of the catalogue.",
+                                );
+                                let lic_disp = song_meta
+                                    .map(|s| license_short(&s.license))
+                                    .unwrap_or_else(|| "—".to_string());
+                                ui.add_sized(
+                                    [70.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(lic_disp.clone())
+                                            .color(license_color(&lic_disp))
+                                            .small()
+                                            .monospace(),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    song_meta
+                                        .map(|s| s.license.clone())
+                                        .unwrap_or_else(|| {
+                                            "license unknown (no DB entry)".to_string()
+                                        }),
+                                );
+                                let instr_disp = song_meta
+                                    .map(|s| s.instrument.clone())
+                                    .unwrap_or_else(|| "—".to_string());
+                                ui.add_sized(
+                                    [60.0, 22.0],
+                                    egui::Label::new(
+                                        egui::RichText::new(instr_disp)
+                                            .color(egui::Color32::from_rgb(180, 180, 200))
+                                            .small()
+                                            .monospace(),
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Recommended-instrument tag from the manifest \
+                                     (drives the suggested-voice pairing).",
+                                );
+
                                 ui.separator();
                                 for &i in indices {
                                     let t = &self.tracks[i];
@@ -3047,6 +3374,30 @@ mod tests {
             }
         }
         assert!(got_nonzero, "MP3 decoded as silence — decoder broken");
+    }
+
+    #[test]
+    fn compact_composer_strips_year_paren() {
+        assert_eq!(compact_composer("J.S. Bach (1685-1750)"), "J.S. Bach");
+        assert_eq!(
+            compact_composer("Francisco Tárrega (1852-1909)"),
+            "Francisco Tárrega"
+        );
+        assert_eq!(compact_composer("Traditional (American)"), "Traditional");
+        assert_eq!(compact_composer("Anonymous"), "Anonymous");
+    }
+
+    #[test]
+    fn license_short_buckets() {
+        assert_eq!(license_short("Public Domain"), "PD");
+        assert_eq!(license_short("public domain"), "PD");
+        assert_eq!(license_short("CC0 1.0"), "CC0");
+        assert_eq!(license_short("CC-BY 4.0"), "CC-BY");
+        assert_eq!(license_short("CC-BY-SA 4.0"), "CC-BY-SA");
+        assert_eq!(license_short(""), "?");
+        // Anything unrecognised passes through verbatim so the user can
+        // still see the raw string and decide.
+        assert_eq!(license_short("Mutopia restricted"), "Mutopia restricted");
     }
 
     #[test]
