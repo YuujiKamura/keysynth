@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS favorites (
     song_id  TEXT PRIMARY KEY,
     added_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS track_voices (
+    song_id    TEXT PRIMARY KEY,
+    voice_id   TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 "#;
 
 #[derive(Debug)]
@@ -257,6 +263,51 @@ impl PlayLogDb {
             .query_row("SELECT COUNT(*) FROM favorites", [], |row| row.get(0))?)
     }
 
+    /// Lookup the user's chosen voice for `song_id`. `None` means the
+    /// user has never picked a voice for this track and the caller
+    /// should fall back to the catalog suggested voice / heuristic.
+    pub fn get_track_voice(&self, song_id: &str) -> Result<Option<String>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT voice_id FROM track_voices WHERE song_id = ?1",
+                params![song_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Persist the user's voice pick for `song_id`. Upsert so toggling
+    /// back and forth reuses the row instead of bloating history.
+    pub fn set_track_voice(&mut self, song_id: &str, voice_id: &str) -> Result<()> {
+        let now = unix_now();
+        self.conn.execute(
+            "INSERT INTO track_voices (song_id, voice_id, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(song_id) DO UPDATE SET voice_id = excluded.voice_id,
+                                                updated_at = excluded.updated_at",
+            params![song_id, voice_id, now],
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot of every persisted (song_id -> voice_id) pick, used by
+    /// the GUI at startup so the catalog reflects the user's last
+    /// session without a per-row SELECT.
+    pub fn track_voices(&self) -> Result<HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT song_id, voice_id FROM track_voices")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = HashMap::new();
+        for r in rows {
+            let (k, v) = r?;
+            out.insert(k, v);
+        }
+        Ok(out)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -292,7 +343,7 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
-        for required in ["favorites", "plays"] {
+        for required in ["favorites", "plays", "track_voices"] {
             assert!(
                 names.iter().any(|n| n == required),
                 "missing table {required} in {names:?}"
@@ -352,6 +403,31 @@ mod tests {
         assert!(!after_off);
         assert!(!db.is_favorite("bach_bwv999_prelude").unwrap());
         assert_eq!(db.count_favorites().unwrap(), 0);
+    }
+
+    #[test]
+    fn track_voice_round_trip() {
+        let mut db = fresh();
+        assert!(db.get_track_voice("bach_bwv999").unwrap().is_none());
+        db.set_track_voice("bach_bwv999", "guitar-stk").unwrap();
+        assert_eq!(
+            db.get_track_voice("bach_bwv999").unwrap().as_deref(),
+            Some("guitar-stk")
+        );
+        // Upsert: second set rewrites the same row.
+        db.set_track_voice("bach_bwv999", "piano-modal").unwrap();
+        assert_eq!(
+            db.get_track_voice("bach_bwv999").unwrap().as_deref(),
+            Some("piano-modal")
+        );
+        db.set_track_voice("scott_joplin_maple", "guitar-stk").unwrap();
+        let all = db.track_voices().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("bach_bwv999"), Some(&"piano-modal".to_string()));
+        assert_eq!(
+            all.get("scott_joplin_maple"),
+            Some(&"guitar-stk".to_string())
+        );
     }
 
     #[test]
