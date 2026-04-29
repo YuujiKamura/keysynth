@@ -354,6 +354,23 @@ name = "ksrepl"
 path = "src/bin/ksrepl.rs"
 required-features = ["native"]
 
+# wav_audit: single-WAV numerical audit — peak/RMS/crest, silence
+# intervals, RMS envelope, spectral envelope, dominant frequencies.
+# Built so an AI agent without ambient audio modality can decide
+# "is this render qualitatively wrong?" purely from numbers.
+[[bin]]
+name = "wav_audit"
+path = "src/bin/wav_audit.rs"
+required-features = ["native"]
+
+# wav_diff: two-WAV numerical diff — cross-correlation peak+lag,
+# multi-resolution STFT distance, spectral envelope ΔdB, peak/RMS
+# deltas. Use to gate ship when something feels off vs last render.
+[[bin]]
+name = "wav_diff"
+path = "src/bin/wav_diff.rs"
+required-features = ["native"]
+
 # ksabtest: Stage F blind A/B harness — pick two voices, render the
 # same MIDI through both, randomize slot assignment, let the listener
 # pick which slot sounds more like a real piano, log every trial to
