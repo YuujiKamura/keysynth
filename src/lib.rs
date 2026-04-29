@@ -45,6 +45,8 @@ pub mod preview_cache;
 #[cfg(feature = "native")]
 pub mod score;
 #[cfg(feature = "native")]
+pub mod scripting;
+#[cfg(feature = "native")]
 pub mod sequencer;
 #[cfg(feature = "native")]
 pub mod sfz;
