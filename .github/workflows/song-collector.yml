@@ -1,0 +1,92 @@
+name: Song Collector
+
+# Daily refresh of the public-domain MIDI catalog. The job runs
+# Stage B collectors (Mutopia, future IMSLP / Wikifonia) followed by
+# the Stage C hardening validator. License-rejected, ID-colliding,
+# missing, and unplayable entries are surfaced through the uploaded
+# failures artifact instead of silently degrading the catalog.
+#
+# This workflow only validates and reports — it never pushes back to
+# the repo. Manifest mutations land through normal PRs after a human
+# reviews tools/.collector-failures.json.
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off-the-hour to avoid Mutopia mirror peaks.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      render_check:
+        description: 'Run cargo render smoke per entry'
+        type: boolean
+        default: true
+
+concurrency:
+  group: song-collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    name: collect + validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install ALSA dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev
+
+      - name: Run validator self-test
+        run: python tools/collector_validate.py --self-test
+
+      - name: Run collector pipeline
+        env:
+          # Manual dispatch chooses; scheduled runs always render-check
+          # because the catalog is small enough (<= ~100 entries) that
+          # the cargo cache makes per-entry render under one second.
+          RENDER_FLAG: ${{ github.event_name == 'workflow_dispatch' && (inputs.render_check && '--render-check' || '') || '--render-check' }}
+        run: |
+          chmod +x scripts/run-collector.sh
+          scripts/run-collector.sh ${RENDER_FLAG}
+        continue-on-error: true
+
+      - name: Upload validator artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: collector-validation-${{ github.run_id }}
+          path: |
+            tools/.collector-failures.json
+            tools/.collector-validated.json
+            bench-out/songs/manifest.json
+          if-no-files-found: warn
+
+      - name: Fail job if catalog has rejections
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          p = pathlib.Path("tools/.collector-failures.json")
+          if not p.is_file():
+              print("no failure log produced — assuming clean")
+              sys.exit(0)
+          data = json.loads(p.read_text(encoding="utf-8"))
+          rejected = data.get("summary", {}).get("rejected", 0)
+          if rejected:
+              print(f"::error::collector rejected {rejected} entries — see uploaded artifact")
+              sys.exit(1)
+          print(f"accepted={data.get('summary', {}).get('accepted', '?')}, no rejections")
+          PY
