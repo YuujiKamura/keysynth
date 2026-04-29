@@ -1316,6 +1316,28 @@ struct Jukebox {
     era_filter: Option<String>,
     license_filter: Option<String>,
     instrument_filter: Option<String>,
+    /// File stem of the row currently focused in the central catalogue.
+    /// Drives the right-side "research" detail pane (composer / era /
+    /// license / source URL / context / per-track tags / note). `None`
+    /// before the user clicks any row, or after the focused track is
+    /// removed by a rescan.
+    selected_label: Option<String>,
+    /// In-memory mirror of `play_log.user_tags`, keyed by song stem.
+    /// Per-row chip rendering reads this without hitting SQLite.
+    user_tags: HashMap<String, Vec<String>>,
+    /// In-memory mirror of `play_log.notes`. Empty / missing entries
+    /// mean "no note yet"; the detail pane renders an empty editor.
+    notes: HashMap<String, String>,
+    /// Edit buffer for the note text area. Held separately so the user
+    /// can type freely without each keystroke racing with persistence;
+    /// flushed on focus-loss or "Save note" click. Tied to
+    /// `note_draft_song` so switching the selected row doesn't silently
+    /// clobber an unsaved edit.
+    note_draft: String,
+    note_draft_song: Option<String>,
+    /// Custom-tag entry buffer for the detail pane. One shared field
+    /// because the pane only edits one song at a time.
+    custom_tag_input: String,
 }
 
 const RECENT_PLAYS_LIMIT: usize = 12;
@@ -1535,7 +1557,15 @@ impl Jukebox {
         let cached_midi_labels = snapshot_cached_midi_voices(&tracks, &selected_voices);
         let prewarm =
             spawn_startup_prewarm(&tracks, &play_counts, &cached_midi_labels, &selected_voices);
-        Ok(Self {
+        let user_tags = play_log
+            .as_ref()
+            .and_then(|db| db.all_user_tags().ok())
+            .unwrap_or_default();
+        let notes = play_log
+            .as_ref()
+            .and_then(|db| db.all_notes().ok())
+            .unwrap_or_default();
+        let mut state = Self {
             tracks,
             selected: None,
             filter: String::new(),
@@ -1559,7 +1589,110 @@ impl Jukebox {
             era_filter: None,
             license_filter: None,
             instrument_filter: None,
-        })
+            selected_label: None,
+            user_tags,
+            notes,
+            note_draft: String::new(),
+            note_draft_song: None,
+            custom_tag_input: String::new(),
+        };
+        // Open the detail pane on the most-recently-played track (or
+        // first ★ favorite, or first track) so the user has a concrete
+        // example of what marking + notes look like the moment the GUI
+        // opens. Also confirms the panel renders during E2E verify.
+        let initial = state
+            .recent_plays
+            .first()
+            .map(|e| e.song_id.clone())
+            .or_else(|| state.favorites.iter().next().cloned())
+            .or_else(|| state.tracks.first().map(|t| t.label.clone()));
+        if let Some(stem) = initial {
+            state.set_selected_label(&stem);
+        }
+        Ok(state)
+    }
+
+    /// Built-in marker palette surfaced at the top of the detail pane
+    /// so a brand-new user has obvious next steps. Custom strings can
+    /// still be added via the "+ tag" input — order here is the
+    /// preferred display sequence.
+    const KNOWN_TAGS: &'static [(&'static str, &'static str, &'static str)] = &[
+        ("study", "\u{1F393}", "Mark as material to learn — theory, structure, technique."),
+        ("perform", "\u{1F3A4}", "Want to play this myself."),
+        ("revisit", "\u{2753}", "Come back to this later — undecided."),
+        ("compare", "\u{1F4DD}", "Reference for A/B against another arrangement."),
+    ];
+
+    /// Set the focused row and bind the note-edit buffer to it. Called
+    /// on row click. Idempotent: re-focusing the same row does not
+    /// overwrite an in-flight edit.
+    fn set_selected_label(&mut self, label: &str) {
+        if self.selected_label.as_deref() == Some(label) {
+            return;
+        }
+        self.flush_note_draft();
+        self.selected_label = Some(label.to_string());
+        self.note_draft = self.notes.get(label).cloned().unwrap_or_default();
+        self.note_draft_song = Some(label.to_string());
+    }
+
+    /// Persist the active note draft to SQLite if it changed. Called
+    /// before switching rows and from the explicit "Save note" button
+    /// so the user controls when the database write happens.
+    fn flush_note_draft(&mut self) {
+        let Some(song) = self.note_draft_song.clone() else {
+            return;
+        };
+        let prev = self.notes.get(&song).cloned().unwrap_or_default();
+        let current = self.note_draft.trim().to_string();
+        if current == prev.trim() {
+            return;
+        }
+        if let Some(db) = self.play_log.as_mut() {
+            if let Err(e) = db.set_note(&song, &current) {
+                eprintln!("jukebox: set_note({song}): {e}");
+                return;
+            }
+        }
+        if current.is_empty() {
+            self.notes.remove(&song);
+        } else {
+            self.notes.insert(song, current);
+        }
+    }
+
+    /// Toggle a single user_tag for `song_id` and refresh in-memory
+    /// mirror so the row chips and detail pane update in the same
+    /// frame.
+    fn toggle_user_tag(&mut self, song_id: &str, tag: &str) {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return;
+        }
+        let Some(db) = self.play_log.as_mut() else {
+            return;
+        };
+        match db.toggle_user_tag(song_id, tag) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("jukebox: toggle_user_tag({song_id}, {tag}): {e}");
+                return;
+            }
+        }
+        // Re-read just this song's tags rather than re-snapshotting the
+        // whole table — keeps the cost flat as the catalogue grows.
+        match db.user_tags(song_id) {
+            Ok(tags) => {
+                if tags.is_empty() {
+                    self.user_tags.remove(song_id);
+                } else {
+                    self.user_tags.insert(song_id.to_string(), tags);
+                }
+            }
+            Err(e) => {
+                eprintln!("jukebox: refresh user_tags({song_id}): {e}");
+            }
+        }
     }
 
     /// Drain any prewarm completions queued since the last frame and
@@ -2181,6 +2314,390 @@ impl Jukebox {
             }
         }
     }
+
+    /// Left side panel: deep-dive metadata + marking + free-form note
+    /// for the row currently in `selected_label`. No-op (panel hidden)
+    /// when nothing is selected so the catalogue can run full-width
+    /// for the casual "shuffle and listen" workflow.
+    fn render_detail_panel(&mut self, ctx: &egui::Context) {
+        let label = match self.selected_label.clone() {
+            Some(l) => l,
+            None => return,
+        };
+        // Pull every read off `self` up-front so the closure body can
+        // mutate `self.note_draft` / call `self.toggle_user_tag` etc.
+        let song_meta = self.song_index.get(&label).cloned();
+        let track_meta = self
+            .tracks
+            .iter()
+            .find(|t| t.label == label)
+            .map(|t| (t.path.clone(), t.engine.clone(), t.source.clone()));
+        let plays = self.play_counts.get(&label).copied().unwrap_or(0);
+        let last_played = self
+            .play_log
+            .as_ref()
+            .and_then(|db| db.last_played_at(&label).ok().flatten());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let assigned_tags: Vec<String> = self
+            .user_tags
+            .get(&label)
+            .cloned()
+            .unwrap_or_default();
+        let known_keys: Vec<&str> = Self::KNOWN_TAGS.iter().map(|(k, _, _)| *k).collect();
+        let custom_assigned: Vec<String> = assigned_tags
+            .iter()
+            .filter(|t| !known_keys.contains(&t.as_str()))
+            .cloned()
+            .collect();
+        let is_favorite = self.favorites.contains(&label);
+
+        let mut tag_ops: Vec<String> = Vec::new();
+        let mut clear_selection = false;
+        let mut close_save = false;
+        let mut play_now = false;
+        let mut toggle_fav = false;
+        let mut open_url: Option<String> = None;
+
+        egui::SidePanel::left("detail-panel")
+            .resizable(true)
+            .default_width(320.0)
+            .min_width(260.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("\u{1F50D} research");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("\u{2715}")
+                            .on_hover_text("Close detail panel")
+                            .clicked()
+                        {
+                            clear_selection = true;
+                        }
+                    });
+                });
+                ui.separator();
+
+                // Title block — DB title + raw stem so the user can
+                // grep-confirm the catalogue row.
+                let title = song_meta
+                    .as_ref()
+                    .map(|s| s.title.clone())
+                    .unwrap_or_else(|| label.clone());
+                ui.label(
+                    egui::RichText::new(title)
+                        .strong()
+                        .size(15.0),
+                );
+                ui.label(
+                    egui::RichText::new(&label)
+                        .monospace()
+                        .small()
+                        .color(egui::Color32::from_rgb(140, 140, 160)),
+                );
+                if let Some((_, engine, source)) = &track_meta {
+                    ui.label(
+                        egui::RichText::new(format!("source: {source}  ·  engine: {engine}"))
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 170, 200)),
+                    );
+                }
+
+                ui.add_space(6.0);
+
+                // Metadata grid (composer / era / instrument / license).
+                if let Some(song) = &song_meta {
+                    egui::Grid::new("detail-meta")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            meta_row(ui, "composer", &song.composer);
+                            if let Some(e) = &song.era {
+                                ui.label(egui::RichText::new("era").small().weak());
+                                ui.label(
+                                    egui::RichText::new(e)
+                                        .color(era_color(e))
+                                        .strong()
+                                        .small(),
+                                );
+                                ui.end_row();
+                            }
+                            meta_row(ui, "instrument", &song.instrument);
+                            ui.label(egui::RichText::new("license").small().weak());
+                            let lic_short = license_short(&song.license);
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(lic_short.clone())
+                                        .color(license_color(&lic_short))
+                                        .strong()
+                                        .monospace()
+                                        .small(),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&song.license)
+                                        .small()
+                                        .color(egui::Color32::from_rgb(180, 180, 180)),
+                                );
+                            });
+                            ui.end_row();
+                            if let Some(v) = &song.suggested_voice {
+                                meta_row(ui, "suggested voice", v);
+                            }
+                            if let Some(src) = &song.source {
+                                meta_row(ui, "source", src);
+                            }
+                        });
+
+                    if let Some(url) = song.source_url.as_deref() {
+                        ui.add_space(4.0);
+                        if ui
+                            .add(
+                                egui::Hyperlink::from_label_and_url(
+                                    egui::RichText::new(format!("\u{1F517} {url}"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(140, 200, 255)),
+                                    url,
+                                )
+                                .open_in_new_tab(true),
+                            )
+                            .on_hover_text(
+                                "Open the manifest source URL in your default browser.",
+                            )
+                            .clicked()
+                        {
+                            open_url = Some(url.to_string());
+                        }
+                    }
+                    if !song.tags.is_empty() {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("manifest tags").small().weak());
+                        ui.horizontal_wrapped(|ui| {
+                            for tag in &song.tags {
+                                ui.label(
+                                    egui::RichText::new(format!("#{tag}"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(200, 200, 230))
+                                        .background_color(egui::Color32::from_rgb(40, 40, 60)),
+                                );
+                            }
+                        });
+                    }
+                    if let Some(ctx_blurb) = song.context.as_deref() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new("context").small().weak());
+                        ui.label(
+                            egui::RichText::new(ctx_blurb)
+                                .small()
+                                .color(egui::Color32::from_rgb(220, 220, 220)),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "no library_db entry — non-MIDI / non-catalog source",
+                        )
+                        .small()
+                        .italics()
+                        .color(egui::Color32::from_rgb(150, 150, 150)),
+                    );
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // Listening stats block.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("\u{1F39A} plays").small().weak(),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{plays}"))
+                            .strong()
+                            .color(egui::Color32::from_rgb(160, 200, 255))
+                            .monospace(),
+                    );
+                    if let Some(ts) = last_played {
+                        ui.label(
+                            egui::RichText::new(format!("last {}", humanize_ago(now - ts)))
+                                .small()
+                                .color(egui::Color32::from_rgb(180, 180, 200)),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("never played")
+                                .small()
+                                .italics()
+                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                        );
+                    }
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("\u{25B6} preview").strong())
+                        .on_hover_text("Preview this track in the active mixer slot.")
+                        .clicked()
+                    {
+                        play_now = true;
+                    }
+                    let fav_glyph = if is_favorite { "\u{2605} unfav" } else { "\u{2606} fav" };
+                    if ui
+                        .button(fav_glyph)
+                        .on_hover_text("Toggle ★ favorite (also shown in side panel).")
+                        .clicked()
+                    {
+                        toggle_fav = true;
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // Marker palette: known toggles + custom-tag entry.
+                ui.label(
+                    egui::RichText::new("marker tags")
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 220, 220)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for (key, glyph, hover) in Self::KNOWN_TAGS {
+                        let on = assigned_tags.iter().any(|t| t == key);
+                        let chip = if on {
+                            egui::RichText::new(format!("{glyph} {key}"))
+                                .strong()
+                                .color(egui::Color32::from_rgb(20, 20, 20))
+                                .background_color(egui::Color32::from_rgb(255, 210, 80))
+                        } else {
+                            egui::RichText::new(format!("{glyph} {key}"))
+                                .color(egui::Color32::from_rgb(220, 220, 220))
+                                .background_color(egui::Color32::from_rgb(50, 50, 60))
+                        };
+                        if ui
+                            .button(chip)
+                            .on_hover_text(*hover)
+                            .clicked()
+                        {
+                            tag_ops.push((*key).to_string());
+                        }
+                    }
+                });
+                if !custom_assigned.is_empty() {
+                    ui.label(
+                        egui::RichText::new("custom")
+                            .small()
+                            .weak(),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for tag in &custom_assigned {
+                            if ui
+                                .button(
+                                    egui::RichText::new(format!("\u{2716} #{tag}"))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(255, 200, 200))
+                                        .background_color(egui::Color32::from_rgb(60, 30, 30)),
+                                )
+                                .on_hover_text("Click to remove this custom tag.")
+                                .clicked()
+                            {
+                                tag_ops.push(tag.clone());
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.custom_tag_input)
+                            .desired_width(160.0)
+                            .hint_text("custom tag…"),
+                    );
+                    let pressed_enter = resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let clicked_add = ui.button("+ tag").clicked();
+                    if pressed_enter || clicked_add {
+                        let new_tag = self.custom_tag_input.trim().to_string();
+                        if !new_tag.is_empty() {
+                            tag_ops.push(new_tag);
+                            self.custom_tag_input.clear();
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                // Notes editor. Bound to a draft buffer so typing
+                // doesn't fight egui's frame cycle.
+                ui.label(
+                    egui::RichText::new("personal note")
+                        .strong()
+                        .color(egui::Color32::from_rgb(220, 220, 220)),
+                );
+                let resp = ui.add(
+                    egui::TextEdit::multiline(&mut self.note_draft)
+                        .desired_rows(4)
+                        .desired_width(f32::INFINITY)
+                        .hint_text(
+                            "private note — what to study, why this caught your ear, …",
+                        ),
+                );
+                if resp.lost_focus() {
+                    close_save = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("\u{1F4BE} save")
+                        .on_hover_text("Persist the note to bench-out/play_log.db.")
+                        .clicked()
+                    {
+                        close_save = true;
+                    }
+                    if ui
+                        .button("clear")
+                        .on_hover_text("Erase the note (deletes the row).")
+                        .clicked()
+                    {
+                        self.note_draft.clear();
+                        close_save = true;
+                    }
+                });
+            });
+
+        // Side-effect drain. egui closures hold &mut self.note_draft
+        // already, so every state write happens after `show()` returns.
+        if let Some(url) = open_url {
+            ctx.open_url(egui::OpenUrl::new_tab(url));
+        }
+        for tag in tag_ops {
+            self.toggle_user_tag(&label, &tag);
+        }
+        if toggle_fav {
+            self.set_favorites_batch(&[(label.clone(), !is_favorite)]);
+        }
+        if play_now {
+            self.play_song_id(&label);
+        }
+        if close_save {
+            self.flush_note_draft();
+        }
+        if clear_selection {
+            self.flush_note_draft();
+            self.selected_label = None;
+            self.note_draft.clear();
+            self.note_draft_song = None;
+        }
+    }
+}
+
+/// Two-cell row helper for the detail-pane metadata grid: weak left
+/// label, strong right value, end_row(). Keeps the gutter consistent
+/// across optional fields without copy-pasting the grid plumbing.
+fn meta_row(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.label(egui::RichText::new(key).small().weak());
+    ui.label(egui::RichText::new(value).small());
+    ui.end_row();
 }
 
 /// Render a single VU meter bar. peak / rms are 0..1+ (we clamp).
@@ -2906,6 +3423,14 @@ impl eframe::App for Jukebox {
                 }
             });
 
+        // ----- Left panel: research / marking detail ---------------
+        // Open whenever a row is selected. Carries everything the
+        // catalogue row can't fit inline: full composer name, license
+        // text, manifest context blurb, clickable source URL, the
+        // user's marker chips for this piece, and a free-form note
+        // editor backed by `play_log.notes`.
+        self.render_detail_panel(ctx);
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let needle = self.filter.to_lowercase();
             // Two-level grouping. The first key folds the iter-variant
@@ -3028,6 +3553,11 @@ impl eframe::App for Jukebox {
                 // the new voice (cache hit = instant, miss = render
                 // spinner).
                 let mut to_set_voice: Vec<(usize, String)> = Vec::new();
+                // Stem of the row the user clicked to focus the detail
+                // panel. Drained after the closure body returns so we
+                // can borrow `&mut self` for `set_selected_label` (the
+                // closure only holds a shared ref).
+                let mut to_select: Option<String> = None;
                 let avail_w = ui.available_width();
                 for (root, pieces) in &folded {
                     let total_renders: usize = pieces.values().map(|v| v.len()).sum();
@@ -3047,7 +3577,8 @@ impl eframe::App for Jukebox {
                          indices: &[usize],
                          to_play: &mut Option<usize>,
                          to_set_fav: &mut Vec<(String, bool)>,
-                         to_set_voice: &mut Vec<(usize, String)>| {
+                         to_set_voice: &mut Vec<(usize, String)>,
+                         to_select: &mut Option<String>| {
                             ui.horizontal_wrapped(|ui| {
                                 let active_in_group = indices
                                     .iter()
@@ -3188,16 +3719,77 @@ impl eframe::App for Jukebox {
                                 )
                                 .on_hover_text(kind_hover);
 
+                                // Stable file-stem we route selection
+                                // through. play_log + library_db both
+                                // key off this, so picking it once here
+                                // means the detail pane, favorites, and
+                                // play history all line up. Uses the
+                                // first index's label since every
+                                // render in a piece shares the same
+                                // stem.
+                                let piece_label_stem: Option<String> = indices
+                                    .first()
+                                    .and_then(|i| self.tracks.get(*i))
+                                    .map(|t| t.label.clone());
+                                let is_selected = piece_label_stem
+                                    .as_deref()
+                                    .map(|s| self.selected_label.as_deref() == Some(s))
+                                    .unwrap_or(false);
                                 let piece_text = if active_in_group {
                                     egui::RichText::new(piece)
                                         .color(egui::Color32::from_rgb(255, 200, 80))
+                                        .strong()
+                                        .monospace()
+                                } else if is_selected {
+                                    egui::RichText::new(piece)
+                                        .color(egui::Color32::from_rgb(150, 220, 255))
                                         .strong()
                                         .monospace()
                                 } else {
                                     egui::RichText::new(piece).monospace()
                                 };
                                 let piece_w = (avail_w * 0.22).max(180.0);
-                                ui.add_sized([piece_w, 22.0], egui::Label::new(piece_text));
+                                let piece_resp = ui.add_sized(
+                                    [piece_w, 22.0],
+                                    egui::SelectableLabel::new(is_selected, piece_text),
+                                );
+                                if piece_resp
+                                    .on_hover_text(
+                                        "Click to open the research / marking detail panel \
+                                         for this piece.",
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(stem) = &piece_label_stem {
+                                        *to_select = Some(stem.clone());
+                                    }
+                                }
+                                // Inline user-tag chips for this piece.
+                                // Single-glyph ribbon so the row stays
+                                // narrow; full taxonomy lives in the
+                                // detail pane. Custom tags collapse
+                                // into a generic "#" badge.
+                                if let Some(stem) = &piece_label_stem {
+                                    if let Some(tags) = self.user_tags.get(stem) {
+                                        for tag in tags {
+                                            let glyph = match tag.as_str() {
+                                                "study" => "\u{1F393}",
+                                                "perform" => "\u{1F3A4}",
+                                                "revisit" => "\u{2753}",
+                                                "compare" => "\u{1F4DD}",
+                                                _ => "\u{1F3F7}",
+                                            };
+                                            ui.add_sized(
+                                                [18.0, 22.0],
+                                                egui::Label::new(
+                                                    egui::RichText::new(glyph)
+                                                        .small(),
+                                                ),
+                                            )
+                                            .on_hover_text(format!("user tag: {tag}"));
+                                        }
+                                    }
+                                }
 
                                 // ---- DB metadata badges --------------
                                 // Pull metadata off the first track that
@@ -3488,6 +4080,7 @@ impl eframe::App for Jukebox {
                                 &mut to_play,
                                 &mut to_set_fav,
                                 &mut to_set_voice,
+                                &mut to_select,
                             );
                             ui.add_space(2.0);
                         }
@@ -3516,6 +4109,7 @@ impl eframe::App for Jukebox {
                                     &mut to_play,
                                     &mut to_set_fav,
                                     &mut to_set_voice,
+                                    &mut to_select,
                                 );
                                 ui.add_space(2.0);
                             }
@@ -3558,6 +4152,9 @@ impl eframe::App for Jukebox {
                 }
                 if !to_set_fav.is_empty() {
                     self.set_favorites_batch(&to_set_fav);
+                }
+                if let Some(stem) = to_select {
+                    self.set_selected_label(&stem);
                 }
             });
         });
