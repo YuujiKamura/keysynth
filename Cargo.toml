@@ -302,6 +302,13 @@ name = "jukebox_lite"
 path = "src/bin/jukebox_lite.rs"
 required-features = ["native"]
 
+# jukebox_lite_g binary: Gemini version of the music browser.
+# Reuse backend from jukebox_lite but with a custom list-style UI.
+[[bin]]
+name = "jukebox_lite_g"
+path = "src/bin/jukebox_lite_g.rs"
+required-features = ["native"]
+
 # seq_grid binary: standalone egui step-sequencer pattern grid.
 [[bin]]
 name = "seq_grid"
