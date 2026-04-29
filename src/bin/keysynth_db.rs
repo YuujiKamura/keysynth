@@ -26,6 +26,7 @@ use keysynth::library_db::{LibraryDb, SongFilter, SongSort, VoiceFilter};
 const DEFAULT_DB: &str = "bench-out/library.db";
 const DEFAULT_MANIFEST: &str = "bench-out/songs/manifest.json";
 const DEFAULT_VOICES_LIVE: &str = "voices_live";
+const DEFAULT_SAMPLES_MANIFEST: &str = "samples/manifest.json";
 
 fn print_help() {
     eprintln!(
@@ -38,7 +39,9 @@ fn print_help() {
          common:\n  \
          --db PATH                  override bench-out/library.db\n  \
          --manifest PATH            override songs manifest path\n  \
-         --voices-live ROOT         override voices_live/ root\n\n\
+         --voices-live ROOT         override voices_live/ root\n  \
+         --samples-manifest PATH    override samples/manifest.json (Stage D)\n  \
+         --no-samples               skip Stage D sample-voice import\n\n\
          query filters:\n  \
          --composer NAME            substring match on composer key (\"bach\", \"tarrega\")\n  \
          --era ERA                  Baroque|Classical|Romantic|Modern|Traditional\n  \
@@ -56,6 +59,8 @@ struct CliArgs {
     db: Option<PathBuf>,
     manifest: Option<PathBuf>,
     voices_live: Option<PathBuf>,
+    samples_manifest: Option<PathBuf>,
+    no_samples: bool,
     composer: Option<String>,
     era: Option<String>,
     instrument: Option<String>,
@@ -90,6 +95,12 @@ fn parse_args() -> Result<CliArgs, String> {
                     iter.next().ok_or("--voices-live needs a value")?,
                 ))
             }
+            "--samples-manifest" => {
+                a.samples_manifest = Some(PathBuf::from(
+                    iter.next().ok_or("--samples-manifest needs a value")?,
+                ))
+            }
+            "--no-samples" => a.no_samples = true,
             "--composer" => a.composer = Some(iter.next().ok_or("--composer needs a value")?),
             "--era" => a.era = Some(iter.next().ok_or("--era needs a value")?),
             "--instrument" => {
@@ -131,16 +142,31 @@ fn run(args: CliArgs) -> Result<(), String> {
                 .voices_live
                 .clone()
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_VOICES_LIVE));
+            let samples_path: Option<PathBuf> = if args.no_samples {
+                None
+            } else {
+                Some(
+                    args.samples_manifest
+                        .clone()
+                        .unwrap_or_else(|| PathBuf::from(DEFAULT_SAMPLES_MANIFEST)),
+                )
+            };
             let (songs, voices) = db
-                .rebuild(&manifest, &vl)
+                .rebuild_with_samples(&manifest, &vl, samples_path.as_deref())
                 .map_err(|e| format!("rebuild: {e}"))?;
+            let samples_note = match &samples_path {
+                Some(p) if p.exists() => format!(" + samples from {}", p.display()),
+                Some(p) => format!(" (samples manifest {} not found, skipped)", p.display()),
+                None => " (--no-samples)".to_string(),
+            };
             eprintln!(
-                "keysynth_db: rebuilt {} ({} songs from {}, {} voices from {})",
+                "keysynth_db: rebuilt {} ({} songs from {}, {} voices from {}{})",
                 db_path.display(),
                 songs,
                 manifest.display(),
                 voices,
                 vl.display(),
+                samples_note,
             );
             Ok(())
         }

@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "directory": "samples/sfz",
+  "description": "Public-domain / CC0 SFZ instrument catalog for keysynth voice slot expansion (Stage D / Voice Collector). Each entry is a single .sfz manifest file fetched via voice_collector from a CC0 / CC-BY upstream. WAV samples referenced by the SFZ are NOT vendored — the SFZ itself describes the mapping (region count, key range, velocity layers) which is what library_db imports as voice metadata. To enable actual playback, run `voice_collector samples --id <id>` to fetch the WAV directory next to the .sfz.",
+  "license_summary": {
+    "all_entries": "CC0-1.0 (Karoryfer Samples)",
+    "verification": "All entries verified against https://github.com/sfzinstruments/<repo> license metadata (license=cc0-1.0) on 2026-04-29. Karoryfer Samples explicitly waived rights — see each repo's LICENSE file. Only CC0 entries are accepted in v1; CC-BY would require attribution surfacing in the GUI which voice_collector does not yet implement.",
+    "rejected_categories": [
+      "CC-BY-NC*",
+      "CC-BY-SA (copyleft — would force keysynth license change)",
+      "proprietary / unknown",
+      "samples behind a click-through TOS"
+    ]
+  },
+  "acquisition_date": "2026-04-29",
+  "fetch_method": "https raw.githubusercontent.com",
+  "entries": [
+    {
+      "id": "karoryfer-shinyguitar-acoustic",
+      "file": "karoryfer-shinyguitar-acoustic.sfz",
+      "display_name": "Karoryfer Shinyguitar (Acoustic)",
+      "instrument": "guitar",
+      "category": "Guitar",
+      "recommend": "Stable",
+      "license": "CC0-1.0",
+      "source": "Karoryfer Samples / sfzinstruments",
+      "source_url": "https://github.com/sfzinstruments/karoryfer.shinyguitar",
+      "fetch_url": "https://raw.githubusercontent.com/sfzinstruments/karoryfer.shinyguitar/master/Programs/acoustic.sfz",
+      "samples_root": "https://github.com/sfzinstruments/karoryfer.shinyguitar/tree/master/Samples",
+      "description": "Bright steel-string acoustic guitar with multi-velocity round-robin samples. Useful contrast voice next to the physical-model guitar_stk.",
+      "tags": ["sfz", "guitar", "acoustic", "cc0", "karoryfer", "samples-not-vendored"]
+    },
+    {
+      "id": "karoryfer-scarypiano",
+      "file": "karoryfer-scarypiano.sfz",
+      "display_name": "Karoryfer Scarypiano",
+      "instrument": "piano",
+      "category": "Piano",
+      "recommend": "Experimental",
+      "license": "CC0-1.0",
+      "source": "Karoryfer Samples / sfzinstruments",
+      "source_url": "https://github.com/sfzinstruments/karoryfer.scarypiano",
+      "fetch_url": "https://raw.githubusercontent.com/sfzinstruments/karoryfer.scarypiano/master/Programs/Scarypiano.sfz",
+      "samples_root": "https://github.com/sfzinstruments/karoryfer.scarypiano/tree/master/Samples",
+      "description": "Detuned, deliberately-rough character piano. Pairs well with a horror/ambient context — not a drop-in Salamander replacement.",
+      "tags": ["sfz", "piano", "character", "cc0", "karoryfer", "samples-not-vendored"]
+    },
+    {
+      "id": "karoryfer-bigcat-cello-plucked",
+      "file": "karoryfer-bigcat-cello-plucked.sfz",
+      "display_name": "Karoryfer Bigcat Cello (Plucked)",
+      "instrument": "strings",
+      "category": "Samples",
+      "recommend": "Stable",
+      "license": "CC0-1.0",
+      "source": "Karoryfer / Bigcat collaboration / sfzinstruments",
+      "source_url": "https://github.com/sfzinstruments/karoryfer-bigcat.cello",
+      "fetch_url": "https://raw.githubusercontent.com/sfzinstruments/karoryfer-bigcat.cello/master/Programs/03-%20Plucked.sfz",
+      "samples_root": "https://github.com/sfzinstruments/karoryfer-bigcat.cello/tree/master/Samples",
+      "description": "Pizzicato cello — short, percussive, fits guitar-companion contexts where the bowed cello would dominate.",
+      "tags": ["sfz", "strings", "cello", "pizzicato", "cc0", "karoryfer", "samples-not-vendored"]
+    },
+    {
+      "id": "karoryfer-meatbass-pizz",
+      "file": "karoryfer-meatbass-pizz.sfz",
+      "display_name": "Karoryfer Meatbass (Pizzicato)",
+      "instrument": "bass",
+      "category": "Samples",
+      "recommend": "Stable",
+      "license": "CC0-1.0",
+      "source": "Karoryfer Samples / sfzinstruments",
+      "source_url": "https://github.com/sfzinstruments/karoryfer.meatbass",
+      "fetch_url": "https://raw.githubusercontent.com/sfzinstruments/karoryfer.meatbass/master/Programs/04_pizz.sfz",
+      "samples_root": "https://github.com/sfzinstruments/karoryfer.meatbass/tree/master/Samples",
+      "description": "Upright bass pizzicato. Low-register foundation voice — bass roles in jukebox / kssong arrangements.",
+      "tags": ["sfz", "bass", "upright", "pizzicato", "cc0", "karoryfer", "samples-not-vendored"]
+    },
+    {
+      "id": "karoryfer-weresax",
+      "file": "karoryfer-weresax.sfz",
+      "display_name": "Karoryfer Weresax",
+      "instrument": "wind",
+      "category": "Samples",
+      "recommend": "Experimental",
+      "license": "CC0-1.0",
+      "source": "Karoryfer Samples / sfzinstruments",
+      "source_url": "https://github.com/sfzinstruments/karoryfer.weresax",
+      "fetch_url": "https://raw.githubusercontent.com/sfzinstruments/karoryfer.weresax/master/Programs/Sax.sfz",
+      "samples_root": "https://github.com/sfzinstruments/karoryfer.weresax/tree/master/Samples",
+      "description": "Alto sax with multiple dynamic + mic-position layers. Adds a wind voice to a catalog otherwise dominated by plucked strings.",
+      "tags": ["sfz", "wind", "saxophone", "alto", "cc0", "karoryfer", "samples-not-vendored"]
+    }
+  ]
+}

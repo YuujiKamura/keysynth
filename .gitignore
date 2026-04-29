@@ -71,7 +71,19 @@ bench-out/play_log.db
 bench-out/play_log.db-wal
 bench-out/play_log.db-shm
 recordings/
-samples/
+# Stage D / voice_collector: ignore everything under samples/ by
+# default so user-staged private SFZ libraries / fetched WAV trees
+# never leak into the repo. The curated CC0 catalog is whitelisted
+# explicitly: `samples/manifest.json` (Karoryfer entries with CC0-1.0
+# attestation) plus the small `.sfz` text files under `samples/sfz/`.
+# Large WAV samples stay upstream — see each manifest entry's
+# `samples_root` URL. Pattern uses `samples/**` (not `samples/`) so
+# the whitelists below can punch back through; with the directory-form
+# `samples/` Git refuses to traverse into the dir at all.
+samples/**
+!samples/manifest.json
+!samples/sfz/
+!samples/sfz/*.sfz
 ir/
 reference/*.wav
 **/*.wav
@@ -151,6 +163,10 @@ bench-out/CHIPTUNE/
 # Exception: the web demo build bundles a small GM SoundFont so Pages
 # can run the sf-piano engine without a separate fetch step. ~32 MB.
 !web/GeneralUser-GS.sf2
+# Stage D / voice_collector curated catalog: small (.sfz text only,
+# no WAVs) and explicitly CC0 — punched back through the blanket
+# **/*.sfz rule above.
+!samples/sfz/*.sfz
 **/*.dls
 # Compressed bundles users may drop in (sample packs, IR libraries)
 *.zip

@@ -57,6 +57,8 @@ pub mod sequencer;
 pub mod sfz;
 #[cfg(feature = "native")]
 pub mod ui;
+#[cfg(feature = "native")]
+pub mod voice_collector;
 
 // Re-export the dashboard-facing types at the crate root so older callers
 // that imported them via `crate::{LiveParams, DashState, Engine}` keep

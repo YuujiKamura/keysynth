@@ -323,6 +323,16 @@ name = "keysynth_db"
 path = "src/bin/keysynth_db.rs"
 required-features = ["native"]
 
+# voice_collector: Stage D pipeline for public-domain SFZ catalog
+# acquisition. Curates CC0 / CC-BY SFZ libraries via samples/manifest.json,
+# fetches each `.sfz` text file via curl, audits licenses, and upserts
+# rows into library.db with id prefix `sample:`. Native-only because it
+# touches the same library_db and shells out to curl.
+[[bin]]
+name = "voice_collector"
+path = "src/bin/voice_collector.rs"
+required-features = ["native"]
+
 # chord_pad binary: real-time chord-trigger surface for the STK guitar
 # voice (and any other voices_live/* family). Dual input: PC keyboard
 # (egui keystrokes → diatonic chord triggers) and USB MIDI (midir
