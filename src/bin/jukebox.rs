@@ -1913,9 +1913,22 @@ impl Jukebox {
                         None
                     }
                 });
-                let want_path = want.and_then(|idx| self.tracks.get(idx)).map(|t| {
+                // For MIDI tracks the audio decoder cannot read the .mid
+                // path directly — it needs the rendered WAV from the
+                // preview cache. If the cache is empty, skip the slot
+                // sync entirely; `preview()` is the path that triggers
+                // a render, so re-trying every frame here would just
+                // spam errors against an empty cache.
+                let want_path = want.and_then(|idx| self.tracks.get(idx)).and_then(|t| {
                     let label = format!("[{}] {}_{}", t.source, t.piece, t.engine);
-                    (t.path.clone(), label)
+                    if t.format == Format::Mid {
+                        match lookup_midi_in_preview_cache(&t.path) {
+                            Ok(Some(p)) => Some((p, label)),
+                            _ => None,
+                        }
+                    } else {
+                        Some((t.path.clone(), label))
+                    }
                 });
                 match (cur_path, want_path) {
                     (None, Some((p, l))) => to_load.push((i, p, l)),
