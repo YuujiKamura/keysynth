@@ -217,12 +217,31 @@ fn classify_source(path: &Path, piece: &str) -> &'static str {
     "keysynth"
 }
 
+/// Voice IDs the per-track voice picker exposes in the jukebox row's
+/// dropdown. Each one maps 1:1 to a `render_midi --engine <id>` alias
+/// so the cache subprocess can render with no extra flags. Order is
+/// the dropdown display order — we lead with the two heuristic
+/// defaults (`piano-modal`, `guitar-stk`) so the most common picks
+/// are at the top, then walk through the alternative pianos and
+/// finally the chiptune / synth tail.
+const AVAILABLE_VOICES: &[&str] = &[
+    "piano-modal",
+    "guitar-stk",
+    "piano",
+    "piano-lite",
+    "piano-5am",
+    "koto",
+    "square",
+    "ks",
+    "fm",
+    "sub",
+];
+
 /// Pick a default voice for a MIDI track based on filename heuristic.
 /// Piano-leaning composer prefixes (mozart, satie, albeniz, bach, ...)
 /// route through `piano-modal`; everything else through the STK guitar
-/// voice. A future revision should read `bench-out/songs/manifest.json`
-/// `suggested_voice` field instead, but the heuristic keeps this PR
-/// scoped to the cache infrastructure (issue #62 Phase 2).
+/// voice. Used as the fallback when the user has not yet picked a
+/// voice for this track via the GUI dropdown (`play_log.track_voices`).
 fn default_voice_for_midi(path: &Path) -> &'static str {
     let stem = path
         .file_stem()
@@ -263,12 +282,13 @@ fn render_midi_binary_path() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Build the `CacheKey` for a MIDI file under the default voice
-/// heuristic. Pulled out of the resolve flow so the synchronous cache
-/// hit check and the background render-and-store path share the same
-/// key construction.
-fn build_midi_cache_key(midi_path: &Path) -> keysynth::preview_cache::CacheKey {
-    let voice_id = default_voice_for_midi(midi_path);
+/// Build the `CacheKey` for a MIDI file under an explicit voice id.
+/// Pulled out of the resolve flow so the synchronous cache hit check
+/// and the background render-and-store path share the same key
+/// construction. The voice id is whatever the user has currently
+/// picked for this track (or the heuristic default if they have not
+/// touched the picker yet).
+fn build_midi_cache_key(midi_path: &Path, voice_id: &str) -> keysynth::preview_cache::CacheKey {
     keysynth::preview_cache::CacheKey {
         song_path: midi_path.to_path_buf(),
         voice_id: voice_id.to_string(),
@@ -293,36 +313,77 @@ fn open_preview_cache() -> Result<keysynth::preview_cache::Cache, String> {
 /// if there's already a rendered WAV for the (song, voice) pair.
 /// Used by the GUI thread for the synchronous fast path before
 /// deciding whether to spawn a background render.
-fn lookup_midi_in_preview_cache(midi_path: &Path) -> Result<Option<PathBuf>, String> {
+fn lookup_midi_in_preview_cache(
+    midi_path: &Path,
+    voice_id: &str,
+) -> Result<Option<PathBuf>, String> {
     let cache = open_preview_cache()?;
-    let key = build_midi_cache_key(midi_path);
+    let key = build_midi_cache_key(midi_path, voice_id);
     cache.lookup(&key).map_err(|e| format!("lookup: {e}"))
 }
 
-/// One-shot stat sweep that returns the set of `Track::label`s whose
-/// default-voice MIDI preview is already cached. Used by the central
-/// panel to draw a "✓" hit glyph next to the engine button without
-/// stat'ing every MIDI on every frame — call sites refresh this on
-/// startup, after `rescan`, and after a successful render completes.
-fn snapshot_cached_midi_labels(tracks: &[Track]) -> HashSet<String> {
+/// One-shot stat sweep that returns, per `Track::label`, the set of
+/// voice ids whose preview WAV is already on disk. The central panel
+/// uses this to draw the "✓" hit glyph next to the picker — it only
+/// goes green when the user's *currently selected* voice for that
+/// track is cached. Call sites refresh on startup, after `rescan`,
+/// and after a successful render (foreground or prewarm).
+///
+/// The sweep stats only the (track, selected-voice) pair so cost stays
+/// O(N midi tracks) rather than O(N × |AVAILABLE_VOICES|). When the
+/// user changes their pick we re-stat just that one entry from the
+/// click handler, not the whole catalogue.
+fn snapshot_cached_midi_voices(
+    tracks: &[Track],
+    selected_voices: &HashMap<String, String>,
+) -> HashMap<String, HashSet<String>> {
     let cache = match open_preview_cache() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("jukebox: cached-set snapshot skipped: {e}");
-            return HashSet::new();
+            return HashMap::new();
         }
     };
-    let mut out = HashSet::new();
+    let mut out: HashMap<String, HashSet<String>> = HashMap::new();
     for t in tracks {
         if t.format != Format::Mid {
             continue;
         }
-        let key = build_midi_cache_key(&t.path);
+        let voice = selected_voices
+            .get(&t.label)
+            .cloned()
+            .unwrap_or_else(|| default_voice_for_midi(&t.path).to_string());
+        let key = build_midi_cache_key(&t.path, &voice);
         if matches!(cache.lookup(&key), Ok(Some(_))) {
-            out.insert(t.label.clone());
+            out.entry(t.label.clone()).or_default().insert(voice);
         }
     }
     out
+}
+
+/// Cheap single-entry refresh used after a voice change or a finished
+/// render. Stats one (path, voice) pair and updates the snapshot map
+/// in place.
+fn refresh_cached_voice_entry(
+    cached: &mut HashMap<String, HashSet<String>>,
+    label: &str,
+    midi_path: &Path,
+    voice_id: &str,
+) {
+    let cache = match open_preview_cache() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let key = build_midi_cache_key(midi_path, voice_id);
+    let entry = cached.entry(label.to_string()).or_default();
+    if matches!(cache.lookup(&key), Ok(Some(_))) {
+        entry.insert(voice_id.to_string());
+    } else {
+        entry.remove(voice_id);
+    }
+    if entry.is_empty() {
+        cached.remove(label);
+    }
 }
 
 /// Synchronous render-and-store. Called from a background thread so
@@ -332,10 +393,9 @@ fn snapshot_cached_midi_labels(tracks: &[Track]) -> HashSet<String> {
 /// inside `render_to_cache` so a stale background thread that fires
 /// after a peer thread already populated the entry returns
 /// immediately.
-fn render_midi_blocking(midi_path: &Path) -> Result<PathBuf, String> {
-    let voice_id = default_voice_for_midi(midi_path);
+fn render_midi_blocking(midi_path: &Path, voice_id: &str) -> Result<PathBuf, String> {
     let cache = open_preview_cache()?;
-    let key = build_midi_cache_key(midi_path);
+    let key = build_midi_cache_key(midi_path, voice_id);
     let bin = render_midi_binary_path()
         .ok_or_else(|| "render_midi binary not found alongside jukebox".to_string())?;
     keysynth::preview_cache::render_to_cache(&cache, &key, voice_id, &bin)
@@ -1231,13 +1291,18 @@ struct Jukebox {
     /// flick between "everything" and "my list" without retyping a
     /// substring filter.
     favorites_only: bool,
-    /// Set of `Track::label`s whose MIDI preview is currently in
-    /// `bench-out/cache/`. Drives the "✓" hit glyph on each MIDI row
-    /// so users can see at a glance which clicks will be instant vs
-    /// which will trigger a foreground render. Refreshed on startup,
-    /// after `rescan`, and whenever a render completes (foreground
-    /// `pending_render` or background prewarm).
-    cached_midi_labels: HashSet<String>,
+    /// Per-track-label set of voice ids whose preview WAV is currently
+    /// in `bench-out/cache/`. Drives the "✓" hit glyph on each MIDI
+    /// row so users can see at a glance whether their currently-picked
+    /// voice will play instantly. Refreshed on startup, after
+    /// `rescan`, after a render completes, and after the user picks a
+    /// new voice from the per-row dropdown.
+    cached_midi_labels: HashMap<String, HashSet<String>>,
+    /// Per-track-label voice id the user has picked from the row's
+    /// dropdown. Persisted in `play_log.track_voices` so the next
+    /// session re-opens with the same picks; absent labels fall back
+    /// to `default_voice_for_midi(path)`.
+    selected_voices: HashMap<String, String>,
     /// Optional background prewarmer that walks the Top-N MIDI tracks
     /// at startup and renders each through `preview_cache::render_to_cache`
     /// so the user's first click on a popular song is a cache hit.
@@ -1280,6 +1345,12 @@ struct PrewarmState {
 /// worker is mid-queue.
 struct PrewarmDone {
     label: String,
+    /// Voice id the prewarmer rendered through. Carried alongside the
+    /// label so the GUI can update `cached_midi_labels` for the right
+    /// (label, voice) pair — picking a different voice from the GUI
+    /// is racy with the prewarm thread, so the worker's report has to
+    /// be self-describing.
+    voice_id: String,
     /// `Some(elapsed_ms)` on a successful render, `None` if the cache
     /// already had the entry (cheap stat-only path), `Err(msg)` if
     /// render_midi failed.
@@ -1290,6 +1361,11 @@ struct PrewarmDone {
 struct PendingRender {
     track_idx: usize,
     label: String,
+    /// Voice id this render is producing. Stored so the completion
+    /// handler can update `cached_midi_labels` for the correct
+    /// (label, voice) pair even when the user has since picked a
+    /// different voice on the row.
+    voice_id: String,
     started: std::time::Instant,
     rx: std::sync::mpsc::Receiver<Result<PathBuf, String>>,
     /// JoinHandle is parked here so the worker thread isn't detached
@@ -1452,8 +1528,13 @@ impl Jukebox {
         let current_device = mixer.device_name.clone();
         let play_log = load_play_log();
         let (favorites, play_counts, recent_plays) = snapshot_play_stats(play_log.as_ref());
-        let cached_midi_labels = snapshot_cached_midi_labels(&tracks);
-        let prewarm = spawn_startup_prewarm(&tracks, &play_counts, &cached_midi_labels);
+        let selected_voices = play_log
+            .as_ref()
+            .and_then(|db| db.track_voices().ok())
+            .unwrap_or_default();
+        let cached_midi_labels = snapshot_cached_midi_voices(&tracks, &selected_voices);
+        let prewarm =
+            spawn_startup_prewarm(&tracks, &play_counts, &cached_midi_labels, &selected_voices);
         Ok(Self {
             tracks,
             selected: None,
@@ -1473,6 +1554,7 @@ impl Jukebox {
             recent_plays,
             favorites_only: false,
             cached_midi_labels,
+            selected_voices,
             prewarm,
             era_filter: None,
             license_filter: None,
@@ -1493,19 +1575,25 @@ impl Jukebox {
                 Ok(done) => match done.outcome {
                     Ok(Some(ms)) => {
                         eprintln!(
-                            "jukebox: prewarm rendered {} in {} ms",
-                            done.label, ms
+                            "jukebox: prewarm rendered {} ({}) in {} ms",
+                            done.label, done.voice_id, ms
                         );
-                        self.cached_midi_labels.insert(done.label);
+                        self.cached_midi_labels
+                            .entry(done.label)
+                            .or_default()
+                            .insert(done.voice_id);
                     }
                     Ok(None) => {
-                        // Already cached when the worker checked; just
-                        // confirm the label is in the set so the glyph
-                        // stays in sync with disk truth.
-                        self.cached_midi_labels.insert(done.label);
+                        self.cached_midi_labels
+                            .entry(done.label)
+                            .or_default()
+                            .insert(done.voice_id);
                     }
                     Err(e) => {
-                        eprintln!("jukebox: prewarm failed for {}: {e}", done.label);
+                        eprintln!(
+                            "jukebox: prewarm failed for {} ({}): {e}",
+                            done.label, done.voice_id
+                        );
                     }
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -1518,6 +1606,42 @@ impl Jukebox {
         if disconnected {
             self.prewarm = None;
         }
+    }
+
+    /// Resolve the effective voice id the user has picked for `label`.
+    /// Falls back to the heuristic default when the user hasn't
+    /// touched the picker for this track yet.
+    fn voice_for(&self, label: &str, midi_path: &Path) -> String {
+        self.selected_voices
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| default_voice_for_midi(midi_path).to_string())
+    }
+
+    /// Persist the user's voice pick for `label` and re-stat the cache
+    /// for the new (label, voice) pair so the "✓" glyph reflects
+    /// disk truth in the same frame. Returns true when the pick
+    /// actually changed (used by the UI to decide whether to fire
+    /// `preview()` immediately so the user hears the new voice).
+    fn set_track_voice(&mut self, label: &str, midi_path: &Path, voice_id: &str) -> bool {
+        let prev = self.selected_voices.get(label).cloned();
+        if prev.as_deref() == Some(voice_id) {
+            return false;
+        }
+        self.selected_voices
+            .insert(label.to_string(), voice_id.to_string());
+        if let Some(db) = self.play_log.as_mut() {
+            if let Err(e) = db.set_track_voice(label, voice_id) {
+                eprintln!("jukebox: set_track_voice({label}, {voice_id}): {e}");
+            }
+        }
+        refresh_cached_voice_entry(
+            &mut self.cached_midi_labels,
+            label,
+            midi_path,
+            voice_id,
+        );
+        true
     }
 
     /// Pull cached favorites / counts / recent-plays from the DB.
@@ -1593,21 +1717,34 @@ impl Jukebox {
 fn pick_prewarm_targets(
     tracks: &[Track],
     play_counts: &HashMap<String, i64>,
-    cached: &HashSet<String>,
-) -> Vec<PathBuf> {
-    let mut candidates: Vec<(&Track, i64)> = tracks
+    cached: &HashMap<String, HashSet<String>>,
+    selected_voices: &HashMap<String, String>,
+) -> Vec<(PathBuf, String)> {
+    let mut candidates: Vec<(&Track, i64, String)> = tracks
         .iter()
-        .filter(|t| t.format == Format::Mid && !cached.contains(&t.label))
+        .filter(|t| t.format == Format::Mid)
         .map(|t| {
+            let voice = selected_voices
+                .get(&t.label)
+                .cloned()
+                .unwrap_or_else(|| default_voice_for_midi(&t.path).to_string());
+            let already = cached
+                .get(&t.label)
+                .map(|s| s.contains(&voice))
+                .unwrap_or(false);
+            (t, already, voice)
+        })
+        .filter(|(_, already, _)| !already)
+        .map(|(t, _, voice)| {
             let count = play_counts.get(&t.label).copied().unwrap_or(0);
-            (t, count)
+            (t, count, voice)
         })
         .collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label.cmp(&b.0.label)));
     candidates
         .into_iter()
         .take(PREWARM_TOP_N)
-        .map(|(t, _)| t.path.clone())
+        .map(|(t, _, voice)| (t.path.clone(), voice))
         .collect()
 }
 
@@ -1617,9 +1754,10 @@ fn pick_prewarm_targets(
 fn spawn_startup_prewarm(
     tracks: &[Track],
     play_counts: &HashMap<String, i64>,
-    cached: &HashSet<String>,
+    cached: &HashMap<String, HashSet<String>>,
+    selected_voices: &HashMap<String, String>,
 ) -> Option<PrewarmState> {
-    let queue = pick_prewarm_targets(tracks, play_counts, cached);
+    let queue = pick_prewarm_targets(tracks, play_counts, cached, selected_voices);
     if queue.is_empty() {
         return None;
     }
@@ -1642,14 +1780,13 @@ fn spawn_startup_prewarm(
                     return;
                 }
             };
-            for path in queue {
+            for (path, voice_id) in queue {
                 let label = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("?")
                     .to_string();
-                let voice_id = default_voice_for_midi(&path);
-                let key = build_midi_cache_key(&path);
+                let key = build_midi_cache_key(&path, &voice_id);
                 // Cache may have been populated by a peer process
                 // (another jukebox window, a manual ksprerender run)
                 // since `pick_prewarm_targets` last looked. Cheap stat
@@ -1661,7 +1798,7 @@ fn spawn_startup_prewarm(
                         match keysynth::preview_cache::render_to_cache(
                             &cache,
                             &key,
-                            voice_id,
+                            &voice_id,
                             &render_bin,
                         ) {
                             Ok(_) => Ok(Some(t0.elapsed().as_millis())),
@@ -1672,8 +1809,15 @@ fn spawn_startup_prewarm(
                 };
                 // Receiver-drop on the GUI side just discards the
                 // notification — the on-disk WAV still exists, so a
-                // later `snapshot_cached_midi_labels` will pick it up.
-                if tx.send(PrewarmDone { label, outcome }).is_err() {
+                // later `snapshot_cached_midi_voices` will pick it up.
+                if tx
+                    .send(PrewarmDone {
+                        label,
+                        voice_id,
+                        outcome,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1775,15 +1919,16 @@ impl Jukebox {
         //                  thread. `update()` polls the channel and
         //                  starts playback once the WAV is ready.
         let playable_path: PathBuf = if track.format == Format::Mid {
-            match lookup_midi_in_preview_cache(&track.path) {
+            let voice = self.voice_for(&track.label, &track.path);
+            match lookup_midi_in_preview_cache(&track.path, &voice) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
-                    self.spawn_midi_render(idx, label);
+                    self.spawn_midi_render(idx, label, voice);
                     return;
                 }
                 Err(e) => {
                     eprintln!(
-                        "jukebox: preview_cache lookup {}: {e}",
+                        "jukebox: preview_cache lookup {} ({voice}): {e}",
                         track.path.display(),
                     );
                     return;
@@ -1800,17 +1945,18 @@ impl Jukebox {
     /// `self.pending_render`; `poll_pending_render` (called from
     /// `update()`) finalises the playback hand-off when the worker
     /// finishes.
-    fn spawn_midi_render(&mut self, idx: usize, label: String) {
+    fn spawn_midi_render(&mut self, idx: usize, label: String, voice_id: String) {
         let path = match self.tracks.get(idx) {
             Some(t) => t.path.clone(),
             None => return,
         };
         let (tx, rx) = std::sync::mpsc::channel();
         let path_for_thread = path.clone();
+        let voice_for_thread = voice_id.clone();
         let handle = std::thread::Builder::new()
             .name("preview-render".into())
             .spawn(move || {
-                let result = render_midi_blocking(&path_for_thread);
+                let result = render_midi_blocking(&path_for_thread, &voice_for_thread);
                 // Receiver drop on the GUI side is non-fatal: we just
                 // discard the rendered path. The cache file itself
                 // already lives at its hashed location, so a future
@@ -1821,11 +1967,12 @@ impl Jukebox {
         eprintln!(
             "jukebox: render queued ({}) — voice={} (background thread)",
             path.display(),
-            default_voice_for_midi(&path),
+            voice_id,
         );
         self.pending_render = Some(PendingRender {
             track_idx: idx,
             label,
+            voice_id,
             started: std::time::Instant::now(),
             rx,
             _handle: handle,
@@ -1860,11 +2007,15 @@ impl Jukebox {
                     wav_path.display(),
                     elapsed_ms,
                 );
-                // Mark the label as cached BEFORE handing off to
-                // `load_resolved_track` so the row's "✓" glyph appears
-                // in the same frame the audio starts.
+                // Mark the (label, voice) pair as cached BEFORE
+                // handing off to `load_resolved_track` so the row's
+                // "✓" glyph appears in the same frame the audio
+                // starts.
                 if let Some(t) = self.tracks.get(pending.track_idx) {
-                    self.cached_midi_labels.insert(t.label.clone());
+                    self.cached_midi_labels
+                        .entry(t.label.clone())
+                        .or_default()
+                        .insert(pending.voice_id.clone());
                 }
                 self.load_resolved_track(pending.track_idx, pending.label, wav_path);
             }
@@ -1948,7 +2099,8 @@ impl Jukebox {
         // cache entries (e.g. a parallel `ksprerender` populated
         // `bench-out/cache/`); rebuild the hit set so the row glyph
         // is honest.
-        self.cached_midi_labels = snapshot_cached_midi_labels(&self.tracks);
+        self.cached_midi_labels =
+            snapshot_cached_midi_voices(&self.tracks, &self.selected_voices);
     }
 
     /// Append a new empty mix slot. UI callable.
@@ -1996,7 +2148,8 @@ impl Jukebox {
                 let want_path = want.and_then(|idx| self.tracks.get(idx)).and_then(|t| {
                     let label = format!("[{}] {}_{}", t.source, t.piece, t.engine);
                     if t.format == Format::Mid {
-                        match lookup_midi_in_preview_cache(&t.path) {
+                        let voice_id = self.voice_for(&label, &t.path);
+                        match lookup_midi_in_preview_cache(&t.path, &voice_id) {
                             Ok(Some(p)) => Some((p, label)),
                             _ => None,
                         }
@@ -2149,7 +2302,22 @@ impl eframe::App for Jukebox {
                     .iter()
                     .filter(|t| t.format == Format::Mid)
                     .count();
-                let cached = self.cached_midi_labels.len();
+                // "cached" counts tracks whose *currently selected*
+                // voice has a WAV on disk — switching a row from
+                // piano-modal to guitar-stk drops it from the green
+                // count until the new voice is rendered.
+                let cached = self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.format == Format::Mid)
+                    .filter(|t| {
+                        let voice = self.voice_for(&t.label, &t.path);
+                        self.cached_midi_labels
+                            .get(&t.label)
+                            .map(|s| s.contains(&voice))
+                            .unwrap_or(false)
+                    })
+                    .count();
                 let cache_color = if total_midi == 0 || cached >= total_midi {
                     egui::Color32::from_rgb(120, 220, 140)
                 } else {
@@ -2853,6 +3021,13 @@ impl eframe::App for Jukebox {
                 // buttons. Drained outside the closure so the egui
                 // borrow on `self` stays read-only inside it.
                 let mut to_set_fav: Vec<(String, bool)> = Vec::new();
+                // Queued voice-picker selections: (track_idx, new
+                // voice_id). After the loop we persist each via
+                // `set_track_voice` and then auto-fire `preview(idx)`
+                // for the changed row so the user immediately hears
+                // the new voice (cache hit = instant, miss = render
+                // spinner).
+                let mut to_set_voice: Vec<(usize, String)> = Vec::new();
                 let avail_w = ui.available_width();
                 for (root, pieces) in &folded {
                     let total_renders: usize = pieces.values().map(|v| v.len()).sum();
@@ -2871,7 +3046,8 @@ impl eframe::App for Jukebox {
                          piece: &str,
                          indices: &[usize],
                          to_play: &mut Option<usize>,
-                         to_set_fav: &mut Vec<(String, bool)>| {
+                         to_set_fav: &mut Vec<(String, bool)>,
+                         to_set_voice: &mut Vec<(usize, String)>| {
                             ui.horizontal_wrapped(|ui| {
                                 let active_in_group = indices
                                     .iter()
@@ -3133,8 +3309,19 @@ impl eframe::App for Jukebox {
                                     // are always instant (decoded
                                     // straight from disk) so we skip
                                     // the glyph for them.
-                                    let cache_hit = t.format == Format::Mid
-                                        && self.cached_midi_labels.contains(&t.label);
+                                    let selected_voice = if t.format == Format::Mid {
+                                        Some(self.voice_for(&t.label, &t.path))
+                                    } else {
+                                        None
+                                    };
+                                    let cache_hit = match &selected_voice {
+                                        Some(v) => self
+                                            .cached_midi_labels
+                                            .get(&t.label)
+                                            .map(|s| s.contains(v))
+                                            .unwrap_or(false),
+                                        None => false,
+                                    };
                                     if cache_hit {
                                         ui.add_sized(
                                             [16.0, 22.0],
@@ -3145,8 +3332,8 @@ impl eframe::App for Jukebox {
                                             ),
                                         )
                                         .on_hover_text(
-                                            "Preview already rendered to bench-out/cache/ — \
-                                             click is instant.",
+                                            "Preview already rendered to bench-out/cache/ \
+                                             for the selected voice — click is instant.",
                                         );
                                     } else if t.format == Format::Mid {
                                         ui.add_sized(
@@ -3158,12 +3345,73 @@ impl eframe::App for Jukebox {
                                             ),
                                         )
                                         .on_hover_text(
-                                            "No cached preview — first click triggers a \
-                                             background render (1–10 s).",
+                                            "No cached preview for the selected voice — \
+                                             first click triggers a background render (1–10 s).",
                                         );
                                     }
+                                    // Per-row voice picker. Only shown
+                                    // for MIDI tracks because non-MIDI
+                                    // rows have a fixed engine baked
+                                    // into the file name (sfz / modal
+                                    // / etc.) — there's nothing to
+                                    // re-render. Selecting a different
+                                    // voice persists immediately to
+                                    // play_log.track_voices and queues
+                                    // an auto-preview so the user
+                                    // hears the new pick without a
+                                    // second click.
+                                    if let Some(cur_voice) = &selected_voice {
+                                        let mut picked: Option<String> = None;
+                                        let cur_text = cur_voice.clone();
+                                        let cached_voices_for_label = self
+                                            .cached_midi_labels
+                                            .get(&t.label)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        egui::ComboBox::from_id_salt(format!("voice-{i}"))
+                                            .selected_text(
+                                                egui::RichText::new(&cur_text).monospace().small(),
+                                            )
+                                            .width(112.0)
+                                            .show_ui(ui, |ui| {
+                                                for v in AVAILABLE_VOICES {
+                                                    let is_cur = *v == cur_text;
+                                                    let is_cached =
+                                                        cached_voices_for_label.contains(*v);
+                                                    let glyph = if is_cached { "\u{2713} " } else { "  " };
+                                                    let item = format!("{glyph}{v}");
+                                                    if ui
+                                                        .selectable_label(
+                                                            is_cur,
+                                                            egui::RichText::new(item)
+                                                                .monospace()
+                                                                .small(),
+                                                        )
+                                                        .on_hover_text(if is_cached {
+                                                            "Already rendered for this track \
+                                                             — switching is instant."
+                                                        } else {
+                                                            "Will trigger a background render \
+                                                             (1–10 s) the first time."
+                                                        })
+                                                        .clicked()
+                                                    {
+                                                        picked = Some((*v).to_string());
+                                                    }
+                                                }
+                                            });
+                                        if let Some(v) = picked {
+                                            if v != cur_text {
+                                                to_set_voice.push((i, v));
+                                            }
+                                        }
+                                    }
+                                    let engine_text = match &selected_voice {
+                                        Some(v) => v.as_str(),
+                                        None => t.engine.as_str(),
+                                    };
                                     let label = if active {
-                                        format!("\u{25B6} {}", t.engine)
+                                        format!("\u{25B6} {}", engine_text)
                                     } else if is_rendering {
                                         // Live elapsed-time counter so
                                         // the user knows the click
@@ -3177,7 +3425,9 @@ impl eframe::App for Jukebox {
                                             .as_ref()
                                             .map(|p| p.started.elapsed().as_secs_f32())
                                             .unwrap_or(0.0);
-                                        format!("\u{231B} {} ({:.1}s)", t.engine, secs)
+                                        format!("\u{231B} {} ({:.1}s)", engine_text, secs)
+                                    } else if t.format == Format::Mid {
+                                        format!("\u{25B6} {}", engine_text)
                                     } else {
                                         t.engine.clone()
                                     };
@@ -3237,6 +3487,7 @@ impl eframe::App for Jukebox {
                                 indices,
                                 &mut to_play,
                                 &mut to_set_fav,
+                                &mut to_set_voice,
                             );
                             ui.add_space(2.0);
                         }
@@ -3264,13 +3515,45 @@ impl eframe::App for Jukebox {
                                     indices,
                                     &mut to_play,
                                     &mut to_set_fav,
+                                    &mut to_set_voice,
                                 );
                                 ui.add_space(2.0);
                             }
                         });
                     }
                 }
-                if let Some(i) = to_play {
+                // Voice picks have to settle BEFORE `to_play`: a
+                // voice change auto-fires preview for the same row, so
+                // we want the latest pick reflected when `preview()`
+                // resolves the cache key. Multiple picks on the same
+                // row in one frame are unlikely (egui delivers one
+                // selectable click at a time) but we defensively keep
+                // only the last per-row.
+                let mut auto_play_after_voice: Option<usize> = None;
+                if !to_set_voice.is_empty() {
+                    let mut last_per_idx: HashMap<usize, String> = HashMap::new();
+                    for (idx, voice) in to_set_voice {
+                        last_per_idx.insert(idx, voice);
+                    }
+                    for (idx, voice) in last_per_idx {
+                        let path = match self.tracks.get(idx) {
+                            Some(t) => t.path.clone(),
+                            None => continue,
+                        };
+                        let label = match self.tracks.get(idx) {
+                            Some(t) => t.label.clone(),
+                            None => continue,
+                        };
+                        if self.set_track_voice(&label, &path, &voice) {
+                            // Auto-fire preview so the user immediately
+                            // hears the new voice. Cache hits play
+                            // straight away; misses kick off the
+                            // background render with progress UI.
+                            auto_play_after_voice = Some(idx);
+                        }
+                    }
+                }
+                if let Some(i) = auto_play_after_voice.or(to_play) {
                     self.preview(i);
                 }
                 if !to_set_fav.is_empty() {
