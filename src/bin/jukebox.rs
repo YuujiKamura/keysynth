@@ -10,13 +10,14 @@
 //! tracked as a frame cursor so loop / mute / solo / pan / volume are
 //! sample-accurate (no per-track Sink, no start-skew).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use keysynth::library_db::{LibraryDb, Song, SongFilter, SongSort, VoiceFilter};
+use keysynth::play_log::{PlayEntry, PlayLogDb};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -1119,7 +1120,31 @@ struct Jukebox {
     /// in the header so the user can see at-a-glance whether discovery
     /// found the expected modeled-voices set.
     db_voice_count: usize,
+    /// Local play-history + favorites store
+    /// (`bench-out/play_log.db`, gitignored). `None` when the file is
+    /// unwritable so the rest of the jukebox keeps functioning — every
+    /// read of this field treats `None` as "no history yet".
+    play_log: Option<PlayLogDb>,
+    /// In-memory mirror of the favorites table; the DB stays
+    /// authoritative. Refreshed after every toggle so the central
+    /// panel can render ★ glyphs without a per-row SELECT.
+    favorites: HashSet<String>,
+    /// Lifetime play counts keyed by `Track::label` (file stem).
+    /// Refreshed after each `record_play` so the side panel and
+    /// per-row badges stay in sync without polling.
+    play_counts: HashMap<String, i64>,
+    /// Most-recent-first slice of the play history, capped at
+    /// `RECENT_PLAYS_LIMIT`. Used by the right side panel.
+    recent_plays: Vec<PlayEntry>,
+    /// When true the central catalogue is filtered down to just the
+    /// rows whose `Track::label` is in `favorites`. Lets the user
+    /// flick between "everything" and "my list" without retyping a
+    /// substring filter.
+    favorites_only: bool,
 }
+
+const RECENT_PLAYS_LIMIT: usize = 12;
+const TOP_PLAYED_LIMIT: usize = 5;
 
 /// One in-flight MIDI → WAV render dispatched from the GUI thread.
 struct PendingRender {
@@ -1181,6 +1206,44 @@ fn load_library_db_index() -> (HashMap<String, Song>, usize) {
         index.insert(s.id.clone(), s);
     }
     (index, voice_count)
+}
+
+/// Open the local play-log database. Failures degrade gracefully so a
+/// read-only working tree (e.g. a CI image) still lets the user browse
+/// the catalogue — they just lose history persistence for the session.
+fn load_play_log() -> Option<PlayLogDb> {
+    let db_path = PathBuf::from("bench-out/play_log.db");
+    let mut db = match PlayLogDb::open(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "jukebox: play_log open failed ({}): {e} — running without history",
+                db_path.display()
+            );
+            return None;
+        }
+    };
+    if let Err(e) = db.migrate() {
+        eprintln!("jukebox: play_log migrate failed: {e} — running without history");
+        return None;
+    }
+    Some(db)
+}
+
+/// Cheap "5m ago" / "2h ago" / "3d ago" formatter used by the recent-
+/// plays panel. Keeps the side panel readable without dragging in a
+/// `chrono` / `humantime` dependency for one-line text.
+fn humanize_ago(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        format!("{s}s ago")
+    } else if s < 3_600 {
+        format!("{}m ago", s / 60)
+    } else if s < 86_400 {
+        format!("{}h ago", s / 3_600)
+    } else {
+        format!("{}d ago", s / 86_400)
+    }
 }
 
 fn list_output_devices() -> Vec<String> {
@@ -1247,6 +1310,8 @@ impl Jukebox {
         let mixer =
             build_mixer_stream("(default)", state).map_err(|e| format!("audio output: {e}"))?;
         let current_device = mixer.device_name.clone();
+        let play_log = load_play_log();
+        let (favorites, play_counts, recent_plays) = snapshot_play_stats(play_log.as_ref());
         Ok(Self {
             tracks,
             selected: None,
@@ -1260,8 +1325,94 @@ impl Jukebox {
             pending_render: None,
             song_index,
             db_voice_count,
+            play_log,
+            favorites,
+            play_counts,
+            recent_plays,
+            favorites_only: false,
         })
     }
+
+    /// Pull cached favorites / counts / recent-plays from the DB.
+    /// Called after every mutation (record_play, toggle_favorite) so
+    /// the side panel reflects the new state without holding a live
+    /// borrow into `play_log` from the egui closures.
+    fn refresh_play_stats(&mut self) {
+        let (favs, counts, recent) = snapshot_play_stats(self.play_log.as_ref());
+        self.favorites = favs;
+        self.play_counts = counts;
+        self.recent_plays = recent;
+    }
+
+    /// Apply a batch of `(song_id, fav)` favorite assignments and
+    /// refresh caches once at the end. Used by the per-piece ★ button:
+    /// a single click can flip several engine renders that share a
+    /// piece root, and we want the side panel to settle in one frame
+    /// instead of mid-loop.
+    fn set_favorites_batch(&mut self, ops: &[(String, bool)]) {
+        if ops.is_empty() {
+            return;
+        }
+        let Some(db) = self.play_log.as_mut() else {
+            return;
+        };
+        for (song_id, fav) in ops {
+            if let Err(e) = db.set_favorite(song_id, *fav) {
+                eprintln!("jukebox: set_favorite({song_id}, {fav}): {e}");
+            }
+        }
+        self.refresh_play_stats();
+    }
+
+    /// Log a play row keyed by `Track::label` (the catalog stem).
+    /// Called every time `load_resolved_track` actually starts audio.
+    fn record_play_for(&mut self, idx: usize) {
+        let Some(track) = self.tracks.get(idx) else {
+            return;
+        };
+        let song_id = track.label.clone();
+        let voice_id = track.engine.clone();
+        let Some(db) = self.play_log.as_mut() else {
+            return;
+        };
+        let voice = if voice_id.is_empty() || voice_id == "—" {
+            None
+        } else {
+            Some(voice_id.as_str())
+        };
+        if let Err(e) = db.record_play(&song_id, voice, None) {
+            eprintln!("jukebox: record_play({song_id}): {e}");
+            return;
+        }
+        self.refresh_play_stats();
+    }
+
+    /// Find the first track matching `song_id` (which is `Track::label`)
+    /// and start it. Used by the side-panel "▶" buttons.
+    fn play_song_id(&mut self, song_id: &str) {
+        let idx = self.tracks.iter().position(|t| t.label == song_id);
+        if let Some(i) = idx {
+            self.preview(i);
+        }
+    }
+}
+
+/// Pulls the small caches the GUI reads every frame out of the DB in
+/// one shot. Returning a tuple keeps `Jukebox::new` and
+/// `refresh_play_stats` symmetric.
+fn snapshot_play_stats(
+    db: Option<&PlayLogDb>,
+) -> (HashSet<String>, HashMap<String, i64>, Vec<PlayEntry>) {
+    let Some(db) = db else {
+        return (HashSet::new(), HashMap::new(), Vec::new());
+    };
+    let favorites: HashSet<String> = db.favorites().unwrap_or_default().into_iter().collect();
+    let play_counts = db.play_counts().unwrap_or_default();
+    let recent_plays = db.recent_plays(RECENT_PLAYS_LIMIT).unwrap_or_default();
+    (favorites, play_counts, recent_plays)
+}
+
+impl Jukebox {
 
     /// Reset all loaded tracks' cursor to 0 and start the transport.
     /// Sample-accurate: every track that's loaded begins from frame 0
@@ -1461,6 +1612,11 @@ impl Jukebox {
             self.slot_file_idx[0] = Some(idx);
         }
         self.selected = Some(idx);
+        // Append a row to play_log.db. Done after the mixer state is
+        // committed so a failed load (handled above with an early
+        // return) doesn't pollute the history with a play that never
+        // produced audio.
+        self.record_play_for(idx);
     }
 
     fn rebind_device(&mut self, name: &str) {
@@ -1490,6 +1646,10 @@ impl Jukebox {
         let (index, voice_count) = load_library_db_index();
         self.song_index = index;
         self.db_voice_count = voice_count;
+        // The play_log is independent of the catalog rebuild, but the
+        // counts/recent caches may be stale if another process wrote
+        // them (e.g. a parallel kssong run); refresh them here too.
+        self.refresh_play_stats();
     }
 
     /// Append a new empty mix slot. UI callable.
@@ -1667,6 +1827,13 @@ impl eframe::App for Jukebox {
                 ui.separator();
                 ui.label("filter:");
                 ui.text_edit_singleline(&mut self.filter);
+                ui.separator();
+                let fav_label = format!("\u{2605} only ({})", self.favorites.len());
+                ui.checkbox(&mut self.favorites_only, fav_label).on_hover_text(
+                    "Restrict the catalogue to starred songs. Use the \u{2605}/\u{2606} \
+                     button on each row to toggle. Persists across sessions in \
+                     bench-out/play_log.db (gitignored, machine-local).",
+                );
             });
             ui.horizontal(|ui| {
                 ui.label("output:");
@@ -1891,6 +2058,209 @@ impl eframe::App for Jukebox {
                     });
             });
 
+        // ----- Right panel: play history + favorites ----------------
+        // Three stacked sections: starred songs, recently played
+        // window, and lifetime leaderboard. Every entry is a button
+        // that re-launches the matching track via `play_song_id`.
+        // The panel is collapsible — drag the splitter to hide it
+        // when the user wants the catalogue full-width.
+        egui::SidePanel::right("history-panel")
+            .resizable(true)
+            .default_width(240.0)
+            .min_width(180.0)
+            .show(ctx, |ui| {
+                let mut to_play_song: Option<String> = None;
+                let mut to_clear_fav: Option<String> = None;
+
+                ui.horizontal(|ui| {
+                    ui.heading("\u{2605} favorites");
+                    ui.label(format!("({})", self.favorites.len()));
+                });
+                ui.separator();
+                if self.play_log.is_none() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(200, 130, 130),
+                        "play_log unavailable",
+                    )
+                    .on_hover_text(
+                        "bench-out/play_log.db could not be opened — favorites and \
+                         history are disabled this session. See stderr for details.",
+                    );
+                } else if self.favorites.is_empty() {
+                    ui.label(
+                        egui::RichText::new("no favorites yet — click \u{2606} on any row")
+                            .small()
+                            .italics(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("favorites-scroll")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            // DB returns most-recently-added first.
+                            // Re-derive from the snapshot we already
+                            // have so the panel doesn't hit SQLite per
+                            // frame.
+                            let mut favs: Vec<&String> = self.favorites.iter().collect();
+                            favs.sort();
+                            for song_id in favs {
+                                ui.horizontal(|ui| {
+                                    let display = self
+                                        .song_index
+                                        .get(song_id)
+                                        .map(|s| s.title.clone())
+                                        .unwrap_or_else(|| song_id.clone());
+                                    let exists = self
+                                        .tracks
+                                        .iter()
+                                        .any(|t| &t.label == song_id);
+                                    let label = if exists {
+                                        format!("\u{25B6} {display}")
+                                    } else {
+                                        format!("(missing) {display}")
+                                    };
+                                    if ui
+                                        .add_enabled(
+                                            exists,
+                                            egui::Button::new(
+                                                egui::RichText::new(label).small(),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text(song_id.as_str())
+                                        .clicked()
+                                    {
+                                        to_play_song = Some(song_id.clone());
+                                    }
+                                    if ui
+                                        .small_button("\u{2605}")
+                                        .on_hover_text("Remove from favorites")
+                                        .clicked()
+                                    {
+                                        to_clear_fav = Some(song_id.clone());
+                                    }
+                                });
+                            }
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.heading("\u{1F551} recent");
+                    ui.label(format!("({})", self.recent_plays.len()));
+                });
+                ui.separator();
+                if self.recent_plays.is_empty() {
+                    ui.label(
+                        egui::RichText::new("nothing played yet")
+                            .small()
+                            .italics(),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .id_salt("recent-scroll")
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            for entry in &self.recent_plays {
+                                ui.horizontal(|ui| {
+                                    let display = self
+                                        .song_index
+                                        .get(&entry.song_id)
+                                        .map(|s| s.title.clone())
+                                        .unwrap_or_else(|| entry.song_id.clone());
+                                    let voice = entry
+                                        .voice_id
+                                        .as_deref()
+                                        .unwrap_or("?");
+                                    let ago = humanize_ago(now - entry.played_at);
+                                    let exists = self
+                                        .tracks
+                                        .iter()
+                                        .any(|t| t.label == entry.song_id);
+                                    let label = format!(
+                                        "\u{25B6} {display}  ({voice}, {ago})"
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            exists,
+                                            egui::Button::new(
+                                                egui::RichText::new(label).small(),
+                                            )
+                                            .frame(false),
+                                        )
+                                        .on_hover_text(entry.song_id.as_str())
+                                        .clicked()
+                                    {
+                                        to_play_song = Some(entry.song_id.clone());
+                                    }
+                                });
+                            }
+                        });
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.heading("\u{1F525} top");
+                });
+                ui.separator();
+                let top: Vec<(String, i64)> = {
+                    let mut v: Vec<(String, i64)> = self
+                        .play_counts
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v))
+                        .collect();
+                    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    v.truncate(TOP_PLAYED_LIMIT);
+                    v
+                };
+                if top.is_empty() {
+                    ui.label(egui::RichText::new("no plays yet").small().italics());
+                } else {
+                    for (song_id, n) in &top {
+                        ui.horizontal(|ui| {
+                            let display = self
+                                .song_index
+                                .get(song_id)
+                                .map(|s| s.title.clone())
+                                .unwrap_or_else(|| song_id.clone());
+                            let exists = self.tracks.iter().any(|t| &t.label == song_id);
+                            let label = format!("\u{25B6} {display}");
+                            ui.add_sized(
+                                [40.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("\u{00D7}{n}"))
+                                        .color(egui::Color32::from_rgb(255, 180, 120))
+                                        .small()
+                                        .monospace(),
+                                ),
+                            );
+                            if ui
+                                .add_enabled(
+                                    exists,
+                                    egui::Button::new(egui::RichText::new(label).small())
+                                        .frame(false),
+                                )
+                                .on_hover_text(song_id.as_str())
+                                .clicked()
+                            {
+                                to_play_song = Some(song_id.clone());
+                            }
+                        });
+                    }
+                }
+
+                if let Some(song_id) = to_play_song {
+                    self.play_song_id(&song_id);
+                }
+                if let Some(song_id) = to_clear_fav {
+                    self.set_favorites_batch(&[(song_id, false)]);
+                }
+            });
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let needle = self.filter.to_lowercase();
             // Two-level grouping. The first key folds the iter-variant
@@ -1958,6 +2328,9 @@ impl eframe::App for Jukebox {
                 if !needle.is_empty() && !t.piece.to_lowercase().contains(&needle) {
                     continue;
                 }
+                if self.favorites_only && !self.favorites.contains(&t.label) {
+                    continue;
+                }
                 let root = fold_key(&t.piece);
                 folded
                     .entry(root)
@@ -1969,6 +2342,10 @@ impl eframe::App for Jukebox {
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 let mut to_play: Option<usize> = None;
+                // Queued favorite-state updates from the per-piece ★
+                // buttons. Drained outside the closure so the egui
+                // borrow on `self` stays read-only inside it.
+                let mut to_set_fav: Vec<(String, bool)> = Vec::new();
                 let avail_w = ui.available_width();
                 for (root, pieces) in &folded {
                     let total_renders: usize = pieces.values().map(|v| v.len()).sum();
@@ -1986,11 +2363,86 @@ impl eframe::App for Jukebox {
                         |ui: &mut egui::Ui,
                          piece: &str,
                          indices: &[usize],
-                         to_play: &mut Option<usize>| {
+                         to_play: &mut Option<usize>,
+                         to_set_fav: &mut Vec<(String, bool)>| {
                             ui.horizontal_wrapped(|ui| {
                                 let active_in_group = indices
                                     .iter()
                                     .any(|i| self.selected == Some(*i) && any_playing);
+                                // Favorite glyph: solid \u{2605} if any
+                                // render in this row is starred, hollow
+                                // \u{2606} otherwise. Click flips every
+                                // render's state to the opposite of
+                                // current "any" so a single button is
+                                // enough to favorite / unfavorite a
+                                // whole piece (the underlying primitive
+                                // stays per-render).
+                                let any_fav = indices.iter().any(|i| {
+                                    self.tracks
+                                        .get(*i)
+                                        .map(|t| self.favorites.contains(&t.label))
+                                        .unwrap_or(false)
+                                });
+                                let star_glyph = if any_fav { "\u{2605}" } else { "\u{2606}" };
+                                let star_color = if any_fav {
+                                    egui::Color32::from_rgb(255, 210, 80)
+                                } else {
+                                    egui::Color32::from_rgb(140, 140, 140)
+                                };
+                                let star_btn = egui::Button::new(
+                                    egui::RichText::new(star_glyph)
+                                        .color(star_color)
+                                        .strong(),
+                                )
+                                .frame(false);
+                                if ui
+                                    .add_sized([22.0, 22.0], star_btn)
+                                    .on_hover_text(if any_fav {
+                                        "Unfavorite this piece (all engine renders)"
+                                    } else {
+                                        "Favorite this piece — appears in the \u{2605} side panel \
+                                         and the \u{2605}-only filter."
+                                    })
+                                    .clicked()
+                                {
+                                    let target = !any_fav;
+                                    for i in indices {
+                                        if let Some(t) = self.tracks.get(*i) {
+                                            to_set_fav.push((t.label.clone(), target));
+                                        }
+                                    }
+                                }
+                                // Lifetime play count (sum across this
+                                // piece's renders). Hidden when zero so
+                                // unplayed rows stay visually quiet.
+                                let total_plays: i64 = indices
+                                    .iter()
+                                    .filter_map(|i| self.tracks.get(*i))
+                                    .map(|t| {
+                                        self.play_counts
+                                            .get(&t.label)
+                                            .copied()
+                                            .unwrap_or(0)
+                                    })
+                                    .sum();
+                                if total_plays > 0 {
+                                    ui.add_sized(
+                                        [40.0, 22.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(format!("\u{00D7}{total_plays}"))
+                                                .color(egui::Color32::from_rgb(160, 200, 255))
+                                                .small()
+                                                .monospace(),
+                                        ),
+                                    )
+                                    .on_hover_text(
+                                        "Lifetime play count from bench-out/play_log.db. \
+                                         Counts every preview launched from this row across all \
+                                         engine variants.",
+                                    );
+                                } else {
+                                    ui.add_space(40.0);
+                                }
                                 let source_label = indices
                                     .first()
                                     .and_then(|i| self.tracks.get(*i))
@@ -2129,7 +2581,13 @@ impl eframe::App for Jukebox {
 
                     if inline {
                         for (piece, indices) in pieces {
-                            render_piece_row(ui, piece, indices, &mut to_play);
+                            render_piece_row(
+                                ui,
+                                piece,
+                                indices,
+                                &mut to_play,
+                                &mut to_set_fav,
+                            );
                             ui.add_space(2.0);
                         }
                     } else {
@@ -2150,7 +2608,13 @@ impl eframe::App for Jukebox {
                             .id_salt(format!("fold-{root}"));
                         header.show(ui, |ui| {
                             for (piece, indices) in pieces {
-                                render_piece_row(ui, piece, indices, &mut to_play);
+                                render_piece_row(
+                                    ui,
+                                    piece,
+                                    indices,
+                                    &mut to_play,
+                                    &mut to_set_fav,
+                                );
                                 ui.add_space(2.0);
                             }
                         });
@@ -2158,6 +2622,9 @@ impl eframe::App for Jukebox {
                 }
                 if let Some(i) = to_play {
                     self.preview(i);
+                }
+                if !to_set_fav.is_empty() {
+                    self.set_favorites_batch(&to_set_fav);
                 }
             });
         });
@@ -2270,6 +2737,19 @@ mod tests {
             }
         }
         assert!(got_nonzero, "MP3 decoded as silence — decoder broken");
+    }
+
+    #[test]
+    fn humanize_ago_picks_natural_unit() {
+        assert_eq!(humanize_ago(-5), "0s ago"); // clock skew → clamp
+        assert_eq!(humanize_ago(0), "0s ago");
+        assert_eq!(humanize_ago(45), "45s ago");
+        assert_eq!(humanize_ago(60), "1m ago");
+        assert_eq!(humanize_ago(125), "2m ago");
+        assert_eq!(humanize_ago(3_600), "1h ago");
+        assert_eq!(humanize_ago(7_200 + 30), "2h ago");
+        assert_eq!(humanize_ago(86_400), "1d ago");
+        assert_eq!(humanize_ago(3 * 86_400 + 7_200), "3d ago");
     }
 
     #[test]
