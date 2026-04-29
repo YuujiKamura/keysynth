@@ -60,6 +60,12 @@ native = [
     # version skew at ship time. Native-only because the catalog is
     # filesystem-scoped and the wasm bundle has no `bench-out/library.db`.
     "dep:rusqlite",
+    # steel-core: embedded Scheme interpreter for the scripting layer
+    # (issue #56 Phase 1). Hosts the Steel REPL (`ksrepl` binary) and is
+    # the foundation for Phase 2/3 — Rust API exposure as Steel callables
+    # and a Lisp DSL for chord progressions / live edit. Native-only:
+    # the wasm browser build keeps to plain Rust UI for now.
+    "dep:steel-core",
 ]
 
 # Web build: stripped to the modelling engines + on-screen keyboard. Pulls
@@ -134,6 +140,12 @@ sha2 = { version = "0.10", optional = true }
 # without per-OS install steps. Native-only: the wasm bundle has no
 # `bench-out/library.db` to read.
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+# steel-core: embedded Scheme interpreter — host for the Lisp scripting
+# layer roadmap (issue #56). Phase 1 just lights up the runtime + REPL;
+# Phase 2/3 will register keysynth Rust API as Steel callables. Default
+# features (`std`, `modules`) are fine — they enable the standard prelude
+# and module system. Native-only: see the `native` feature comment above.
+steel-core = { version = "0.8", optional = true }
 
 # Web-only (gated via `web` feature). Pulled in only when targeting wasm32.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -320,4 +332,14 @@ required-features = ["native"]
 [[bin]]
 name = "chord_pad"
 path = "src/bin/chord_pad.rs"
+required-features = ["native"]
+
+# ksrepl: Steel (embedded Scheme) REPL — entry point for the Lisp
+# scripting layer (issue #56 Phase 1). Phase 1 only hosts the bare
+# Steel runtime so `(+ 1 2)` round-trips; Phase 2/3 will register
+# keysynth Rust API as Steel callables for voice construction, chord
+# progressions, and live edit. Native-only: depends on steel-core.
+[[bin]]
+name = "ksrepl"
+path = "src/bin/ksrepl.rs"
 required-features = ["native"]
