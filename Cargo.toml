@@ -286,36 +286,17 @@ name = "render_chiptune"
 path = "src/bin/render_chiptune.rs"
 required-features = ["native"]
 
-# jukebox binary: minimal egui WAV browser for A/B listening.
-[[bin]]
-name = "jukebox"
-path = "src/bin/jukebox.rs"
-required-features = ["native"]
+# NOTE (2026-04-30 凍結): jukebox / jukebox_lite / jukebox_lite_c /
+# jukebox_lite_g の4変種は archive/jukebox-bins-2026-04-30 タグに退避。
+# 今後の jukebox 機能は jukebox_lite_seq (sequencer + list view 統合) に集約。
 
-# jukebox_lite binary: YouTube-style minimal browser
-# (team/jukebox-lite-rebuild). Same backend modules as `jukebox`
-# (library_db / play_log / preview_cache / gui_cp) but a heavily
-# trimmed UI: header search, mood/genre sidebar, song-card grid,
-# Now Playing bar. Voice picking is mood-driven (no per-row UI).
+# jukebox_lite_seq binary: jukebox_lite_c list view + a BMS-style live
+# sequencer view. The sequencer drives `voices_live/*` cdylibs in-process
+# (no `render_midi` subprocess, no preview_cache) so voice / mute / solo /
+# tempo changes take effect mid-playback.
 [[bin]]
-name = "jukebox_lite"
-path = "src/bin/jukebox_lite.rs"
-required-features = ["native"]
-
-# jukebox_lite_c binary: Codex list-view browser.
-# Reuses the same backend modules as `jukebox_lite` but switches to a
-# dense Finder / foobar / Spotify-Songs-style list with an inspector
-# pane instead of a card grid.
-[[bin]]
-name = "jukebox_lite_c"
-path = "src/bin/jukebox_lite_c.rs"
-required-features = ["native"]
-
-# jukebox_lite_g binary: Gemini version of the music browser.
-# Reuse backend from jukebox_lite but with a custom list-style UI.
-[[bin]]
-name = "jukebox_lite_g"
-path = "src/bin/jukebox_lite_g.rs"
+name = "jukebox_lite_seq"
+path = "src/bin/jukebox_lite_seq.rs"
 required-features = ["native"]
 
 # seq_grid binary: standalone egui step-sequencer pattern grid.
