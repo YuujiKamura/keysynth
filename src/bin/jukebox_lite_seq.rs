@@ -1265,6 +1265,13 @@ struct SeqMutState {
     voices: Vec<ActiveSeqVoice>,
     track_mute: Vec<bool>,
     track_solo: Vec<bool>,
+    /// Per-track voice slug. `None` means "use master". Audio thread
+    /// looks this up against the shared `VoicePool` on every note_on
+    /// — present in pool ⇒ that factory makes the voice; absent ⇒
+    /// fall through to master. This is the "each channel has its own
+    /// engine" feature: switching a track's voice is just a pool
+    /// lookup, no rebuild.
+    track_voice_slugs: Vec<Option<String>>,
     tempo_scale: f32,
     master: f32,
 }
@@ -1279,6 +1286,7 @@ impl SeqMutState {
             voices: Vec::with_capacity(SEQ_VOICE_CAP),
             track_mute: Vec::new(),
             track_solo: Vec::new(),
+            track_voice_slugs: Vec::new(),
             tempo_scale: 1.0,
             master: 0.55,
         }
@@ -1306,45 +1314,57 @@ impl SeqMutState {
         if self.track_solo.len() < n {
             self.track_solo.resize(n, false);
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-enum SeqVoiceLoadStatus {
-    Idle,
-    Loading {
-        name: String,
-        #[allow(dead_code)]
-        started: Instant,
-    },
-    Loaded { name: String, took_ms: u128 },
-    Failed { name: String, message: String },
-}
-
-impl SeqVoiceLoadStatus {
-    fn label(&self) -> String {
-        match self {
-            Self::Idle => "no voice loaded".into(),
-            Self::Loading { name, .. } => format!("building {name}..."),
-            Self::Loaded { name, took_ms } => format!("{name} (built in {took_ms} ms)"),
-            Self::Failed { name, message } => format!("{name}: {message}"),
+        if self.track_voice_slugs.len() < n {
+            self.track_voice_slugs.resize(n, None);
         }
     }
 }
 
+/// Memory-resident pool of every `LiveFactory` we've ever loaded. Once
+/// a voice is in here it stays there, so re-selecting it is an
+/// `ArcSwap::store` (or a HashMap lookup for per-track), never a
+/// `cargo build`. Shared between the GUI thread (writes on load
+/// completion) and the audio thread (reads on each note_on for
+/// per-track lookup).
+type VoicePool = Arc<Mutex<HashMap<String, Arc<LiveFactory>>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum VoiceSlotState {
+    /// Never requested. UI shows this as "—".
+    Idle,
+    /// Build / load is currently running on a worker thread.
+    Loading,
+    /// Factory is in the pool; ready to use instantly.
+    Ready,
+    /// Build failed; the message is surfaced in the dropdown tooltip.
+    Failed(String),
+}
+
+// SeqVoiceLoadStatus replaced by per-slot VoiceSlotState above; the
+// dropdown reads the slot map directly so every option shows ✓ /
+// spinner / × independently rather than a single global status line.
+
 struct SeqEngine {
     shared: Arc<Mutex<SeqMutState>>,
+    /// Master voice — used for any track whose `track_voice_slugs[i]`
+    /// is `None` (or whose slug is not yet in the pool). Hot-swappable
+    /// via `ArcSwap` so re-selecting in the master dropdown is one
+    /// pointer store.
     factory: Arc<ArcSwap<Option<Arc<LiveFactory>>>>,
-    /// Negotiated cpal sample rate (kept for diagnostics / future
-    /// surfacing in the GUI; render callbacks read it directly via
-    /// the closure capture).
+    /// Memory-resident voice pool. Both the master swap above and
+    /// per-track lookups in the render block resolve against this.
+    pool: VoicePool,
+    /// State of every voice slot the user has touched (or that the
+    /// background warm-up has triggered). The dropdown reads this to
+    /// show ✓ / spinner / × per option without taking the pool lock.
+    slot_states: Arc<Mutex<HashMap<String, VoiceSlotState>>>,
     #[allow(dead_code)]
     sr: u32,
-    voice_status: Arc<Mutex<SeqVoiceLoadStatus>>,
     voice_load_rx: Receiver<SeqVoiceLoadEvent>,
     voice_load_tx: Sender<SeqVoiceLoadEvent>,
-    /// Currently-loaded voice slug ("guitar_stk" / "piano" / ...).
-    /// `None` until first build completes.
+    /// Currently-active master voice slug. Set the moment we kick off
+    /// a load (so a duplicate click is a no-op) and cleared if that
+    /// load fails.
     current_voice: Option<String>,
     _stream: cpal::Stream,
 }
@@ -1354,6 +1374,10 @@ enum SeqVoiceLoadEvent {
         name: String,
         factory: Arc<LiveFactory>,
         took_ms: u128,
+        /// `true` when this load was triggered by the master-voice
+        /// dropdown; `false` for warm-up / per-track loads that just
+        /// want the factory in the pool without rotating the master.
+        set_as_master: bool,
     },
     Failed {
         name: String,
@@ -1366,6 +1390,7 @@ fn seq_render_block(
     channels: u16,
     state: &Arc<Mutex<SeqMutState>>,
     factory: &Arc<ArcSwap<Option<Arc<LiveFactory>>>>,
+    pool: &VoicePool,
     sr: u32,
 ) {
     for s in out.iter_mut() {
@@ -1387,8 +1412,17 @@ fn seq_render_block(
 
     let block_start = st.playhead_sec;
     let block_end = block_start + dt_event;
-    let voice_factory = factory.load_full();
-    let voice_factory = voice_factory.as_ref().as_ref().cloned();
+    let master_factory = factory.load_full();
+    let master_factory: Option<Arc<LiveFactory>> =
+        master_factory.as_ref().as_ref().cloned();
+
+    // Snapshot pool once per render block. Audio thread takes the
+    // mutex briefly; GUI rarely contends because writes only happen
+    // when a load completes (rare event, < once per second worst case).
+    let pool_snapshot: HashMap<String, Arc<LiveFactory>> = match pool.lock() {
+        Ok(g) => g.clone(),
+        Err(_) => HashMap::new(),
+    };
 
     // Spawn note_ons whose start_sec falls inside this block. We grab
     // one Arc<Vec<SeqNote>> snapshot up front; mutating commands swap a
@@ -1405,7 +1439,20 @@ fn seq_render_block(
                 if st.voices.len() >= SEQ_VOICE_CAP {
                     st.voices.remove(0);
                 }
-                if let Some(fac) = voice_factory.as_ref() {
+                // Resolve the factory for this track: per-track slug
+                // first (if both set and present in the pool), then
+                // master. Falling through silently when no factory is
+                // available is intentional — the user just hasn't
+                // built any voice yet, and the alternative is a
+                // crash.
+                let track_slug = st
+                    .track_voice_slugs
+                    .get(n.track_idx as usize)
+                    .and_then(|s| s.as_ref());
+                let factory_for_note: Option<&Arc<LiveFactory>> = track_slug
+                    .and_then(|slug| pool_snapshot.get(slug.as_str()))
+                    .or(master_factory.as_ref());
+                if let Some(fac) = factory_for_note {
                     let freq = midi_to_freq(n.midi_note);
                     let v = fac.make_voice(sr as f32, freq, n.velocity);
                     st.voices.push(ActiveSeqVoice {
@@ -1506,17 +1553,19 @@ impl SeqEngine {
         let shared = Arc::new(Mutex::new(SeqMutState::new()));
         let factory: Arc<ArcSwap<Option<Arc<LiveFactory>>>> =
             Arc::new(ArcSwap::from_pointee(None));
+        let pool: VoicePool = Arc::new(Mutex::new(HashMap::new()));
 
         let err_fn = |e| eprintln!("jukebox_lite_seq sequencer audio error: {e}");
         let stream = match sample_format {
             SampleFormat::F32 => {
                 let st = shared.clone();
                 let fac = factory.clone();
+                let pl = pool.clone();
                 device
                     .build_output_stream(
                         &stream_cfg,
                         move |out: &mut [f32], _| {
-                            seq_render_block(out, channels, &st, &fac, sr);
+                            seq_render_block(out, channels, &st, &fac, &pl, sr);
                         },
                         err_fn,
                         None,
@@ -1526,6 +1575,7 @@ impl SeqEngine {
             SampleFormat::I16 => {
                 let st = shared.clone();
                 let fac = factory.clone();
+                let pl = pool.clone();
                 let mut scratch = Vec::<f32>::new();
                 device
                     .build_output_stream(
@@ -1534,7 +1584,7 @@ impl SeqEngine {
                             if scratch.len() != out.len() {
                                 scratch.resize(out.len(), 0.0);
                             }
-                            seq_render_block(&mut scratch, channels, &st, &fac, sr);
+                            seq_render_block(&mut scratch, channels, &st, &fac, &pl, sr);
                             for (dst, src) in out.iter_mut().zip(scratch.iter()) {
                                 *dst = (src.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                             }
@@ -1547,6 +1597,7 @@ impl SeqEngine {
             SampleFormat::U16 => {
                 let st = shared.clone();
                 let fac = factory.clone();
+                let pl = pool.clone();
                 let mut scratch = Vec::<f32>::new();
                 device
                     .build_output_stream(
@@ -1555,7 +1606,7 @@ impl SeqEngine {
                             if scratch.len() != out.len() {
                                 scratch.resize(out.len(), 0.0);
                             }
-                            seq_render_block(&mut scratch, channels, &st, &fac, sr);
+                            seq_render_block(&mut scratch, channels, &st, &fac, &pl, sr);
                             for (dst, src) in out.iter_mut().zip(scratch.iter()) {
                                 *dst =
                                     (((src.clamp(-1.0, 1.0) + 1.0) * 0.5) * u16::MAX as f32) as u16;
@@ -1574,8 +1625,9 @@ impl SeqEngine {
         Ok(Self {
             shared,
             factory,
+            pool,
+            slot_states: Arc::new(Mutex::new(HashMap::new())),
             sr,
-            voice_status: Arc::new(Mutex::new(SeqVoiceLoadStatus::Idle)),
             voice_load_rx: rx,
             voice_load_tx: tx,
             current_voice: None,
@@ -1583,27 +1635,99 @@ impl SeqEngine {
         })
     }
 
+    /// User-visible status string for the currently-active master
+    /// voice. Reads slot_states (cheap) so the dropdown renders every
+    /// frame without contending the pool mutex.
+    #[allow(dead_code)]
     fn status_label(&self) -> String {
-        match self.voice_status.lock() {
-            Ok(g) => g.label(),
-            Err(_) => "voice status poisoned".into(),
+        let slug = match self.current_voice.as_ref() {
+            Some(s) => s.clone(),
+            None => return "no master voice".into(),
+        };
+        let state = self
+            .slot_states
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&slug).cloned());
+        match state {
+            Some(VoiceSlotState::Ready) => format!("✓ {slug}"),
+            Some(VoiceSlotState::Loading) => format!("building {slug}..."),
+            Some(VoiceSlotState::Failed(msg)) => format!("× {slug}: {msg}"),
+            _ => format!("? {slug}"),
         }
     }
 
-    fn load_voice_async(&mut self, voice_slug: &str) {
-        if self.current_voice.as_deref() == Some(voice_slug) {
+    fn slot_state(&self, slug: &str) -> VoiceSlotState {
+        self.slot_states
+            .lock()
+            .ok()
+            .and_then(|g| g.get(slug).cloned())
+            .unwrap_or(VoiceSlotState::Idle)
+    }
+
+    fn pool_has(&self, slug: &str) -> bool {
+        self.pool.lock().map(|g| g.contains_key(slug)).unwrap_or(false)
+    }
+
+    /// Fast path for "voice already in pool" (no rebuild). Returns
+    /// `true` if the master swap could be satisfied from cache; the
+    /// caller can skip the load thread entirely in that case.
+    fn try_set_master_from_pool(&mut self, slug: &str) -> bool {
+        let factory = match self.pool.lock() {
+            Ok(g) => g.get(slug).cloned(),
+            Err(_) => None,
+        };
+        if let Some(f) = factory {
+            self.factory.store(Arc::new(Some(f)));
+            self.current_voice = Some(slug.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// Request `slug` to be loaded into the pool. If it's already
+    /// there, swap the master pointer and return immediately
+    /// (no thread spawn). If it's currently building, do nothing.
+    /// Otherwise spawn a background `build_and_load`.
+    ///
+    /// `set_as_master` controls whether successful load also rotates
+    /// the master ArcSwap to this voice; warm-up calls pass `false`.
+    fn ensure_voice_loaded(&mut self, slug: &str, set_as_master: bool) {
+        if self.try_set_master_from_pool(slug) && set_as_master {
+            // Cache hit + master rotation done in try_set_master_from_pool.
             return;
         }
-        let crate_root = PathBuf::from("voices_live").join(voice_slug);
-        let name = voice_slug.to_string();
-        if let Ok(mut g) = self.voice_status.lock() {
-            *g = SeqVoiceLoadStatus::Loading {
-                name: name.clone(),
-                started: Instant::now(),
-            };
+        // Already loaded but caller didn't want to rotate master:
+        // mark slot Ready and bail.
+        if self.pool_has(slug) {
+            if let Ok(mut g) = self.slot_states.lock() {
+                g.insert(slug.into(), VoiceSlotState::Ready);
+            }
+            return;
         }
+        // Already building? Don't double-spawn.
+        if matches!(self.slot_state(slug), VoiceSlotState::Loading) {
+            if set_as_master {
+                self.current_voice = Some(slug.to_string());
+            }
+            return;
+        }
+
+        let crate_root = PathBuf::from("voices_live").join(slug);
+        let name = slug.to_string();
+        if let Ok(mut g) = self.slot_states.lock() {
+            g.insert(name.clone(), VoiceSlotState::Loading);
+        }
+        if set_as_master {
+            // Tentatively claim master so duplicate clicks don't
+            // re-spawn. Actual ArcSwap update happens in poll once
+            // the build lands.
+            self.current_voice = Some(name.clone());
+        }
+
         let tx = self.voice_load_tx.clone();
-        let name_for_thread = name.clone();
+        let name_for_thread = name;
+        let set_master_for_thread = set_as_master;
         std::thread::Builder::new()
             .name("jukebox-lite-seq-voice".into())
             .spawn(move || {
@@ -1614,6 +1738,7 @@ impl SeqEngine {
                             name: name_for_thread,
                             factory: Arc::new(f),
                             took_ms: started.elapsed().as_millis(),
+                            set_as_master: set_master_for_thread,
                         });
                     }
                     Err(e) => {
@@ -1625,11 +1750,6 @@ impl SeqEngine {
                 }
             })
             .expect("spawn seq voice loader");
-        // Tentatively mark `current_voice` so a second click on the
-        // same dropdown entry doesn't double-spawn while a build is in
-        // flight. If the build fails we reset to the previously-loaded
-        // voice in the poll handler.
-        self.current_voice = Some(name);
     }
 
     fn poll_voice_loads(&mut self) {
@@ -1643,25 +1763,28 @@ impl SeqEngine {
                     name,
                     factory,
                     took_ms,
+                    set_as_master,
                 } => {
-                    self.factory.store(Arc::new(Some(factory)));
-                    if let Ok(mut g) = self.voice_status.lock() {
-                        *g = SeqVoiceLoadStatus::Loaded {
-                            name: name.clone(),
-                            took_ms,
-                        };
+                    if let Ok(mut g) = self.pool.lock() {
+                        g.insert(name.clone(), factory.clone());
                     }
-                    eprintln!("jukebox_lite_seq: loaded voice '{name}' in {took_ms} ms");
+                    if let Ok(mut g) = self.slot_states.lock() {
+                        g.insert(name.clone(), VoiceSlotState::Ready);
+                    }
+                    if set_as_master {
+                        self.factory.store(Arc::new(Some(factory)));
+                    }
+                    eprintln!(
+                        "jukebox_lite_seq: pool += '{name}' ({took_ms} ms){}",
+                        if set_as_master { " [master]" } else { "" }
+                    );
                 }
                 SeqVoiceLoadEvent::Failed { name, message } => {
                     eprintln!(
                         "jukebox_lite_seq: voice '{name}' failed to load: {message}"
                     );
-                    if let Ok(mut g) = self.voice_status.lock() {
-                        *g = SeqVoiceLoadStatus::Failed {
-                            name: name.clone(),
-                            message,
-                        };
+                    if let Ok(mut g) = self.slot_states.lock() {
+                        g.insert(name.clone(), VoiceSlotState::Failed(message));
                     }
                     if self.current_voice.as_deref() == Some(name.as_str()) {
                         self.current_voice = None;
@@ -1805,6 +1928,7 @@ impl SeqEngine {
         }
     }
 
+    #[allow(dead_code)]
     fn current_voice(&self) -> Option<&str> {
         self.current_voice.as_deref()
     }
@@ -1820,12 +1944,6 @@ const SEQ_VOICE_CHOICES: &[(&str, &str)] = &[
     ("piano_thick", "Piano Thick"),
     ("piano_5am", "Piano 5AM"),
 ];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ViewMode {
-    List,
-    Sequencer,
-}
 
 struct JukeboxLiteSeq {
     tracks: Vec<Track>,
@@ -1856,7 +1974,6 @@ struct JukeboxLiteSeq {
 
     // Sequencer view state. The engine owns its own cpal stream that
     // sits idle until the user enters the Sequencer tab and hits Play.
-    view_mode: ViewMode,
     seq: Option<SeqEngine>,
     seq_init_error: Option<String>,
     seq_loaded_label: Option<String>,
@@ -1902,16 +2019,26 @@ impl JukeboxLiteSeq {
             .or_else(|| favorites.iter().next().cloned())
             .or_else(|| tracks.first().map(|t| t.label.clone()));
 
-        // Bring the sequencer engine up but don't kick off a voice
-        // build — that happens lazily the first time the Sequencer tab
-        // is opened so the cold-start path stays fast.
-        let (seq, seq_init_error) = match SeqEngine::build() {
+        // Bring the sequencer engine up and start warming every voice
+        // in `SEQ_VOICE_CHOICES`. Each `ensure_voice_loaded` call
+        // either swaps an in-memory factory in (cache hit, free) or
+        // kicks a background `cargo build` (cold). Master rotation
+        // happens for the first slug only; the rest just populate the
+        // pool so subsequent dropdown picks are instant. Cargo's
+        // incremental cache means the second time the user runs the
+        // app every voice is "✓" within a few hundred ms.
+        let (mut seq, seq_init_error) = match SeqEngine::build() {
             Ok(e) => (Some(e), None),
             Err(e) => {
                 eprintln!("jukebox_lite_seq: sequencer engine init failed: {e}");
                 (None, Some(e))
             }
         };
+        if let Some(s) = seq.as_mut() {
+            for (idx, (slug, _)) in SEQ_VOICE_CHOICES.iter().enumerate() {
+                s.ensure_voice_loaded(slug, idx == 0);
+            }
+        }
 
         Ok(Self {
             tracks,
@@ -1936,7 +2063,6 @@ impl JukeboxLiteSeq {
             cp_state,
             _cp_handle: cp_handle,
             cp_frame_id: 0,
-            view_mode: ViewMode::List,
             seq,
             seq_init_error,
             seq_loaded_label: None,
@@ -2467,6 +2593,148 @@ impl JukeboxLiteSeq {
     }
 
     fn show_transport(&mut self, ui: &mut egui::Ui, playback: &PlaybackSnapshot) {
+        // Branch on the selected row's format:
+        //   - .mid  → drive the live `SeqEngine` (Play/Stop/tempo,
+        //             progress comes from playhead vs end_sec).
+        //   - .wav/.mp3 → drive the existing file-stream `Mixer`
+        //             (Play/Stop/volume, progress from PCM cursor).
+        // Both branches paint the same dark frame; the user reads
+        // playing-state from the `Stop`/`Play` button label.
+        let selected_format = self
+            .selected_track()
+            .map(|t| t.format)
+            .unwrap_or(Format::Wav);
+        match selected_format {
+            Format::Mid => self.show_seq_transport(ui),
+            Format::Wav | Format::Mp3 => self.show_file_transport(ui, playback),
+        }
+    }
+
+    fn show_seq_transport(&mut self, ui: &mut egui::Ui) {
+        let status = match self.seq.as_ref() {
+            Some(s) => s.snapshot_status(),
+            None => return,
+        };
+        let title = self
+            .seq_loaded_label
+            .clone()
+            .or_else(|| self.selected_label.clone())
+            .unwrap_or_else(|| "No MIDI selected".to_string());
+        let subtitle = self
+            .selected_label
+            .as_ref()
+            .and_then(|l| self.song_index.get(l))
+            .map(|s| {
+                let mut out = compact_composer(&s.composer);
+                if let Some(era) = s.era.as_deref() {
+                    out.push_str("  /  ");
+                    out.push_str(era);
+                }
+                out
+            })
+            .unwrap_or_else(|| "Live sequencer · in-process voices_live".to_string());
+
+        let mut clicked_play = false;
+        let mut clicked_stop = false;
+        let mut new_tempo: Option<f32> = None;
+
+        egui::Frame::none()
+            .fill(egui::Color32::from_rgb(57, 69, 63))
+            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
+            .rounding(8.0)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            egui::RichText::new(title)
+                                .size(17.0)
+                                .strong()
+                                .color(egui::Color32::from_rgb(246, 244, 240)),
+                        );
+                        ui.label(
+                            egui::RichText::new(subtitle)
+                                .small()
+                                .color(egui::Color32::from_rgb(205, 213, 204)),
+                        );
+                    });
+                    ui.add_space(14.0);
+                    let progress = if status.end_sec > 0.0 {
+                        (status.playhead_sec as f32 / status.end_sec as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .desired_width(280.0)
+                            .text(format!(
+                                "{:.1}s / {:.1}s",
+                                status.playhead_sec, status.end_sec
+                            )),
+                    );
+                    ui.add_space(14.0);
+                    if ui
+                        .add_sized(
+                            [62.0, 28.0],
+                            egui::Button::new(if status.is_playing { "Pause" } else { "Play" })
+                                .fill(egui::Color32::from_rgb(208, 224, 216)),
+                        )
+                        .clicked()
+                    {
+                        clicked_play = true;
+                    }
+                    ui.add_space(4.0);
+                    if ui
+                        .add_sized(
+                            [54.0, 28.0],
+                            egui::Button::new("Stop")
+                                .fill(egui::Color32::from_rgb(225, 218, 208)),
+                        )
+                        .clicked()
+                    {
+                        clicked_stop = true;
+                    }
+                    ui.add_space(8.0);
+                    let mut tempo = status.tempo_scale;
+                    if ui
+                        .add_sized(
+                            [180.0, 24.0],
+                            egui::Slider::new(&mut tempo, 0.25..=2.0).text("tempo"),
+                        )
+                        .changed()
+                    {
+                        new_tempo = Some(tempo);
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("voices {}", status.voice_count))
+                            .small()
+                            .color(egui::Color32::from_rgb(205, 213, 204)),
+                    );
+                });
+            });
+
+        if let Some(t) = new_tempo {
+            if let Some(seq) = self.seq.as_ref() {
+                seq.set_tempo(t);
+            }
+        }
+        if clicked_stop {
+            if let Some(seq) = self.seq.as_ref() {
+                seq.stop();
+            }
+        }
+        if clicked_play {
+            if status.is_playing {
+                if let Some(seq) = self.seq.as_ref() {
+                    seq.pause();
+                }
+            } else {
+                self.seq_play();
+            }
+        }
+    }
+
+    fn show_file_transport(&mut self, ui: &mut egui::Ui, playback: &PlaybackSnapshot) {
         egui::Frame::none()
             .fill(egui::Color32::from_rgb(57, 69, 63))
             .inner_margin(egui::Margin::symmetric(14.0, 12.0))
@@ -2513,7 +2781,7 @@ impl JukeboxLiteSeq {
                     } else {
                         0.0
                     };
-                    ui.add(egui::ProgressBar::new(progress).desired_width(340.0).text(
+                    ui.add(egui::ProgressBar::new(progress).desired_width(280.0).text(
                         if playback.total_frames > 0 {
                             let secs = playback.cursor_frames as u32
                                 / self.sample_rate_for_progress.max(1);
@@ -2545,12 +2813,6 @@ impl JukeboxLiteSeq {
                             self.resume_loaded();
                         }
                     }
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(display_voice_label(self.loaded_voice.as_deref()))
-                            .small()
-                            .color(egui::Color32::from_rgb(219, 223, 216)),
-                    );
                     ui.add_space(8.0);
                     if ui
                         .add_sized(
@@ -3064,31 +3326,6 @@ impl JukeboxLiteSeq {
     // process, no render_midi subprocess, no preview_cache.
     // ----------------------------------------------------------------
 
-    fn enter_sequencer_mode(&mut self) {
-        // Stop the list-view stream so the two cpal streams don't both
-        // try to fight for headroom on the same device.
-        self.stop();
-        self.view_mode = ViewMode::Sequencer;
-        // Kick off the default voice build the first time the user
-        // opens this tab — keeps the cold-start cost out of `new()`.
-        let voice = self.seq_voice_slug.clone();
-        if let Some(seq) = self.seq.as_mut() {
-            if seq.current_voice().is_none() {
-                seq.load_voice_async(&voice);
-            }
-        }
-    }
-
-    fn enter_list_mode(&mut self) {
-        // Pause the sequencer so it stops driving cpal output. We
-        // pause rather than stop so the user can hop back and resume
-        // exactly where they were.
-        if let Some(seq) = self.seq.as_ref() {
-            seq.pause();
-        }
-        self.view_mode = ViewMode::List;
-    }
-
     fn seq_load_selected(&mut self) {
         let track = match self.selected_track() {
             Some(t) => t,
@@ -3130,132 +3367,40 @@ impl JukeboxLiteSeq {
         }
     }
 
-    fn seq_change_voice(&mut self, voice_slug: &str) {
+    fn seq_change_master_voice(&mut self, voice_slug: &str) {
         self.seq_voice_slug = voice_slug.to_string();
         if let Some(seq) = self.seq.as_mut() {
-            seq.load_voice_async(voice_slug);
+            // Cache hit: this returns after a single ArcSwap::store.
+            // Cache miss: queues a background build, master rotates
+            // when the build lands.
+            seq.ensure_voice_loaded(voice_slug, true);
         }
     }
 
-    fn show_view_toggle(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            let list_fill = if self.view_mode == ViewMode::List {
-                egui::Color32::from_rgb(80, 115, 103)
-            } else {
-                egui::Color32::from_rgb(229, 226, 218)
-            };
-            let list_text = if self.view_mode == ViewMode::List {
-                egui::Color32::from_rgb(247, 245, 240)
-            } else {
-                egui::Color32::from_rgb(44, 47, 45)
-            };
-            let seq_fill = if self.view_mode == ViewMode::Sequencer {
-                egui::Color32::from_rgb(80, 115, 103)
-            } else {
-                egui::Color32::from_rgb(229, 226, 218)
-            };
-            let seq_text = if self.view_mode == ViewMode::Sequencer {
-                egui::Color32::from_rgb(247, 245, 240)
-            } else {
-                egui::Color32::from_rgb(44, 47, 45)
-            };
-            if ui
-                .add_sized(
-                    [120.0, 28.0],
-                    egui::Button::new(egui::RichText::new("List view").color(list_text))
-                        .fill(list_fill),
-                )
-                .clicked()
-                && self.view_mode != ViewMode::List
-            {
-                self.enter_list_mode();
+    fn seq_change_track_voice(&mut self, track_idx: usize, voice_slug: Option<&str>) {
+        let Some(seq) = self.seq.as_mut() else {
+            return;
+        };
+        if let Some(slug) = voice_slug {
+            // Same warm-up rule: if the slug isn't pooled yet, kick a
+            // build that drops it into the pool without touching
+            // master. Until then audio thread falls back to master
+            // for this track, so playback never goes silent.
+            seq.ensure_voice_loaded(slug, false);
+        }
+        if let Ok(mut st) = seq.shared.lock() {
+            let slot = track_idx;
+            if st.track_voice_slugs.len() <= slot {
+                st.track_voice_slugs.resize(slot + 1, None);
             }
-            if ui
-                .add_sized(
-                    [140.0, 28.0],
-                    egui::Button::new(egui::RichText::new("Sequencer view").color(seq_text))
-                        .fill(seq_fill),
-                )
-                .clicked()
-                && self.view_mode != ViewMode::Sequencer
-            {
-                self.enter_sequencer_mode();
-            }
-        });
+            st.track_voice_slugs[slot] = voice_slug.map(str::to_string);
+        }
     }
 
-    fn show_sequencer_header(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            ui.heading("keysynth / jukebox lite seq");
-            ui.add_space(8.0);
-            ui.label(
-                egui::RichText::new("live sequencer")
-                    .small()
-                    .color(egui::Color32::from_rgb(96, 100, 93)),
-            );
-            ui.add_space(16.0);
-            self.show_view_toggle(ui);
-        });
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            let label = self
-                .seq_loaded_label
-                .clone()
-                .unwrap_or_else(|| "(no MIDI loaded)".to_string());
-            ui.label(
-                egui::RichText::new("Loaded")
-                    .small()
-                    .color(egui::Color32::from_rgb(96, 100, 93)),
-            );
-            ui.label(egui::RichText::new(label).strong());
-            ui.add_space(12.0);
-            ui.label(
-                egui::RichText::new("Voice")
-                    .small()
-                    .color(egui::Color32::from_rgb(96, 100, 93)),
-            );
-            let current_label = SEQ_VOICE_CHOICES
-                .iter()
-                .find(|(slug, _)| *slug == self.seq_voice_slug.as_str())
-                .map(|(_, label)| *label)
-                .unwrap_or("(unknown)");
-            let mut chosen: Option<&'static str> = None;
-            egui::ComboBox::from_id_salt("seq_voice_combo")
-                .selected_text(current_label)
-                .show_ui(ui, |ui| {
-                    for (slug, label) in SEQ_VOICE_CHOICES {
-                        if ui
-                            .selectable_label(self.seq_voice_slug == *slug, *label)
-                            .clicked()
-                        {
-                            chosen = Some(*slug);
-                        }
-                    }
-                });
-            if let Some(slug) = chosen {
-                self.seq_change_voice(slug);
-            }
-            ui.add_space(8.0);
-            let status = self
-                .seq
-                .as_ref()
-                .map(|s| s.status_label())
-                .unwrap_or_else(|| {
-                    self.seq_init_error
-                        .clone()
-                        .unwrap_or_else(|| "no seq engine".into())
-                });
-            ui.label(
-                egui::RichText::new(status)
-                    .small()
-                    .color(egui::Color32::from_rgb(86, 102, 94)),
-            );
-        });
-    }
+    // Master-voice combo embedded directly in the per-track strip
+    // (see `show_sequencer_panel`); no separate header function.
 
-    fn show_sequencer_central(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(8.0);
+    fn show_sequencer_panel(&mut self, ui: &mut egui::Ui) {
         let Some(seq) = self.seq.as_ref() else {
             ui.label(
                 egui::RichText::new(
@@ -3263,7 +3408,7 @@ impl JukeboxLiteSeq {
                         .clone()
                         .unwrap_or_else(|| "sequencer engine unavailable".into()),
                 )
-                .heading()
+                .small()
                 .color(egui::Color32::from_rgb(168, 84, 84)),
             );
             return;
@@ -3273,32 +3418,92 @@ impl JukeboxLiteSeq {
         let (mute, solo) = seq.snapshot_track_flags();
 
         if program.notes.is_empty() {
-            ui.add_space(20.0);
-            ui.vertical_centered(|ui| {
-                ui.label(
-                    egui::RichText::new("Pick a MIDI row in the List view")
-                        .heading()
-                        .color(egui::Color32::from_rgb(99, 103, 96)),
-                );
-                ui.label("then come back here and hit Load → Play.");
-                ui.add_space(8.0);
-                if ui.button("Load selected MIDI").clicked() {
-                    self.seq_load_selected();
-                }
-            });
+            // Silent placeholder. The grid lives where the program
+            // would be drawn so the layout doesn't shift when a row
+            // gets selected.
+            let avail = ui.available_size();
+            let (rect, _) =
+                ui.allocate_exact_size(avail, egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            painter.rect_filled(rect, 6.0, egui::Color32::from_rgb(28, 36, 32));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "select a MIDI row above",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgba_unmultiplied(160, 180, 168, 120),
+            );
             return;
         }
 
-        // Track strip (Mute / Solo per track).
+        // Snapshot per-track voice slugs + slot states once for the
+        // whole strip. The track combo deferred-mutates via these
+        // intent vectors so we never carry a borrow on `seq` across
+        // the &mut self call.
+        let track_slug_snapshot: Vec<Option<String>> = self
+            .seq
+            .as_ref()
+            .and_then(|s| s.shared.lock().ok().map(|st| st.track_voice_slugs.clone()))
+            .unwrap_or_default();
+        let states: HashMap<String, VoiceSlotState> = self
+            .seq
+            .as_ref()
+            .and_then(|s| s.slot_states.lock().ok().map(|g| g.clone()))
+            .unwrap_or_default();
+
+        let mut track_voice_intents: Vec<(usize, Option<&'static str>)> = Vec::new();
+
+        // Track strip (master voice + Mute / Solo / Voice combo per
+        // track). The leading "Master" cell is the default fallback
+        // for any track set to "(master)" in its own combo.
+        let mut master_chosen: Option<&'static str> = None;
         ui.horizontal_wrapped(|ui| {
-            ui.label(
-                egui::RichText::new("Tracks")
-                    .small()
-                    .color(egui::Color32::from_rgb(96, 100, 93)),
-            );
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(232, 228, 219))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Master")
+                                .small()
+                                .strong()
+                                .color(egui::Color32::from_rgb(48, 53, 49)),
+                        );
+                        let current_label = SEQ_VOICE_CHOICES
+                            .iter()
+                            .find(|(slug, _)| *slug == self.seq_voice_slug.as_str())
+                            .map(|(_, label)| *label)
+                            .unwrap_or("(unknown)");
+                        egui::ComboBox::from_id_salt("seq_master_voice_strip")
+                            .selected_text(format!(
+                                "{} {current_label}",
+                                state_glyph(states.get(self.seq_voice_slug.as_str()))
+                            ))
+                            .width(140.0)
+                            .show_ui(ui, |ui| {
+                                for (slug, label) in SEQ_VOICE_CHOICES {
+                                    let glyph = state_glyph(states.get(*slug));
+                                    let txt = format!("{glyph} {label}");
+                                    if ui
+                                        .selectable_label(
+                                            self.seq_voice_slug == *slug,
+                                            txt,
+                                        )
+                                        .clicked()
+                                    {
+                                        master_chosen = Some(*slug);
+                                    }
+                                }
+                            });
+                    });
+                });
             for t in 0..program.track_count {
                 let is_m = mute.get(t).copied().unwrap_or(false);
                 let is_s = solo.get(t).copied().unwrap_or(false);
+                let track_slug = track_slug_snapshot
+                    .get(t)
+                    .and_then(|s| s.as_deref());
                 ui.add_space(4.0);
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(232, 228, 219))
@@ -3342,6 +3547,48 @@ impl JukeboxLiteSeq {
                             if ui.add_sized([22.0, 18.0], solo_btn).clicked() {
                                 seq.toggle_solo(t);
                             }
+
+                            // Per-track voice combo. "(master)" routes
+                            // through the shared master factory; any
+                            // other slug pulls that track's notes
+                            // through its own pooled factory.
+                            let track_label = match track_slug {
+                                None => "(master)".to_string(),
+                                Some(slug) => {
+                                    let name = SEQ_VOICE_CHOICES
+                                        .iter()
+                                        .find(|(s, _)| *s == slug)
+                                        .map(|(_, n)| *n)
+                                        .unwrap_or(slug);
+                                    format!(
+                                        "{} {name}",
+                                        state_glyph(states.get(slug))
+                                    )
+                                }
+                            };
+                            egui::ComboBox::from_id_salt(("seq_track_voice", t))
+                                .selected_text(track_label)
+                                .width(120.0)
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            track_slug.is_none(),
+                                            "(master)",
+                                        )
+                                        .clicked()
+                                    {
+                                        track_voice_intents.push((t, None));
+                                    }
+                                    for (slug, label) in SEQ_VOICE_CHOICES {
+                                        let glyph = state_glyph(states.get(*slug));
+                                        let txt = format!("{glyph} {label}");
+                                        let selected = track_slug == Some(*slug);
+                                        if ui.selectable_label(selected, txt).clicked() {
+                                            track_voice_intents
+                                                .push((t, Some(*slug)));
+                                        }
+                                    }
+                                });
                         });
                     });
             }
@@ -3452,133 +3699,45 @@ impl JukeboxLiteSeq {
             egui::Stroke::new(1.6, egui::Color32::from_rgb(244, 226, 138)),
         );
 
-        // Click / drag to seek.
+        // Click / drag to seek. Intent-collection style so we don't
+        // hold a `seq` borrow across the `&mut self` apply pass below.
+        let mut seek_to: Option<f64> = None;
         if let Some(pos) = resp.interact_pointer_pos() {
             if rect.contains(pos) {
                 let t =
                     ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
-                let target = t as f64 * total_sec as f64;
+                seek_to = Some(t as f64 * total_sec as f64);
+            }
+        }
+        // Release the `seq` borrow we've been holding for snapshots,
+        // mute/solo button handlers, etc., then apply collected
+        // intents that need `&mut self`. At this point we're below
+        // every site that read from `seq`.
+        let _ = seq;
+        if let Some(slug) = master_chosen {
+            self.seq_change_master_voice(slug);
+        }
+        for (track, slug) in track_voice_intents {
+            self.seq_change_track_voice(track, slug);
+        }
+        if let Some(target) = seek_to {
+            if let Some(seq) = self.seq.as_ref() {
                 seq.seek(target);
             }
         }
     }
 
-    fn show_sequencer_transport(&mut self, ui: &mut egui::Ui) {
-        let status = match self.seq.as_ref() {
-            Some(s) => s.snapshot_status(),
-            None => {
-                ui.label("seq engine unavailable");
-                return;
-            }
-        };
-        let title = self
-            .seq_loaded_label
-            .clone()
-            .unwrap_or_else(|| "No MIDI loaded".to_string());
+}
 
-        // Collect intent from the UI without taking any borrow on
-        // `self` that would block calling `&mut self` methods later.
-        let mut clicked_play_pause = false;
-        let mut clicked_stop = false;
-        let mut clicked_load = false;
-        let mut new_tempo: Option<f32> = None;
-
-        egui::Frame::none()
-            .fill(egui::Color32::from_rgb(57, 69, 63))
-            .inner_margin(egui::Margin::symmetric(14.0, 12.0))
-            .rounding(8.0)
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(
-                            egui::RichText::new(title)
-                                .size(17.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(246, 244, 240)),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{:.1}s / {:.1}s   tempo {:.2}×   voices {}",
-                                status.playhead_sec,
-                                status.end_sec,
-                                status.tempo_scale,
-                                status.voice_count
-                            ))
-                            .small()
-                            .color(egui::Color32::from_rgb(205, 213, 204)),
-                        );
-                    });
-                    ui.add_space(14.0);
-
-                    if ui
-                        .add_sized(
-                            [62.0, 28.0],
-                            egui::Button::new(if status.is_playing { "Pause" } else { "Play" })
-                                .fill(egui::Color32::from_rgb(208, 224, 216)),
-                        )
-                        .clicked()
-                    {
-                        clicked_play_pause = true;
-                    }
-                    ui.add_space(4.0);
-                    if ui
-                        .add_sized(
-                            [54.0, 28.0],
-                            egui::Button::new("Stop")
-                                .fill(egui::Color32::from_rgb(225, 218, 208)),
-                        )
-                        .clicked()
-                    {
-                        clicked_stop = true;
-                    }
-                    ui.add_space(4.0);
-                    if ui
-                        .add_sized(
-                            [62.0, 28.0],
-                            egui::Button::new("Load")
-                                .fill(egui::Color32::from_rgb(225, 218, 208)),
-                        )
-                        .clicked()
-                    {
-                        clicked_load = true;
-                    }
-                    ui.add_space(8.0);
-
-                    let mut tempo = status.tempo_scale;
-                    if ui
-                        .add_sized(
-                            [180.0, 24.0],
-                            egui::Slider::new(&mut tempo, 0.25..=2.0).text("tempo"),
-                        )
-                        .changed()
-                    {
-                        new_tempo = Some(tempo);
-                    }
-                });
-            });
-
-        if let Some(tempo) = new_tempo {
-            if let Some(seq) = self.seq.as_ref() {
-                seq.set_tempo(tempo);
-            }
-        }
-        if clicked_stop {
-            if let Some(seq) = self.seq.as_ref() {
-                seq.stop();
-            }
-        }
-        if clicked_play_pause {
-            if status.is_playing {
-                if let Some(seq) = self.seq.as_ref() {
-                    seq.pause();
-                }
-            } else {
-                self.seq_play();
-            }
-        }
-        if clicked_load {
-            self.seq_load_selected();
-        }
+/// Single-character status glyph for a voice slot. Drives the combo
+/// labels so the user sees ✓ for "instantly available", spinner for
+/// "still building", × for "build broke". Avoids dropdown jitter.
+fn state_glyph(s: Option<&VoiceSlotState>) -> &'static str {
+    match s {
+        Some(VoiceSlotState::Ready) => "✓",
+        Some(VoiceSlotState::Loading) => "…",
+        Some(VoiceSlotState::Failed(_)) => "×",
+        Some(VoiceSlotState::Idle) | None => "·",
     }
 }
 
@@ -3611,61 +3770,98 @@ impl eframe::App for JukeboxLiteSeq {
             && self
                 .seq
                 .as_ref()
-                .map(|s| matches!(
-                    *s.voice_status.lock().unwrap(),
-                    SeqVoiceLoadStatus::Loaded { .. }
-                ))
+                .map(|s| {
+                    matches!(
+                        s.slot_state(self.seq_voice_slug.as_str()),
+                        VoiceSlotState::Ready
+                    )
+                })
                 .unwrap_or(false)
         {
             self.seq_play();
             self.seq_autoplay_pending = false;
         }
 
+        // Selection-driven auto-load: whenever the row that's
+        // selected in the table differs from what's loaded in the
+        // sequencer engine, swap the program in. No tabs, no buttons
+        // — clicking a `.mid` row IS the load.
+        let want_mid = self
+            .selected_label
+            .as_deref()
+            .filter(|label| {
+                self.tracks
+                    .iter()
+                    .any(|t| t.label == *label && t.format == Format::Mid)
+            })
+            .map(str::to_string);
+        let have_mid = self.seq_loaded_label.clone();
+        let seq_idle = self
+            .seq
+            .as_ref()
+            .map(|s| !s.snapshot_status().is_playing)
+            .unwrap_or(true);
+        if want_mid.is_some() && want_mid != have_mid && seq_idle {
+            self.seq_load_selected();
+        }
+
         let visible = self.visible_tracks();
         self.ensure_selection(&visible);
         let playback = self.playback_snapshot();
 
-        match self.view_mode {
-            ViewMode::List => {
-                egui::TopBottomPanel::top("jukebox_lite_seq_header")
-                    .exact_height(110.0)
-                    .show(ctx, |ui| {
-                        self.show_view_toggle(ui);
-                        ui.add_space(2.0);
-                        self.show_header(ui, visible.len());
-                    });
+        // Single unified layout — list + sequencer share one window.
+        // Header carries the search/filter row plus the master voice
+        // combo, sidebar holds tile filters, right pane is the
+        // inspector for the selected row, central panel is split
+        // vertically: top half = list table (the browser), bottom
+        // half = sequencer grid (live program for the selected row).
+        // Bottom transport adapts to the selected row's format.
+        egui::TopBottomPanel::top("jukebox_lite_seq_header")
+            .exact_height(80.0)
+            .show(ctx, |ui| self.show_header(ui, visible.len()));
 
-                egui::TopBottomPanel::bottom("jukebox_lite_seq_transport")
-                    .exact_height(92.0)
-                    .show(ctx, |ui| self.show_transport(ui, &playback));
+        egui::TopBottomPanel::bottom("jukebox_lite_seq_transport")
+            .exact_height(92.0)
+            .show(ctx, |ui| self.show_transport(ui, &playback));
 
-                egui::SidePanel::left("jukebox_lite_seq_sidebar")
-                    .resizable(false)
-                    .exact_width(190.0)
-                    .show(ctx, |ui| self.show_sidebar(ui));
+        egui::SidePanel::left("jukebox_lite_seq_sidebar")
+            .resizable(false)
+            .exact_width(190.0)
+            .show(ctx, |ui| self.show_sidebar(ui));
 
-                egui::SidePanel::right("jukebox_lite_seq_inspector")
-                    .resizable(false)
-                    .exact_width(320.0)
-                    .show(ctx, |ui| self.show_inspector(ui, &playback));
+        egui::SidePanel::right("jukebox_lite_seq_inspector")
+            .resizable(false)
+            .exact_width(320.0)
+            .show(ctx, |ui| self.show_inspector(ui, &playback));
 
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.add_space(8.0);
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // Vertical split: top = list rows, bottom = sequencer
+            // grid. We give the sequencer ~45% of the height because
+            // the grid scales better than the table — the table just
+            // wraps text on narrow rows; the grid loses pitch
+            // resolution if it's too short.
+            let total_h = ui.available_height();
+            let seq_h = (total_h * 0.45).max(180.0).min(total_h - 120.0);
+            let table_h = total_h - seq_h - 6.0;
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), table_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.add_space(6.0);
                     self.show_table(ui, &visible, &playback);
-                });
-            }
-            ViewMode::Sequencer => {
-                egui::TopBottomPanel::top("jukebox_lite_seq_header_seq")
-                    .exact_height(86.0)
-                    .show(ctx, |ui| self.show_sequencer_header(ui));
-
-                egui::TopBottomPanel::bottom("jukebox_lite_seq_transport_seq")
-                    .exact_height(92.0)
-                    .show(ctx, |ui| self.show_sequencer_transport(ui));
-
-                egui::CentralPanel::default().show(ctx, |ui| self.show_sequencer_central(ui));
-            }
-        }
+                },
+            );
+            ui.add_space(4.0);
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), seq_h),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.add_space(2.0);
+                    self.show_sequencer_panel(ui);
+                },
+            );
+        });
 
         self.publish_cp_snapshot(&visible, &playback);
 
@@ -3678,9 +3874,12 @@ impl eframe::App for JukeboxLiteSeq {
             || seq_active
             || self.pending_render.is_some()
             || self.pending_audit.is_some()
-            || self.view_mode == ViewMode::Sequencer
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
+        } else {
+            // Repaint at idle just slow enough that the grid view
+            // updates after a click but doesn't burn CPU at 30 fps.
+            ctx.request_repaint_after(std::time::Duration::from_millis(120));
         }
     }
 }
@@ -3861,26 +4060,16 @@ fn apply_visual_style(ctx: &egui::Context) {
 }
 
 struct CliArgs {
-    start_view: ViewMode,
     initial_midi_label: Option<String>,
     autoplay: bool,
 }
 
 fn parse_cli() -> CliArgs {
-    let mut start_view = ViewMode::List;
     let mut initial_midi_label = None;
     let mut autoplay = false;
     let mut iter = std::env::args().skip(1);
     while let Some(a) = iter.next() {
         match a.as_str() {
-            "--view" | "--start-view" => {
-                if let Some(v) = iter.next() {
-                    start_view = match v.as_str() {
-                        "seq" | "sequencer" => ViewMode::Sequencer,
-                        _ => ViewMode::List,
-                    };
-                }
-            }
             "--midi" | "--start-midi" => {
                 initial_midi_label = iter.next();
             }
@@ -3889,7 +4078,6 @@ fn parse_cli() -> CliArgs {
         }
     }
     CliArgs {
-        start_view,
         initial_midi_label,
         autoplay,
     }
@@ -3906,11 +4094,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(label) = args.initial_midi_label.as_ref() {
         if app.tracks.iter().any(|t| &t.label == label) {
             app.selected_label = Some(label.clone());
+            // Load the program now so the grid is non-empty on the
+            // very first frame; the audio engine waits until the user
+            // hits Play (or `--autoplay` flips it after voice load).
+            app.seq_load_selected();
         }
-    }
-    if args.start_view == ViewMode::Sequencer {
-        app.enter_sequencer_mode();
-        app.seq_load_selected();
     }
     if args.autoplay {
         app.seq_autoplay_pending = true;
