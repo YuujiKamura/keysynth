@@ -1434,6 +1434,8 @@ const PREWARM_TOP_N: usize = 6;
 /// real perceived-latency win for a 6-track warmup.
 struct PrewarmState {
     rx: std::sync::mpsc::Receiver<PrewarmDone>,
+    total: usize,
+    completed: usize,
     /// JoinHandle parked here so the thread isn't detached. Held until
     /// the channel disconnects (worker has finished its queue).
     _handle: std::thread::JoinHandle<()>,
@@ -1788,40 +1790,45 @@ impl Jukebox {
     /// fold them into `cached_midi_labels` so the "✓" glyph appears
     /// on a row the moment its background render finishes.
     fn poll_prewarm(&mut self) {
-        let Some(state) = self.prewarm.as_ref() else {
-            return;
-        };
         let mut disconnected = false;
-        loop {
-            match state.rx.try_recv() {
-                Ok(done) => match done.outcome {
-                    Ok(Some(ms)) => {
-                        eprintln!(
-                            "jukebox: prewarm rendered {} ({}) in {} ms",
-                            done.label, done.voice_id, ms
-                        );
-                        self.cached_midi_labels
-                            .entry(done.label)
-                            .or_default()
-                            .insert(done.voice_id);
+        {
+            let Some(state) = self.prewarm.as_mut() else {
+                return;
+            };
+            loop {
+                match state.rx.try_recv() {
+                    Ok(done) => {
+                        state.completed = state.completed.saturating_add(1);
+                        match done.outcome {
+                            Ok(Some(ms)) => {
+                                eprintln!(
+                                    "jukebox: prewarm rendered {} ({}) in {} ms",
+                                    done.label, done.voice_id, ms
+                                );
+                                self.cached_midi_labels
+                                    .entry(done.label)
+                                    .or_default()
+                                    .insert(done.voice_id);
+                            }
+                            Ok(None) => {
+                                self.cached_midi_labels
+                                    .entry(done.label)
+                                    .or_default()
+                                    .insert(done.voice_id);
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "jukebox: prewarm failed for {} ({}): {e}",
+                                    done.label, done.voice_id
+                                );
+                            }
+                        }
                     }
-                    Ok(None) => {
-                        self.cached_midi_labels
-                            .entry(done.label)
-                            .or_default()
-                            .insert(done.voice_id);
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "jukebox: prewarm failed for {} ({}): {e}",
-                            done.label, done.voice_id
-                        );
-                    }
-                },
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
                 }
             }
         }
@@ -1983,6 +1990,7 @@ fn spawn_startup_prewarm(
     if queue.is_empty() {
         return None;
     }
+    let total = queue.len();
     let render_bin = render_midi_binary_path()?;
     let (tx, rx) = std::sync::mpsc::channel::<PrewarmDone>();
     eprintln!(
@@ -2047,6 +2055,8 @@ fn spawn_startup_prewarm(
         .ok()?;
     Some(PrewarmState {
         rx,
+        total,
+        completed: 0,
         _handle: handle,
     })
 }
@@ -2898,6 +2908,40 @@ fn meta_row(ui: &mut egui::Ui, key: &str, value: &str) {
     ui.end_row();
 }
 
+/// Fixed-width mixer slider cell: label + slider + numeric value on a
+/// stable baseline so rows don't jitter as values change.
+fn mixer_slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+) -> egui::Response {
+    let height = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(
+        egui::vec2(170.0, height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(egui::RichText::new(label).small());
+            let response = ui.add_sized(
+                [96.0, height],
+                egui::Slider::new(value, range)
+                    .show_value(false)
+                    .step_by(0.05),
+            );
+            ui.add_sized(
+                [42.0, height],
+                egui::Label::new(
+                    egui::RichText::new(format!("{:>5.2}", *value))
+                        .monospace()
+                        .small(),
+                ),
+            );
+            response
+        },
+    )
+    .inner
+}
+
 /// Spawn the embedded jukebox CP server. Registers `get_state`,
 /// `load_track`, `play`, `stop`, `set_voice`, and `rescan` against a
 /// shared `gui_cp::State`. The egui thread drains the command queue
@@ -3134,15 +3178,30 @@ impl eframe::App for Jukebox {
                             .unwrap_or(false)
                     })
                     .count();
-                let cache_color = if total_midi == 0 || cached >= total_midi {
-                    egui::Color32::from_rgb(120, 220, 140)
+                let prewarm_remaining = self
+                    .prewarm
+                    .as_ref()
+                    .map(|state| state.total.saturating_sub(state.completed));
+                let (cache_text, cache_color) = if total_midi == 0 {
+                    (
+                        "no MIDI previews".to_string(),
+                        egui::Color32::from_rgb(150, 150, 150),
+                    )
+                } else if let Some(remaining) = prewarm_remaining.filter(|n| *n > 0) {
+                    (
+                        format!("rendering {remaining} more"),
+                        egui::Color32::from_rgb(120, 185, 255),
+                    )
+                } else if cached >= total_midi {
+                    (
+                        "all MIDI previews ready".to_string(),
+                        egui::Color32::from_rgb(120, 220, 140),
+                    )
                 } else {
-                    egui::Color32::from_rgb(220, 200, 120)
-                };
-                let cache_text = if self.prewarm.is_some() {
-                    format!("cache {cached}/{total_midi} \u{231B}")
-                } else {
-                    format!("cache {cached}/{total_midi} \u{2713}")
+                    (
+                        format!("{cached}/{total_midi} MIDI previews ready"),
+                        egui::Color32::from_rgb(210, 200, 150),
+                    )
                 };
                 ui.label(
                     egui::RichText::new(cache_text)
@@ -3151,10 +3210,10 @@ impl eframe::App for Jukebox {
                         .small(),
                 )
                 .on_hover_text(
-                    "MIDI preview cache coverage. Green ✓ = every MIDI in the catalogue \
-                     has a rendered WAV in bench-out/cache/. Yellow ⌛ = background \
-                     prewarmer still working. Run `ksprerender` to fill the cache for \
-                     every (song, voice) pair offline.",
+                    "MIDI preview cache coverage. While startup prewarm is active, this \
+                     reads as background render progress instead of an alert. Run \
+                     `ksprerender` to fill bench-out/cache/ for every (song, voice) pair \
+                     offline.",
                 );
                 ui.separator();
                 let fav_label = format!("\u{2605} only ({})", self.favorites.len());
@@ -3426,25 +3485,11 @@ impl eframe::App for Jukebox {
                                         }
                                     });
                                 let mut vol = snap.volume;
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut vol, 0.0..=2.0)
-                                            .text("vol")
-                                            .step_by(0.05),
-                                    )
-                                    .changed()
-                                {
+                                if mixer_slider(ui, "vol", &mut vol, 0.0..=2.0).changed() {
                                     volume_changes.push((slot_idx, vol));
                                 }
                                 let mut pan = snap.pan;
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut pan, -1.0..=1.0)
-                                            .text("pan")
-                                            .step_by(0.05),
-                                    )
-                                    .changed()
-                                {
+                                if mixer_slider(ui, "pan", &mut pan, -1.0..=1.0).changed() {
                                     pan_changes.push((slot_idx, pan));
                                 }
                                 let mut muted = snap.muted;
