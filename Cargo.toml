@@ -371,6 +371,18 @@ name = "wav_diff"
 path = "src/bin/wav_diff.rs"
 required-features = ["native"]
 
+# gui_audit binary: pixel-level static audit of a GUI screenshot.
+# Reads a PNG (winshot / desk_capture / printscreen output) and emits
+# a JSON report — palette, WCAG contrast, edge density, column-peak
+# alignment, margin balance, and rule-driven `blockers`. Pairs with
+# the gui_vlm critique step (taste signal) and the cp-core CP probes
+# (state correctness) to form a 3-axis ship gate. See
+# ~/.agents/skills/gui-verify-pixel-vlm/SKILL.md for the workflow.
+[[bin]]
+name = "gui_audit"
+path = "src/bin/gui_audit.rs"
+required-features = ["native"]
+
 # ksabtest: Stage F blind A/B harness — pick two voices, render the
 # same MIDI through both, randomize slot assignment, let the listener
 # pick which slot sounds more like a real piano, log every trial to
