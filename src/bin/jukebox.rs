@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use keysynth::library_db::{LibraryDb, Song, SongFilter, SongSort, VoiceFilter};
 use keysynth::play_log::{PlayEntry, PlayLogDb};
@@ -233,6 +234,32 @@ fn lookup_midi_in_preview_cache(midi_path: &Path) -> Result<Option<PathBuf>, Str
     let cache = open_preview_cache()?;
     let key = build_midi_cache_key(midi_path);
     cache.lookup(&key).map_err(|e| format!("lookup: {e}"))
+}
+
+/// One-shot stat sweep that returns the set of `Track::label`s whose
+/// default-voice MIDI preview is already cached. Used by the central
+/// panel to draw a "✓" hit glyph next to the engine button without
+/// stat'ing every MIDI on every frame — call sites refresh this on
+/// startup, after `rescan`, and after a successful render completes.
+fn snapshot_cached_midi_labels(tracks: &[Track]) -> HashSet<String> {
+    let cache = match open_preview_cache() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("jukebox: cached-set snapshot skipped: {e}");
+            return HashSet::new();
+        }
+    };
+    let mut out = HashSet::new();
+    for t in tracks {
+        if t.format != Format::Mid {
+            continue;
+        }
+        let key = build_midi_cache_key(&t.path);
+        if matches!(cache.lookup(&key), Ok(Some(_))) {
+            out.insert(t.label.clone());
+        }
+    }
+    out
 }
 
 /// Synchronous render-and-store. Called from a background thread so
@@ -1141,10 +1168,52 @@ struct Jukebox {
     /// flick between "everything" and "my list" without retyping a
     /// substring filter.
     favorites_only: bool,
+    /// Set of `Track::label`s whose MIDI preview is currently in
+    /// `bench-out/cache/`. Drives the "✓" hit glyph on each MIDI row
+    /// so users can see at a glance which clicks will be instant vs
+    /// which will trigger a foreground render. Refreshed on startup,
+    /// after `rescan`, and whenever a render completes (foreground
+    /// `pending_render` or background prewarm).
+    cached_midi_labels: HashSet<String>,
+    /// Optional background prewarmer that walks the Top-N MIDI tracks
+    /// at startup and renders each through `preview_cache::render_to_cache`
+    /// so the user's first click on a popular song is a cache hit.
+    /// `None` once the worker has finished or never started.
+    prewarm: Option<PrewarmState>,
 }
 
 const RECENT_PLAYS_LIMIT: usize = 12;
 const TOP_PLAYED_LIMIT: usize = 5;
+/// Number of MIDI tracks the startup prewarmer pre-renders. Picked to
+/// dominate the user's first listening session without paying the full
+/// (#songs × #voices) wall time on launch — typical bench-out/songs/
+/// has ~14 entries, so 6 covers most of "what was I listening to last
+/// time" without delaying the GUI's first paint.
+const PREWARM_TOP_N: usize = 6;
+
+/// Background pre-render driver. Owns the worker thread and a one-shot
+/// channel that streams completion records back to the GUI. The worker
+/// renders sequentially: parallel renders would compete for the same
+/// `target/release/render_midi` subprocess and disk bandwidth without a
+/// real perceived-latency win for a 6-track warmup.
+struct PrewarmState {
+    rx: std::sync::mpsc::Receiver<PrewarmDone>,
+    /// JoinHandle parked here so the thread isn't detached. Held until
+    /// the channel disconnects (worker has finished its queue).
+    _handle: std::thread::JoinHandle<()>,
+}
+
+/// One completion record emitted by the prewarm worker. `label` is the
+/// `Track::label` (file stem) — we send only the label, not an index,
+/// because the `tracks` Vec can be re-sorted by a `rescan` while the
+/// worker is mid-queue.
+struct PrewarmDone {
+    label: String,
+    /// `Some(elapsed_ms)` on a successful render, `None` if the cache
+    /// already had the entry (cheap stat-only path), `Err(msg)` if
+    /// render_midi failed.
+    outcome: Result<Option<u128>, String>,
+}
 
 /// One in-flight MIDI → WAV render dispatched from the GUI thread.
 struct PendingRender {
@@ -1312,6 +1381,8 @@ impl Jukebox {
         let current_device = mixer.device_name.clone();
         let play_log = load_play_log();
         let (favorites, play_counts, recent_plays) = snapshot_play_stats(play_log.as_ref());
+        let cached_midi_labels = snapshot_cached_midi_labels(&tracks);
+        let prewarm = spawn_startup_prewarm(&tracks, &play_counts, &cached_midi_labels);
         Ok(Self {
             tracks,
             selected: None,
@@ -1330,7 +1401,49 @@ impl Jukebox {
             play_counts,
             recent_plays,
             favorites_only: false,
+            cached_midi_labels,
+            prewarm,
         })
+    }
+
+    /// Drain any prewarm completions queued since the last frame and
+    /// fold them into `cached_midi_labels` so the "✓" glyph appears
+    /// on a row the moment its background render finishes.
+    fn poll_prewarm(&mut self) {
+        let Some(state) = self.prewarm.as_ref() else {
+            return;
+        };
+        let mut disconnected = false;
+        loop {
+            match state.rx.try_recv() {
+                Ok(done) => match done.outcome {
+                    Ok(Some(ms)) => {
+                        eprintln!(
+                            "jukebox: prewarm rendered {} in {} ms",
+                            done.label, ms
+                        );
+                        self.cached_midi_labels.insert(done.label);
+                    }
+                    Ok(None) => {
+                        // Already cached when the worker checked; just
+                        // confirm the label is in the set so the glyph
+                        // stays in sync with disk truth.
+                        self.cached_midi_labels.insert(done.label);
+                    }
+                    Err(e) => {
+                        eprintln!("jukebox: prewarm failed for {}: {e}", done.label);
+                    }
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.prewarm = None;
+        }
     }
 
     /// Pull cached favorites / counts / recent-plays from the DB.
@@ -1395,6 +1508,107 @@ impl Jukebox {
             self.preview(i);
         }
     }
+}
+
+/// Pick the first `PREWARM_TOP_N` MIDI tracks worth pre-rendering.
+/// Ordering: descending lifetime play count (so the user's actual
+/// favourites win), with stem-alphabetical fallback so a fresh DB
+/// still pre-warms a deterministic slate. Already-cached labels are
+/// skipped so a second jukebox launch doesn't re-queue work it's
+/// already done.
+fn pick_prewarm_targets(
+    tracks: &[Track],
+    play_counts: &HashMap<String, i64>,
+    cached: &HashSet<String>,
+) -> Vec<PathBuf> {
+    let mut candidates: Vec<(&Track, i64)> = tracks
+        .iter()
+        .filter(|t| t.format == Format::Mid && !cached.contains(&t.label))
+        .map(|t| {
+            let count = play_counts.get(&t.label).copied().unwrap_or(0);
+            (t, count)
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.label.cmp(&b.0.label)));
+    candidates
+        .into_iter()
+        .take(PREWARM_TOP_N)
+        .map(|(t, _)| t.path.clone())
+        .collect()
+}
+
+/// Kick off the background prewarm worker. Returns `None` when the
+/// prewarm queue is empty (everything already cached, or no MIDIs
+/// found) so callers don't have to wait on a no-op thread.
+fn spawn_startup_prewarm(
+    tracks: &[Track],
+    play_counts: &HashMap<String, i64>,
+    cached: &HashSet<String>,
+) -> Option<PrewarmState> {
+    let queue = pick_prewarm_targets(tracks, play_counts, cached);
+    if queue.is_empty() {
+        return None;
+    }
+    let render_bin = render_midi_binary_path()?;
+    let (tx, rx) = std::sync::mpsc::channel::<PrewarmDone>();
+    eprintln!(
+        "jukebox: prewarm queue → {} MIDI track(s) (top by play count)",
+        queue.len()
+    );
+    let handle = std::thread::Builder::new()
+        .name("preview-prewarm".into())
+        .spawn(move || {
+            // Re-open the cache inside the worker so we don't leak any
+            // GUI-thread handle into the background; the on-disk
+            // representation is the only shared state.
+            let cache = match open_preview_cache() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("jukebox: prewarm cache open failed: {e}");
+                    return;
+                }
+            };
+            for path in queue {
+                let label = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                let voice_id = default_voice_for_midi(&path);
+                let key = build_midi_cache_key(&path);
+                // Cache may have been populated by a peer process
+                // (another jukebox window, a manual ksprerender run)
+                // since `pick_prewarm_targets` last looked. Cheap stat
+                // here saves a redundant subprocess spawn.
+                let outcome = match cache.lookup(&key) {
+                    Ok(Some(_)) => Ok(None),
+                    Ok(None) => {
+                        let t0 = Instant::now();
+                        match keysynth::preview_cache::render_to_cache(
+                            &cache,
+                            &key,
+                            voice_id,
+                            &render_bin,
+                        ) {
+                            Ok(_) => Ok(Some(t0.elapsed().as_millis())),
+                            Err(e) => Err(format!("render_to_cache: {e}")),
+                        }
+                    }
+                    Err(e) => Err(format!("lookup: {e}")),
+                };
+                // Receiver-drop on the GUI side just discards the
+                // notification — the on-disk WAV still exists, so a
+                // later `snapshot_cached_midi_labels` will pick it up.
+                if tx.send(PrewarmDone { label, outcome }).is_err() {
+                    return;
+                }
+            }
+        })
+        .ok()?;
+    Some(PrewarmState {
+        rx,
+        _handle: handle,
+    })
 }
 
 /// Pulls the small caches the GUI reads every frame out of the DB in
@@ -1572,6 +1786,12 @@ impl Jukebox {
                     wav_path.display(),
                     elapsed_ms,
                 );
+                // Mark the label as cached BEFORE handing off to
+                // `load_resolved_track` so the row's "✓" glyph appears
+                // in the same frame the audio starts.
+                if let Some(t) = self.tracks.get(pending.track_idx) {
+                    self.cached_midi_labels.insert(t.label.clone());
+                }
                 self.load_resolved_track(pending.track_idx, pending.label, wav_path);
             }
             Err(e) => {
@@ -1650,6 +1870,11 @@ impl Jukebox {
         // counts/recent caches may be stale if another process wrote
         // them (e.g. a parallel kssong run); refresh them here too.
         self.refresh_play_stats();
+        // New tracks may have shipped with their own pre-rendered
+        // cache entries (e.g. a parallel `ksprerender` populated
+        // `bench-out/cache/`); rebuild the hit set so the row glyph
+        // is honest.
+        self.cached_midi_labels = snapshot_cached_midi_labels(&self.tracks);
     }
 
     /// Append a new empty mix slot. UI callable.
@@ -1763,6 +1988,10 @@ impl eframe::App for Jukebox {
         // for THIS frame (no extra one-frame latency between worker
         // completion and audible playback).
         self.poll_pending_render();
+        // Background prewarm completions: each Ok flips the row's "✓"
+        // glyph on. Cheap (try_recv loop) so it's safe to call every
+        // frame.
+        self.poll_prewarm();
 
         // Apply pending file-load changes from combo boxes.
         self.sync_slot_files();
@@ -1827,6 +2056,35 @@ impl eframe::App for Jukebox {
                 ui.separator();
                 ui.label("filter:");
                 ui.text_edit_singleline(&mut self.filter);
+                ui.separator();
+                let total_midi = self
+                    .tracks
+                    .iter()
+                    .filter(|t| t.format == Format::Mid)
+                    .count();
+                let cached = self.cached_midi_labels.len();
+                let cache_color = if total_midi == 0 || cached >= total_midi {
+                    egui::Color32::from_rgb(120, 220, 140)
+                } else {
+                    egui::Color32::from_rgb(220, 200, 120)
+                };
+                let cache_text = if self.prewarm.is_some() {
+                    format!("cache {cached}/{total_midi} \u{231B}")
+                } else {
+                    format!("cache {cached}/{total_midi} \u{2713}")
+                };
+                ui.label(
+                    egui::RichText::new(cache_text)
+                        .color(cache_color)
+                        .monospace()
+                        .small(),
+                )
+                .on_hover_text(
+                    "MIDI preview cache coverage. Green ✓ = every MIDI in the catalogue \
+                     has a rendered WAV in bench-out/cache/. Yellow ⌛ = background \
+                     prewarmer still working. Run `ksprerender` to fill the cache for \
+                     every (song, voice) pair offline.",
+                );
                 ui.separator();
                 let fav_label = format!("\u{2605} only ({})", self.favorites.len());
                 ui.checkbox(&mut self.favorites_only, fav_label).on_hover_text(
@@ -2524,10 +2782,62 @@ impl eframe::App for Jukebox {
                                         .as_ref()
                                         .map(|p| p.track_idx == i)
                                         .unwrap_or(false);
+                                    // MIDI tracks reach the audio
+                                    // pipeline through `preview_cache`,
+                                    // so a cache hit means "click =
+                                    // instant playback". Surface that
+                                    // contract on the row so the user
+                                    // can distinguish a sub-millisecond
+                                    // click from a multi-second render
+                                    // BEFORE clicking. Non-MIDI rows
+                                    // are always instant (decoded
+                                    // straight from disk) so we skip
+                                    // the glyph for them.
+                                    let cache_hit = t.format == Format::Mid
+                                        && self.cached_midi_labels.contains(&t.label);
+                                    if cache_hit {
+                                        ui.add_sized(
+                                            [16.0, 22.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("\u{2713}")
+                                                    .color(egui::Color32::from_rgb(120, 220, 140))
+                                                    .strong(),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "Preview already rendered to bench-out/cache/ — \
+                                             click is instant.",
+                                        );
+                                    } else if t.format == Format::Mid {
+                                        ui.add_sized(
+                                            [16.0, 22.0],
+                                            egui::Label::new(
+                                                egui::RichText::new("\u{2218}")
+                                                    .color(egui::Color32::from_rgb(140, 140, 140))
+                                                    .small(),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "No cached preview — first click triggers a \
+                                             background render (1–10 s).",
+                                        );
+                                    }
                                     let label = if active {
                                         format!("\u{25B6} {}", t.engine)
                                     } else if is_rendering {
-                                        format!("\u{231B} {}", t.engine)
+                                        // Live elapsed-time counter so
+                                        // the user knows the click
+                                        // landed and roughly how long
+                                        // the render has been in
+                                        // flight. Updated by the
+                                        // standard 50 ms repaint
+                                        // schedule.
+                                        let secs = self
+                                            .pending_render
+                                            .as_ref()
+                                            .map(|p| p.started.elapsed().as_secs_f32())
+                                            .unwrap_or(0.0);
+                                        format!("\u{231B} {} ({:.1}s)", t.engine, secs)
                                     } else {
                                         t.engine.clone()
                                     };
