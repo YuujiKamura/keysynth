@@ -732,11 +732,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_title("keysynth chord pad — STK guitar"),
         ..Default::default()
     };
+    eprintln!("chord_pad: opening GUI window (eframe::run_native)");
     eframe::run_native(
         "keysynth chord pad",
         options,
         Box::new(|_cc| Ok(Box::new(app))),
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe: {e}").into() })?;
+    eprintln!("chord_pad: GUI window closed, exiting");
     Ok(())
 }
