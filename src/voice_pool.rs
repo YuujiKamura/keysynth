@@ -6,20 +6,55 @@
 //! per-channel `VoiceFactory` slots so the UI can hot-swap timbres
 //! between notes without interrupting voices that are already ringing.
 //!
-//! Invariants (audio-thread safe):
-//!   - `process_block` does **not** allocate. Voices are summed in place
-//!     into the caller-provided buffer; finished voices are removed via
-//!     `Vec::retain` (in-place, no realloc on shrink).
-//!   - `dispatch(NoteOn)` may allocate inside `make_voice`; the audio
-//!     thread tolerates this because note-on rate is bounded by the MIDI
-//!     event stream (≪ block rate).
-//!   - No `panic!` / `unwrap` / `expect`. Poisoned locks are recovered
-//!     with `into_inner` so a single misbehaving caller can't take down
-//!     the audio thread.
-//!   - `set_channel_factory` is the only writer of the channel routing
-//!     table; everything else takes a read lock.
+//! # Concurrency model (Issue #71)
 //!
-use std::sync::{Arc, Mutex, RwLock};
+//! The previous version put `voices: Mutex<Vec<ActiveVoice>>` between
+//! the audio callback and any UI thread that wanted to read a counter
+//! for a frame update. Every `active_count()` from a 60 Hz UI loop
+//! contended with the cpal callback for the same lock, opening a
+//! priority-inversion path to audio under-runs.
+//!
+//! This version splits the surface in two:
+//!
+//! - **Audio thread (exclusive owner of the voice list).** `tick`,
+//!   `process_block`, `all_notes_off` and the `dispatch_*` helpers
+//!   take `&mut self` and are invoked from the cpal callback (which
+//!   owns the `VoicePool` value). Because the borrow checker enforces
+//!   exclusivity, no `unsafe` and no `UnsafeCell` are needed. The
+//!   voice list is a plain `Vec<ActiveVoice>` field. No locks of any
+//!   kind are taken on this path.
+//!
+//! - **UI thread (read-only via atomics, write-only via SPSC).** The UI
+//!   gets a thin `VoicePoolUi` handle with a `Sender<PoolCmd>` and
+//!   shared atomic / `ArcSwap` snapshots. `active_count()` is
+//!   `AtomicUsize::load(Relaxed)`; channel-factory names are read via
+//!   wait-free `ArcSwap::load_full`; channel-factory writes go onto
+//!   the SPSC queue and are applied by the audio thread on its next tick.
+//!
+//! # Invariants (audio-thread safe)
+//!
+//! - `process_block` does not allocate. Voices are summed in place into
+//!   the caller-provided buffer; finished voices are removed via
+//!   `Vec::retain` (in-place, no realloc on shrink).
+//! - `dispatch(NoteOn)` may allocate inside `make_voice`; the audio
+//!   thread tolerates this because note-on rate is bounded by the MIDI
+//!   event stream (≪ block rate).
+//! - No `panic!` / `unwrap` / `expect`. SPSC sends from the UI silently
+//!   drop if the queue is full or the audio side has gone away — UI
+//!   command rate is human-scale, and the audio thread drains on every
+//!   tick, so under steady state the queue never approaches its bound.
+//! - Voice eviction order: `is_releasing()` voices are stolen first
+//!   (chord_pad pattern — they are inaudible by then); otherwise
+//!   `voices.remove(0)` takes the oldest still-sustaining voice. The
+//!   `Vec::retain` step in `process_block` preserves index order, so
+//!   "position 0 == oldest still sustaining" holds without a separate
+//!   timestamp (Issue #73 — `started_at` removed).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
 
 use crate::synth::VoiceImpl;
 use crate::voice_lib::DecayModel;
@@ -62,17 +97,39 @@ pub trait VoiceFactory: Send + Sync {
 /// A voice currently sounding inside the pool. `decay_model` is captured
 /// at note-on time from the factory so a later `set_channel_factory` does
 /// not change how this voice responds to its eventual NoteOff.
+///
+/// No `started_at` field (Issue #73): eviction picks the oldest
+/// sustaining voice purely by index, which works because the voice list
+/// is a `Vec` and `Vec::retain` preserves order.
 struct ActiveVoice {
     channel: u8,
     note: u8,
     voice: Box<dyn VoiceImpl + Send>,
     decay_model: DecayModel,
-    /// Sample-time at note-on. Currently always 0 (the pool has no
-    /// global clock yet); reserved for the SCHED-driven sample-accurate
-    /// version where eviction wants the truly-oldest voice.
-    #[allow(dead_code)]
-    started_at: u64,
 }
+
+// ---------------------------------------------------------------------------
+// PoolCmd — UI → audio thread message
+// ---------------------------------------------------------------------------
+
+/// Commands the UI thread can post to the audio thread via the SPSC
+/// queue. Only operations that mutate the voice list or per-channel
+/// factory routing live here; pure read-side helpers (`active_count`,
+/// `channel_factory_name`) bypass the queue and read atomic snapshots.
+enum PoolCmd {
+    SetChannelFactory {
+        channel: u8,
+        factory: Arc<dyn VoiceFactory>,
+    },
+    AllNotesOff,
+}
+
+/// Capacity of the UI → audio command queue. UI command rate is
+/// human-scale (factory swaps, panic stops), so even tens of commands
+/// per second sit comfortably inside this bound. A bounded queue lets
+/// us reject (silently drop) rather than block the UI thread if the
+/// audio thread ever wedges.
+const CMD_QUEUE_CAP: usize = 256;
 
 // ---------------------------------------------------------------------------
 // VoicePool
@@ -80,67 +137,183 @@ struct ActiveVoice {
 
 const NUM_CHANNELS: usize = 16;
 
-/// Polyphonic voice pool. See module docs for invariants.
+/// Polyphonic voice pool. See module docs for the audio/UI split.
+///
+/// # Ownership model
+///
+/// The `VoicePool` value should live inside the cpal callback closure
+/// (or a struct moved into the closure). Audio-thread methods take
+/// `&mut self`, so the borrow checker enforces that nothing else can
+/// see the voice list while the audio thread is touching it. UI threads
+/// interact through a `VoicePoolUi` handle returned by `ui_handle()`,
+/// which holds only `Send + Sync` projections — an SPSC sender, an
+/// `Arc<AtomicUsize>` for the voice count, and per-channel
+/// `Arc<ArcSwap<String>>` for factory names.
+///
+/// The split has two consequences worth highlighting:
+///
+/// - **No `unsafe` anywhere.** The previous draft of this module used
+///   `UnsafeCell<Vec<…>>` to mutate from `&self` methods. That is
+///   unsound for any caller that can clone the pool into multiple
+///   threads. By taking `&mut self` instead, we get the same lock-
+///   free behaviour with full Rust safety.
+/// - **`set_channel_factory(&self, …)` stays `&self`.** The legacy
+///   direct path is retained for back-compat (existing tests, audio-
+///   thread init code that doesn't yet have an exclusive borrow).
+///   This field is therefore stored in an `ArcSwap` so the read
+///   side stays wait-free even when shared.
 pub struct VoicePool {
     sample_rate: f32,
     voice_cap: usize,
-    voices: Mutex<Vec<ActiveVoice>>,
-    channel_factories: RwLock<[Arc<dyn VoiceFactory>; NUM_CHANNELS]>,
+
+    /// Active voices. Mutated only via `&mut self` audio-thread
+    /// methods; the borrow checker rules out any concurrent access.
+    voices: Vec<ActiveVoice>,
+
+    /// Per-channel current factory. Audio thread reads via `load_full`
+    /// when handling NoteOn; UI thread requests writes by sending
+    /// `PoolCmd::SetChannelFactory`, and the audio thread applies them
+    /// via `store` while draining the queue. ArcSwap is wait-free on
+    /// the read side, which is what we need on the audio path.
+    ///
+    /// The element type is `Arc<dyn VoiceFactory>` (boxed once), and
+    /// arc-swap stores it behind another `Arc`. The double `Arc` is
+    /// arc-swap's `RefCnt` requirement: `Arc<T>: RefCnt` only for
+    /// `T: Sized`, so we cannot use `ArcSwap<dyn VoiceFactory>`
+    /// directly. The extra indirection is on a NoteOn-rate path, not
+    /// the per-sample loop, so it is free of consequence.
+    channel_factories: [ArcSwap<Arc<dyn VoiceFactory>>; NUM_CHANNELS],
+
+    /// UI-readable snapshot of each channel's factory name. Updated by
+    /// the audio thread alongside `channel_factories`. Wrapped in `Arc`
+    /// per element so `VoicePoolUi` can share the same `ArcSwap`
+    /// instance (rather than a stale clone). Reads are wait-free.
+    channel_names: [Arc<ArcSwap<String>>; NUM_CHANNELS],
+
+    /// UI → audio command queue. Receiver is drained by the audio
+    /// thread on every `tick`; `cmd_tx` is cloned out to UI handles.
+    cmd_rx: Receiver<PoolCmd>,
+    cmd_tx: SyncSender<PoolCmd>,
+
+    /// UI-readable snapshot of `voices.len()`. Audio thread writes this
+    /// after every state change; UI reads relaxed.
+    active_count_atomic: Arc<AtomicUsize>,
 }
 
 impl VoicePool {
     /// Build a pool of capacity `voice_cap`, with every channel pointing
     /// at `default` initially. The UI can override individual channels
-    /// later via `set_channel_factory`.
+    /// later via `set_channel_factory` (audio-thread direct path) or
+    /// `VoicePoolUi::set_channel_factory` (SPSC-routed path).
     pub fn new(sample_rate: f32, voice_cap: usize, default: Arc<dyn VoiceFactory>) -> Self {
-        // `array::from_fn` keeps the array on the stack and avoids needing
-        // `Clone` on the trait object itself.
-        let factories: [Arc<dyn VoiceFactory>; NUM_CHANNELS] =
-            std::array::from_fn(|_| Arc::clone(&default));
+        let default_name = default.name().to_string();
+        let channel_factories: [ArcSwap<Arc<dyn VoiceFactory>>; NUM_CHANNELS] =
+            std::array::from_fn(|_| ArcSwap::from(Arc::new(Arc::clone(&default))));
+        let channel_names: [Arc<ArcSwap<String>>; NUM_CHANNELS] =
+            std::array::from_fn(|_| Arc::new(ArcSwap::from(Arc::new(default_name.clone()))));
+
+        let (cmd_tx, cmd_rx) = sync_channel(CMD_QUEUE_CAP);
+
         Self {
             sample_rate,
             voice_cap,
-            voices: Mutex::new(Vec::with_capacity(voice_cap)),
-            channel_factories: RwLock::new(factories),
+            voices: Vec::with_capacity(voice_cap),
+            channel_factories,
+            channel_names,
+            cmd_rx,
+            cmd_tx,
+            active_count_atomic: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Hot-swap the factory bound to `channel`. Voices already sounding
-    /// keep their original engine; only NoteOns received after this call
-    /// pick up the new factory. Out-of-range channels (>= 16) are
-    /// silently ignored — MIDI status bytes are masked to 0..=15 by the
-    /// scheduler but defensive-coding against bad callers is cheap.
+    /// Hand out a thin UI-side handle. The handle clones the
+    /// `Sender<PoolCmd>`, the active-count `Arc<AtomicUsize>`, and the
+    /// per-channel `Arc<ArcSwap<String>>` projections so it is `Send +
+    /// Sync` and cheap to copy. UI code can park it inside an egui
+    /// context or a separate thread without holding `&VoicePool`.
+    pub fn ui_handle(&self) -> VoicePoolUi {
+        VoicePoolUi {
+            cmd_tx: self.cmd_tx.clone(),
+            active_count: Arc::clone(&self.active_count_atomic),
+            channel_names: std::array::from_fn(|i| Arc::clone(&self.channel_names[i])),
+        }
+    }
+
+    /// Audio-thread entry point. Drain pending UI commands, dispatch
+    /// `events` (which the caller has produced this block from
+    /// `MidiSequencer::advance` or similar), render every active voice
+    /// into `out`, retire finished voices, and publish the new
+    /// `active_count` snapshot.
+    ///
+    /// This is the **single canonical hot path** for the audio
+    /// callback. Existing callers that prefer the fine-grained API
+    /// (`dispatch` + `process_block`) keep working — `tick` is
+    /// equivalent to "drain commands, then call `dispatch` for each
+    /// event, then call `process_block`".
+    ///
+    /// AUDIO THREAD ONLY. Takes `&mut self` so the borrow checker
+    /// enforces exclusivity — no extra runtime guard needed.
+    pub fn tick(&mut self, events: &[MidiEvent], out: &mut [f32]) {
+        self.drain_cmds();
+        for ev in events {
+            self.dispatch(ev);
+        }
+        self.process_block(out);
+    }
+
+    /// Drain pending UI commands from the SPSC queue. AUDIO THREAD ONLY.
+    fn drain_cmds(&mut self) {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            match cmd {
+                PoolCmd::SetChannelFactory { channel, factory } => {
+                    let idx = channel as usize;
+                    if idx >= NUM_CHANNELS {
+                        continue;
+                    }
+                    let name = Arc::new(factory.name().to_string());
+                    self.channel_factories[idx].store(Arc::new(factory));
+                    self.channel_names[idx].store(name);
+                }
+                PoolCmd::AllNotesOff => {
+                    self.dispatch_all_notes_off_global();
+                }
+            }
+        }
+    }
+
+    /// Hot-swap the factory bound to `channel`. AUDIO-THREAD-CALLABLE
+    /// (legacy path): out-of-thread callers should prefer
+    /// `VoicePoolUi::set_channel_factory`, which routes through the
+    /// SPSC queue. This direct method is kept for backward
+    /// compatibility (existing tests, audio-thread init code).
+    /// Out-of-range channels (>= 16) are silently ignored.
     pub fn set_channel_factory(&self, channel: u8, factory: Arc<dyn VoiceFactory>) {
         let idx = channel as usize;
         if idx >= NUM_CHANNELS {
             return;
         }
-        let mut guard = match self.channel_factories.write() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard[idx] = factory;
+        let name = Arc::new(factory.name().to_string());
+        self.channel_factories[idx].store(Arc::new(factory));
+        self.channel_names[idx].store(name);
     }
 
     /// Name of the factory currently bound to `channel`. Returns an
-    /// empty string if `channel` is out of range so callers don't have
-    /// to handle a `Result` for the common UI-label case.
+    /// empty string if `channel` is out of range. Wait-free
+    /// `ArcSwap::load_full` snapshot — no locks.
     pub fn channel_factory_name(&self, channel: u8) -> String {
         let idx = channel as usize;
         if idx >= NUM_CHANNELS {
             return String::new();
         }
-        let guard = match self.channel_factories.read() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard[idx].name().to_string()
+        (*self.channel_names[idx].load_full()).clone()
     }
 
-    /// Route one MIDI event to the pool. Safe to call from the audio
-    /// thread; only blocks on its own `Mutex` (no contention in
-    /// practice — the UI uses `set_channel_factory`, not `dispatch`).
-    pub fn dispatch(&self, ev: &MidiEvent) {
+    /// Route one MIDI event to the pool. AUDIO THREAD ONLY.
+    ///
+    /// Existing callers (jukebox / live MIDI player) invoke `dispatch`
+    /// directly from inside the cpal callback, which satisfies the
+    /// audio-thread contract.
+    pub fn dispatch(&mut self, ev: &MidiEvent) {
         match ev.kind {
             MidiEventKind::NoteOn { note, velocity } => {
                 self.dispatch_note_on(ev.channel, note, velocity);
@@ -154,43 +327,45 @@ impl VoicePool {
         }
     }
 
-    fn dispatch_note_on(&self, channel: u8, note: u8, velocity: u8) {
+    fn dispatch_note_on(&mut self, channel: u8, note: u8, velocity: u8) {
         if channel as usize >= NUM_CHANNELS {
             return;
         }
         // A pool with zero capacity can never hold a voice; bail out
-        // before we touch the channel-factory map or the voices Mutex
-        // (the eviction branch below would otherwise call
-        // `voices.remove(0)` on an empty Vec and panic).
+        // before we touch anything else (the eviction branch below
+        // would otherwise call `voices.remove(0)` on an empty Vec).
         if self.voice_cap == 0 {
             return;
         }
-        // Pull factory + decay model out under the read lock first so we
-        // never hold the channel lock and the voices lock at the same
-        // time (lock-ordering hygiene; matters if a future caller takes
-        // them in the opposite order).
-        let (factory, decay_model) = {
-            let guard = match self.channel_factories.read() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            let f = Arc::clone(&guard[channel as usize]);
-            let dm = f.decay_model();
-            (f, dm)
-        };
+        // Snapshot the current factory atomically. ArcSwap::load_full
+        // returns an `Arc<Arc<dyn VoiceFactory>>` (see field-level doc
+        // for the double-Arc justification). Cloning the inner `Arc`
+        // gives us a flat handle the rest of this function can use;
+        // later `store` from the cmd drain step does not invalidate
+        // it because each snapshot keeps its own ref-counted handle.
+        let factory_outer = self.channel_factories[channel as usize].load_full();
+        let factory: Arc<dyn VoiceFactory> = Arc::clone(&*factory_outer);
+        let decay_model = factory.decay_model();
 
         let freq = crate::synth::midi_to_freq(note);
         let vel_norm = (velocity as f32) / 127.0;
         let voice = factory.make_voice(self.sample_rate, freq, vel_norm);
 
-        let mut voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let voices = &mut self.voices;
 
         // Eviction: at cap, drop a releasing voice first (chord_pad
         // pattern — those are already on their way out and stealing
-        // them is inaudible), else the oldest sustained voice.
+        // them is inaudible), else the oldest sustained voice. Index
+        // 0 is "oldest" because `Vec::retain` (the only other shrink
+        // step) preserves index order.
+        //
+        // We use `Vec::remove` (O(n) shift) deliberately, *not*
+        // `swap_remove` (O(1) but reorders): the eviction policy
+        // depends on positional order being preserved so "index 0 ==
+        // oldest" stays true on the next eviction. With voice_cap
+        // bounded to typical polyphony (≤ 128), the shift is a
+        // handful of pointer copies on the audio thread — far below
+        // the cost of one block of synth math.
         if voices.len() >= self.voice_cap {
             let releasing_idx = voices.iter().position(|v| v.voice.is_releasing());
             let victim = releasing_idx.unwrap_or(0);
@@ -202,20 +377,15 @@ impl VoicePool {
             note,
             voice,
             decay_model,
-            started_at: 0,
         });
+
+        let n = voices.len();
+        self.publish_active_count(n);
     }
 
-    fn dispatch_note_off(&self, channel: u8, note: u8) {
-        let mut voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for v in voices.iter_mut() {
-            if v.channel == channel
-                && v.note == note
-                && !v.voice.is_releasing()
-            {
+    fn dispatch_note_off(&mut self, channel: u8, note: u8) {
+        for v in self.voices.iter_mut() {
+            if v.channel == channel && v.note == note && !v.voice.is_releasing() {
                 match v.decay_model {
                     DecayModel::Damper => {
                         v.voice.trigger_release();
@@ -236,53 +406,114 @@ impl VoicePool {
         }
     }
 
-    fn dispatch_all_notes_off(&self, channel: u8) {
-        let mut voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for v in voices.iter_mut() {
+    fn dispatch_all_notes_off(&mut self, channel: u8) {
+        for v in self.voices.iter_mut() {
             if v.channel == channel {
                 v.voice.trigger_release();
             }
         }
     }
 
+    fn dispatch_all_notes_off_global(&mut self) {
+        for v in self.voices.iter_mut() {
+            v.voice.trigger_release();
+        }
+    }
+
     /// Sum every active voice into `out` (additive — caller is
     /// responsible for zeroing first if they want a clean slate).
     /// Voices that report `is_done()` after rendering are removed.
-    /// **Allocation-free.**
-    pub fn process_block(&self, out: &mut [f32]) {
-        let mut voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for v in voices.iter_mut() {
+    /// **Allocation-free.** AUDIO THREAD ONLY.
+    pub fn process_block(&mut self, out: &mut [f32]) {
+        for v in self.voices.iter_mut() {
             v.voice.render_add(out);
         }
-        voices.retain(|v| !v.voice.is_done());
+        self.voices.retain(|v| !v.voice.is_done());
+        let n = self.voices.len();
+        self.publish_active_count(n);
     }
 
-    /// Number of voices currently in the pool (before the next
-    /// `process_block` retain). Cheap; takes the voices lock briefly.
+    /// Number of voices currently in the pool (last published by the
+    /// audio thread). Wait-free `Relaxed` load — safe to call from any
+    /// thread, including a 60 Hz UI redraw loop.
     pub fn active_count(&self) -> usize {
-        let voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        voices.len()
+        self.active_count_atomic.load(Ordering::Relaxed)
     }
 
     /// Trigger release on every voice in the pool, regardless of
-    /// channel. Used by `LiveMidiPlayer::stop` / `seek`.
-    pub fn all_notes_off(&self) {
-        let mut voices = match self.voices.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for v in voices.iter_mut() {
-            v.voice.trigger_release();
+    /// channel. AUDIO-THREAD-CALLABLE legacy path; UI threads should
+    /// use `VoicePoolUi::all_notes_off`, which posts to the SPSC queue.
+    pub fn all_notes_off(&mut self) {
+        self.dispatch_all_notes_off_global();
+        let n = self.voices.len();
+        self.publish_active_count(n);
+    }
+
+    #[inline]
+    fn publish_active_count(&self, n: usize) {
+        self.active_count_atomic.store(n, Ordering::Relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VoicePoolUi — UI-side handle
+// ---------------------------------------------------------------------------
+
+/// UI-side handle returned by `VoicePool::ui_handle`.
+///
+/// All methods on this type are safe to call from any thread other than
+/// the audio thread. Mutations go through the SPSC queue (one queue
+/// element per call); reads are atomic / wait-free.
+///
+/// If the audio thread has already been dropped (queue receiver gone)
+/// or the queue is full, sends are silently discarded — the UI must
+/// not treat these as fallible because the audio thread is the
+/// dominant lifetime in the app.
+#[derive(Clone)]
+pub struct VoicePoolUi {
+    cmd_tx: SyncSender<PoolCmd>,
+    active_count: Arc<AtomicUsize>,
+    /// One read-only projection per channel, sharing the same
+    /// `ArcSwap<String>` instance with the pool. Wait-free reads.
+    channel_names: [Arc<ArcSwap<String>>; NUM_CHANNELS],
+}
+
+impl VoicePoolUi {
+    /// Request the audio thread bind `factory` to `channel`. Out-of-
+    /// range channels are dropped on the audio side.
+    pub fn set_channel_factory(&self, channel: u8, factory: Arc<dyn VoiceFactory>) {
+        // try_send so a full queue (or dropped audio thread) cannot
+        // block the UI. Dropping a SetChannelFactory is preferable to
+        // stalling a 60 Hz redraw — the user can re-issue.
+        match self
+            .cmd_tx
+            .try_send(PoolCmd::SetChannelFactory { channel, factory })
+        {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
         }
+    }
+
+    /// Request the audio thread release every voice in the pool.
+    pub fn all_notes_off(&self) {
+        match self.cmd_tx.try_send(PoolCmd::AllNotesOff) {
+            Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+        }
+    }
+
+    /// Wait-free snapshot of how many voices are currently sounding.
+    pub fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::Relaxed)
+    }
+
+    /// Wait-free snapshot of the factory name currently bound to
+    /// `channel`. Reflects the most recent `SetChannelFactory` that
+    /// the audio thread has drained.
+    pub fn channel_factory_name(&self, channel: u8) -> String {
+        let idx = channel as usize;
+        if idx >= NUM_CHANNELS {
+            return String::new();
+        }
+        (*self.channel_names[idx].load_full()).clone()
     }
 }
 
@@ -293,18 +524,19 @@ impl VoicePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize as TAtomicUsize;
+    use std::sync::Arc as TArc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    /// Test voice with a tunable lifetime. `note_off_done` controls
+    /// Test voice with a tunable lifetime. `done_after_release` controls
     /// whether `trigger_release` immediately marks the voice done (so
-    /// `process_block` retires it on the next pass) — this lets the
-    /// `note_off_releases_voice` test verify the full pipeline without
-    /// running a real envelope for hundreds of samples.
+    /// `process_block` retires it on the next pass).
     struct MockVoice {
         released: bool,
         done_after_release: bool,
         /// Counter to verify `render_add` actually ran.
-        render_calls: Arc<AtomicUsize>,
+        render_calls: TArc<TAtomicUsize>,
     }
 
     impl VoiceImpl for MockVoice {
@@ -329,7 +561,7 @@ mod tests {
         name: String,
         decay: DecayModel,
         done_after_release: bool,
-        render_calls: Arc<AtomicUsize>,
+        render_calls: TArc<TAtomicUsize>,
     }
 
     impl MockFactory {
@@ -338,7 +570,7 @@ mod tests {
                 name: name.to_string(),
                 decay: DecayModel::Damper,
                 done_after_release: true,
-                render_calls: Arc::new(AtomicUsize::new(0)),
+                render_calls: TArc::new(TAtomicUsize::new(0)),
             }
         }
     }
@@ -353,7 +585,7 @@ mod tests {
             Box::new(MockVoice {
                 released: false,
                 done_after_release: self.done_after_release,
-                render_calls: Arc::clone(&self.render_calls),
+                render_calls: TArc::clone(&self.render_calls),
             })
         }
         fn name(&self) -> &str {
@@ -381,7 +613,7 @@ mod tests {
     #[test]
     fn note_on_allocates_voice() {
         let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
-        let pool = VoicePool::new(44_100.0, 32, f);
+        let mut pool = VoicePool::new(44_100.0, 32, f);
         assert_eq!(pool.active_count(), 0);
         pool.dispatch(&note_on(0, 60, 100));
         assert_eq!(pool.active_count(), 1);
@@ -390,7 +622,7 @@ mod tests {
     #[test]
     fn note_off_releases_voice() {
         let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
-        let pool = VoicePool::new(44_100.0, 32, f);
+        let mut pool = VoicePool::new(44_100.0, 32, f);
         pool.dispatch(&note_on(0, 60, 100));
         assert_eq!(pool.active_count(), 1);
         pool.dispatch(&note_off(0, 60));
@@ -402,17 +634,21 @@ mod tests {
         assert_eq!(pool.active_count(), 0);
     }
 
+    /// Issue #73 acceptance: with `started_at` removed, eviction at
+    /// capacity steals the position-0 voice, which is the oldest
+    /// because `Vec::retain` preserves order.
     #[test]
-    fn voice_cap_steals_oldest() {
+    fn voice_cap_steals_oldest_by_index() {
         let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
-        let pool = VoicePool::new(44_100.0, 2, f);
+        let mut pool = VoicePool::new(44_100.0, 2, f);
         pool.dispatch(&note_on(0, 60, 100));
         pool.dispatch(&note_on(0, 62, 100));
         pool.dispatch(&note_on(0, 64, 100));
         assert_eq!(pool.active_count(), 2);
         // The oldest voice (note 60) should be gone; 62 and 64 remain.
-        let voices = pool.voices.lock().unwrap_or_else(|p| p.into_inner());
-        let notes: Vec<u8> = voices.iter().map(|v| v.note).collect();
+        // Read voices back via the field directly (legal here — the
+        // test is single-threaded and lives in the same module).
+        let notes: Vec<u8> = pool.voices.iter().map(|v| v.note).collect();
         assert!(!notes.contains(&60), "note 60 should have been stolen");
         assert!(notes.contains(&62));
         assert!(notes.contains(&64));
@@ -422,7 +658,7 @@ mod tests {
     fn set_channel_factory_swaps_for_next_note() {
         let fa: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("factory_a"));
         let fb: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("factory_b"));
-        let pool = VoicePool::new(44_100.0, 32, Arc::clone(&fa));
+        let mut pool = VoicePool::new(44_100.0, 32, Arc::clone(&fa));
         assert_eq!(pool.channel_factory_name(0), "factory_a");
 
         // Note 1: on factory_a.
@@ -465,7 +701,7 @@ mod tests {
         // A degenerate pool with zero capacity should silently swallow
         // NoteOn dispatches rather than panic on `voices.remove(0)`.
         let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
-        let pool = VoicePool::new(44_100.0, 0, f);
+        let mut pool = VoicePool::new(44_100.0, 0, f);
         assert_eq!(pool.active_count(), 0);
         pool.dispatch(&note_on(0, 60, 100));
         pool.dispatch(&note_on(0, 62, 100));
@@ -479,7 +715,7 @@ mod tests {
     #[test]
     fn process_block_is_additive_and_culls_done() {
         let f: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("a"));
-        let pool = VoicePool::new(44_100.0, 8, f);
+        let mut pool = VoicePool::new(44_100.0, 8, f);
         pool.dispatch(&note_on(0, 60, 100));
         pool.dispatch(&note_on(0, 62, 100));
         let mut buf = vec![1.0_f32; 32]; // pre-existing content
@@ -491,5 +727,112 @@ mod tests {
         pool.all_notes_off();
         pool.process_block(&mut buf);
         assert_eq!(pool.active_count(), 0);
+    }
+
+    /// Issue #71 acceptance: a UI thread spamming
+    /// `ui_handle().active_count()` and `set_channel_factory` does not
+    /// block the audio thread, and the audio thread's `tick` actually
+    /// applies the queued factory swaps.
+    ///
+    /// We avoid wall-clock timing assertions (flaky on busy CI). The
+    /// proxy assertion is functional: after the audio thread runs N
+    /// ticks while the UI thread sends K factory swaps, the audio
+    /// thread's view of the channel-0 factory name must end up at the
+    /// last swap value. If a lock had snuck back in, either the
+    /// `active_count()` poll would have stalled or one of the swaps
+    /// would have been lost.
+    #[test]
+    fn concurrent_ui_query_does_not_block_audio() {
+        // Models the real ownership: audio thread owns the pool by
+        // value, UI threads share `VoicePoolUi` clones. No `Arc<Pool>`
+        // anywhere — the borrow checker enforces single-mutator on
+        // the audio side.
+        let fa: Arc<dyn VoiceFactory> = Arc::new(MockFactory::new("audio_default"));
+        let mut pool = VoicePool::new(44_100.0, 32, fa);
+        let ui = pool.ui_handle();
+
+        const NUM_SWAPS: usize = 100;
+        const NUM_QUERIES: usize = 1000;
+
+        // Pre-build NUM_SWAPS distinct factories so the UI thread
+        // doesn't allocate inside the hot loop.
+        let factories: Vec<Arc<dyn VoiceFactory>> = (0..NUM_SWAPS)
+            .map(|i| {
+                Arc::new(MockFactory::new(&format!("ui_swap_{i}")))
+                    as Arc<dyn VoiceFactory>
+            })
+            .collect();
+
+        let stop = TArc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // UI thread A: spam wait-free reads.
+        let stop_q = TArc::clone(&stop);
+        let ui_q = ui.clone();
+        let querier = thread::spawn(move || {
+            let mut sum = 0_usize;
+            for _ in 0..NUM_QUERIES {
+                sum = sum.wrapping_add(ui_q.active_count());
+                let _ = ui_q.channel_factory_name(0);
+                if stop_q.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            sum
+        });
+
+        // UI thread B: send all swaps.
+        let ui_swap = ui.clone();
+        let factories_for_swap = factories.clone();
+        let swapper = thread::spawn(move || {
+            for f in factories_for_swap.iter() {
+                ui_swap.set_channel_factory(0, Arc::clone(f));
+            }
+        });
+
+        // Audio thread: run ticks until the swapper finishes, then
+        // drain a few extra ticks for in-flight commands. Wall-clock
+        // bound is a CI safety net only — the functional assert below
+        // is what really proves Issue #71 is fixed.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut buf = vec![0.0_f32; 64];
+        let mut events: Vec<MidiEvent> = Vec::new();
+        loop {
+            pool.tick(&events, &mut buf);
+            // Inject a NoteOn occasionally so the audio thread does
+            // real work, not just queue-draining.
+            events.clear();
+            events.push(note_on(0, 60, 100));
+            if swapper.is_finished() {
+                // Drain a couple more ticks to absorb in-flight cmds.
+                for _ in 0..8 {
+                    pool.tick(&[], &mut buf);
+                }
+                break;
+            }
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = querier.join();
+        let _ = swapper.join();
+
+        // Functional assert: the last swap must be reflected on both
+        // the audio side (`channel_factory_name`) and the UI side
+        // (`ui.channel_factory_name`). This is the proxy for "no
+        // contention dropped a command".
+        let expected = format!("ui_swap_{}", NUM_SWAPS - 1);
+        assert_eq!(
+            pool.channel_factory_name(0),
+            expected,
+            "audio side did not converge to last swap — queue or atomic dropped a write"
+        );
+        assert_eq!(
+            ui.channel_factory_name(0),
+            expected,
+            "UI handle did not see last swap on the shared ArcSwap"
+        );
     }
 }
