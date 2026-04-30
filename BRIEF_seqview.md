@@ -1,8 +1,8 @@
 # Brief: Jukebox Sequencer View
 
 ## Worktree
-- `C:\Users\yuuji\keysynth-team-seqview` (branch `team/sequencer-view`, off origin/main)
-- 起動時 `cd C:\Users\yuuji\keysynth-team-seqview` してから始めろ
+- `<repo-root>/../keysynth-team-seqview` (branch `team/sequencer-view`, off origin/main)
+- 起動時に上記 worktree に `cd` してから始めろ (絶対パスはマシンごとに違う)
 
 ## Goal
 現状の jukebox は MIDI を事前 render して WAV を再生する **静的アセット paradigm** に短絡してる。これを直すために **sequencer view** を新設、live 演奏 paradigm の窓を開ける。
