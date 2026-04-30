@@ -201,7 +201,7 @@ impl LiveMidiPlayer {
 ### 規律
 
 - worktree 隔離 (`keysynth-live-sched`, `keysynth-live-pool`, `keysynth-live-ui`)
-- `CARGO_TARGET_DIR=F:/rust-targets/jb-live-<wt>`
+- `CARGO_TARGET_DIR=<scratch-target>/jb-live-<wt>` (worktree-isolated build dir; pick any fast disk, e.g. `target/jb-live-<wt>`)
 - foreground 強制、自己修正 3 回上限、`git add <path>` のみ
 - 不変条件:
   - `VoicePool::process_block` は audio callback で呼ぶので **アロケート禁止** (Vec push 等は `dispatch` 側のみ、それも `Mutex::lock` の内側で限定)

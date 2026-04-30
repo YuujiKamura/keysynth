@@ -339,18 +339,21 @@ const CDYLIB_EXT: &str = "so";
 
 fn locate_guitar_cdylib() -> Option<PathBuf> {
     // Cargo's per-package target directory may be overridden globally
-    // (this repo points at F:/rust-targets via .cargo/config.toml in
-    // some environments). We probe a small candidate set: the
-    // workspace-local `voices_live/guitar/target/release` *and* the
-    // CARGO_TARGET_DIR override if it is set, plus the well-known
-    // F:/rust-targets path used by the rest of the repo.
+    // via `CARGO_TARGET_DIR` or `.cargo/config.toml`. We probe, in
+    // priority order:
+    //   1. the explicit `CARGO_TARGET_DIR` override (if set)
+    //   2. the workspace-local `voices_live/guitar/target/release`
+    //      under the test's manifest dir (works regardless of where
+    //      the repo lives on disk).
     let name = format!("{}keysynth_voice_guitar.{}", CDYLIB_PREFIX, CDYLIB_EXT);
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates: Vec<PathBuf> = [
-        PathBuf::from("voices_live/guitar/target/release").join(&name),
         std::env::var_os("CARGO_TARGET_DIR")
             .map(|p| PathBuf::from(p).join("release").join(&name))
             .unwrap_or_default(),
-        PathBuf::from("F:/rust-targets/release").join(&name),
+        manifest_dir
+            .join("voices_live/guitar/target/release")
+            .join(&name),
     ]
     .into_iter()
     .filter(|p| !p.as_os_str().is_empty())

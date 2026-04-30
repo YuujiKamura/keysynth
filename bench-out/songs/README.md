@@ -32,9 +32,12 @@ repertoire.
 current listing, e.g.:
 
 ```bash
-F:/rust-targets/release/keysynth_db.exe query --instrument guitar
-F:/rust-targets/release/keysynth_db.exe query --composer Bach
-F:/rust-targets/release/keysynth_db.exe query --era Romantic --instrument piano
+# Adjust the binary path to your cargo target dir — `target/release/` by
+# default, or wherever `CARGO_TARGET_DIR` points. The `.exe` suffix only
+# applies on Windows.
+target/release/keysynth_db query --instrument guitar
+target/release/keysynth_db query --composer Bach
+target/release/keysynth_db query --era Romantic --instrument piano
 ```
 
 The hand-curated seed (PR #63) is identifiable by short, descriptive
@@ -89,8 +92,8 @@ python tools/mutopia_collector.py \
 
 # Then refresh the materialized SQLite catalog so query / Steel REPL
 # pick up the new rows:
-F:/rust-targets/release/keysynth_db.exe rebuild
-F:/rust-targets/release/ksrepl.exe -e '(query-songs :composer "Bach")'
+target/release/keysynth_db rebuild
+target/release/ksrepl -e '(query-songs :composer "Bach")'
 ```
 
 License allowlist: `Public Domain`, `CC-BY 4.0`. CC-BY-SA, CC-BY-NC,

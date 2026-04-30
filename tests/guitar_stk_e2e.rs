@@ -310,13 +310,19 @@ const CDYLIB_EXT: &str = "dylib";
 const CDYLIB_EXT: &str = "so";
 
 fn locate_guitar_stk_cdylib() -> Option<PathBuf> {
+    // See `tests/guitar_e2e.rs::locate_guitar_cdylib` for the probe
+    // order rationale (CARGO_TARGET_DIR override first, then the
+    // workspace-local voices_live build dir, resolved relative to the
+    // test's manifest dir so the lookup is host-independent).
     let name = format!("{}keysynth_voice_guitar_stk.{}", CDYLIB_PREFIX, CDYLIB_EXT);
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let candidates: Vec<PathBuf> = [
-        PathBuf::from("voices_live/guitar_stk/target/release").join(&name),
         std::env::var_os("CARGO_TARGET_DIR")
             .map(|p| PathBuf::from(p).join("release").join(&name))
             .unwrap_or_default(),
-        PathBuf::from("F:/rust-targets/release").join(&name),
+        manifest_dir
+            .join("voices_live/guitar_stk/target/release")
+            .join(&name),
     ]
     .into_iter()
     .filter(|p| !p.as_os_str().is_empty())

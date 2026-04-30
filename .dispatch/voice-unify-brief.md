@@ -3,7 +3,7 @@
 Reference: 朝の dispatch chain (#40 hot-reload + #41 cp-core + #42 MIDI-optional/E2E) の自然な延長。
 
 ## Working tree
-- Worktree: `C:\Users\yuuji\AppData\Local\Temp\ks-voice-unify` (Unix: `/tmp/ks-voice-unify`)
+- Worktree: `<tmp>/ks-voice-unify` (e.g. `%TEMP%\ks-voice-unify` on Windows, `/tmp/ks-voice-unify` on Unix)
 - Branch: `claude/voice-plugin-migration` (already checked out, base origin/main = e966045)
 - DO NOT touch any file outside this worktree.
 

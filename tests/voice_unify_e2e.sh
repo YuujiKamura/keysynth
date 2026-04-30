@@ -49,7 +49,8 @@ echo "OUT   = $OUT_DIR"
 echo "PORT  = $PORT"
 
 # Locate the built keysynth + ksctl binaries via cargo metadata so we
-# tolerate a custom target-dir (e.g. F:\rust-targets on this dev box).
+# tolerate a custom target-dir (e.g. set via `CARGO_TARGET_DIR` or a
+# `.cargo/config.toml` override).
 TARGET_DIR=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n1)
 if [ -z "$TARGET_DIR" ]; then

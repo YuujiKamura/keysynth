@@ -124,22 +124,15 @@ reference/*.wav
 !bench-out/REF/guitar/
 !bench-out/REF/guitar/LICENSE.txt
 !bench-out/REF/guitar/README.md
-# CP E2E demo log: tests/cp_e2e_demo.sh writes the captured PR evidence
-# here. Whitelist the directory so run.log is checkable, but keep the
-# rendered WAVs and keysynth's verbose stderr tail local-only.
-!bench-out/cp-e2e/
-!bench-out/cp-e2e/run.log
-bench-out/cp-e2e/*.wav
-bench-out/cp-e2e/*.stderr.log
-bench-out/cp-e2e/*-body.md
-# Voice-unify E2E demo log: tests/voice_unify_e2e.sh writes the
-# captured PR evidence here. Same policy as cp-e2e: whitelist the log,
-# keep WAVs / latency tsv / stderr local-only.
-!bench-out/voice-unify/
-!bench-out/voice-unify/run.log
-bench-out/voice-unify/*.wav
-bench-out/voice-unify/keysynth.stderr.log
-bench-out/voice-unify/reload_latency.tsv
+# CP E2E demo + voice-unify E2E demo write captured PR evidence under
+# bench-out/cp-e2e/ and bench-out/voice-unify/. These run logs include
+# absolute filesystem paths from the executing host and so are kept
+# local-only (not committed). The blanket `bench-out/*` rule above
+# already excludes them; explicit deny rules below double-belt the
+# WAVs / latency tsv / stderr tails so a stray `git add -f` cannot
+# leak host paths.
+bench-out/cp-e2e/
+bench-out/voice-unify/
 **/*.flac
 **/*.aif
 **/*.aiff

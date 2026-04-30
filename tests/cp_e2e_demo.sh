@@ -37,8 +37,8 @@ LIVE_SRC_BACKUP="$OUT_DIR/lib.rs.orig"
 rm -f "$WAV_A" "$WAV_B" "$KS_LOG"
 
 # Locate the built keysynth + ksctl binaries via cargo metadata so we
-# tolerate a custom target-dir (e.g. the F:\rust-targets override on
-# this dev machine).
+# tolerate a custom target-dir (e.g. via `CARGO_TARGET_DIR` or a
+# workspace-local `.cargo/config.toml` override).
 TARGET_DIR=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
   | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -n1)
 if [ -z "$TARGET_DIR" ]; then
